@@ -1,0 +1,477 @@
+#!/bin/bash
+# scaleout — 메인 맥이 다른 맥(워커)들에 Claude Code 일을 나눠 맡기고 결과만 받아 온다.
+# https://github.com/yuna-studio/mac-scaleout
+#
+# 메인에서:
+#   scaleout init [--main-host <cloudflare ssh 호스트>]     처음 한 번 (install.sh 가 부른다)
+#   scaleout add <이름> <사용자@주소> [--dir ~/workspace]      워커 하나 붙이기 — 워커 비밀번호를 한 번 묻고 나머지는 알아서
+#   scaleout add <이름> --ssh <이미 되는 ssh 별칭>             이미 SSH 가 되는 워커
+#   scaleout invite <이름> [--dir ~/workspace]               워커에서 한 줄만 붙이면 끝나는 초대 명령 찍기 (원격 로그인이 꺼진 워커도)
+#   scaleout accept <이름> --port <포트> --user <사용자> [--lan <주소>] <SCALEOUT_PUBKEY 줄>
+#                                                             워커에서 직접 setup.sh 를 돌렸을 때 메인 쪽 마무리
+#   scaleout ls | status [이름] | doctor <이름> | remove <이름>
+#   scaleout run [-w <이름>|auto] [-d <워커 폴더>] [-f <지시 파일>]   일 맡기기 (지시는 파일 또는 표준 입력) → 작업 번호
+#   scaleout wait <작업 번호> [-m <초>]                       끝날 때까지 기다렸다가 최종 보고 (기본 540초, 아직이면 종료 코드 2)
+#   scaleout result <작업 번호> | logs <작업 번호> | cancel <작업 번호> | jobs [이름]
+#   scaleout exec <이름> -- <명령...>                          워커에서 셸 명령 (SSH 세션이라 키체인은 못 씀)
+#
+# 종료 코드: 0 성공 · 1 워커 Claude 실패 · 2 아직 도는 중 · 3 워커에 못 붙음 · 4 사용법 · 5 없음
+set -u
+# 심볼릭 링크(~/.local/bin/scaleout)로 불려도 실제 패키지 위치를 찾는다
+src="$0"
+while [ -L "$src" ]; do t="$(readlink "$src")"; case "$t" in /*) src="$t";; *) src="$(dirname "$src")/$t";; esac; done
+PKG="$(cd "$(dirname "$src")/.." && pwd)"
+. "$PKG/lib/common.sh"
+
+VERSION="0.1.0"
+SSHC="$HOME/.ssh/config"
+WDIR="$SCALEOUT_CONF/workers"
+MAIN_CONF="$SCALEOUT_CONF/main.conf"
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=6 -o ServerAliveInterval=30)
+RP='export PATH=$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH;'
+
+wconf() { echo "$WDIR/$1"; }
+workers() { [ -d "$WDIR" ] && ls -1 "$WDIR" 2>/dev/null; }
+need_worker() { [ -f "$(wconf "$1")" ] || die $E_NOT_FOUND "워커 「$1」가 없어요 — scaleout ls"; }
+
+# ── 워커로 가는 길: 터널(어느 망이든) 먼저, 안 되면 같은 망 직접 ──
+ROUTE_CACHE=""
+route() {
+  local n="$1" hit alias
+  hit="$(printf '%s\n' "$ROUTE_CACHE" | sed -n "s/^$n=//p" | tail -1)"
+  [ -n "$hit" ] && { [ "$hit" = "-" ] && return 1; echo "$hit"; return 0; }
+  for alias in "scaleout-$n" "scaleout-$n-lan"; do
+    grep -q "^Host $alias\$" "$SSHC" 2>/dev/null || continue
+    if ssh -n "${SSH_OPTS[@]}" -o ConnectTimeout=5 "$alias" true 2>/dev/null; then
+      ROUTE_CACHE="$ROUTE_CACHE
+$n=$alias"; echo "$alias"; return 0
+    fi
+  done
+  ROUTE_CACHE="$ROUTE_CACHE
+$n=-"
+  return 1
+}
+rsh() {  # rsh <이름> <원격 명령> — 워커에서 실행 (표준 입력은 넘기지 않는다 — 넘기면 ssh 가 지시를 먹어 버린다)
+  local r; r="$(route "$1")" || die $E_UNREACHABLE "워커 「$1」에 못 붙음 — 깨어 있는지, 원격 로그인이 켜졌는지 확인 (scaleout status)"
+  shift; ssh -n "${SSH_OPTS[@]}" "$r" "$@"
+}
+rsh_in() {  # rsh_in <이름> <원격 명령> < 파일 — 표준 입력을 워커로 넘긴다
+  local r; r="$(route "$1")" || die $E_UNREACHABLE "워커 「$1」에 못 붙음 — scaleout status"
+  shift; ssh "${SSH_OPTS[@]}" "$r" "$@"
+}
+
+next_port() {
+  local p="$SCALEOUT_PORT_BASE" used w
+  used=" $(for w in $(workers); do conf_get "$(wconf "$w")" PORT; done | tr '\n' ' ') "
+  while case "$used" in *" $p "*) true;; *) false;; esac || nc -z -G 1 localhost "$p" 2>/dev/null; do p=$((p + 1)); done
+  echo "$p"
+}
+
+write_worker_ssh() {  # write_worker_ssh <이름> <사용자> <포트|빈칸> <같은 망 주소|빈칸>
+  local n="$1" u="$2" p="$3" lan="$4" body=""
+  if [ -n "$p" ]; then
+    body="Host scaleout-$n
+  HostName localhost
+  Port $p
+  User $u
+  HostKeyAlias scaleout-$n
+  IdentityFile $SCALEOUT_KEY
+  IdentitiesOnly yes
+  StrictHostKeyChecking accept-new
+  ConnectTimeout 6"
+  fi
+  if [ -n "$lan" ]; then
+    body="$body${body:+
+}Host scaleout-$n-lan
+  HostName $lan
+  User $u
+  HostKeyAlias scaleout-$n
+  IdentityFile $SCALEOUT_KEY
+  IdentitiesOnly yes
+  StrictHostKeyChecking accept-new
+  ConnectTimeout 6"
+  fi
+  ssh_block_put "$SSHC" "scaleout $n" "$body"
+}
+
+authorize_tunnel_key() {  # authorize_tunnel_key <이름> <포트> <공개키 줄>
+  local n="$1" p="$2" key="$3" ak="$HOME/.ssh/authorized_keys" tmp
+  mkdir -p "$HOME/.ssh"; chmod 700 "$HOME/.ssh"; touch "$ak"; chmod 600 "$ak"
+  tmp="$(mktemp)"; grep -v " scaleout-$n\$" "$ak" > "$tmp"; cat "$tmp" > "$ak"; rm -f "$tmp"
+  # 워커 키로는 메인에 터널만 열 수 있다 (셸 · 다른 포워딩 금지)
+  printf 'restrict,port-forwarding,permitlisten="localhost:%s",command="echo scaleout tunnel only; exit 1" %s\n' "$p" "$key" >> "$ak"
+}
+
+cmd_init() {
+  local mh="" mu
+  mu="$(whoami)"
+  while [ $# -gt 0 ]; do
+    case "$1" in --main-host) mh="$2"; shift 2;; --main-user) mu="$2"; shift 2;; *) die $E_USAGE "init [--main-host 호스트] [--main-user 사용자]";; esac
+  done
+  [ -n "$mh" ] || mh="$(main_tunnel_host || true)"
+  mkdir -p "$WDIR"
+  conf_set "$MAIN_CONF" MAIN_HOST "$mh"
+  conf_set "$MAIN_CONF" MAIN_USER "$mu"
+  [ -f "$SCALEOUT_KEY" ] || ssh-keygen -q -t ed25519 -N "" -f "$SCALEOUT_KEY" -C "scaleout-main@$(scutil --get LocalHostName 2>/dev/null || hostname)"
+  if [ -d "$HOME/.claude" ]; then
+    mkdir -p "$HOME/.claude/agents"
+    cp "$PKG/claude/scaleout.md" "$HOME/.claude/agents/scaleout.md"
+    say "Claude 서브에이전트 「scaleout」 설치: ~/.claude/agents/scaleout.md"
+  fi
+  say "메인 준비 끝 (scaleout $VERSION)"
+  if [ -n "$mh" ]; then
+    say "  역방향 터널 호스트: $mh (워커가 어느 망에 있어도 붙어요)"
+  else
+    say "  Cloudflare SSH 터널을 못 찾았어요 — 워커는 같은 망에서만 붙어요 (나중에 scaleout init --main-host <호스트>)"
+  fi
+  say "다음: scaleout add <이름> <사용자@워커주소>"
+}
+
+cmd_add() {
+  local n="${1:-}"; shift || true
+  [ -n "$n" ] || die $E_USAGE "add <이름> <사용자@주소> | add <이름> --ssh <별칭>"
+  case "$n" in *[!a-z0-9-]*) die $E_USAGE "이름은 영문 소문자 · 숫자 · - 만";; esac
+  local target="" alias="" dir="~" maxj=2 tunnel=1 lan="" test=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --ssh) alias="$2"; shift 2;;
+      --dir) dir="$2"; shift 2;;
+      --max-jobs) maxj="$2"; shift 2;;
+      --lan) lan="$2"; shift 2;;
+      --no-tunnel) tunnel=0; shift;;
+      --no-test) test=0; shift;;
+      -*) die $E_USAGE "모르는 옵션 $1";;
+      *) target="$1"; shift;;
+    esac
+  done
+  [ -n "$target$alias" ] || die $E_USAGE "워커 주소(사용자@주소)나 --ssh 별칭이 필요해요"
+  [ -f "$MAIN_CONF" ] || cmd_init >/dev/null
+  local mh mu; mh="$(conf_get "$MAIN_CONF" MAIN_HOST)"; mu="$(conf_get "$MAIN_CONF" MAIN_USER)"
+  [ -f "$SCALEOUT_KEY" ] || ssh-keygen -q -t ed25519 -N "" -f "$SCALEOUT_KEY" -C "scaleout-main"
+
+  # 1) 처음 붙는 길
+  local boot=()
+  if [ -n "$alias" ]; then
+    boot=(ssh "${SSH_OPTS[@]}" "$alias")
+    "${boot[@]}" true 2>/dev/null || die $E_UNREACHABLE "「${alias}」로 못 붙음"
+    # scaleout 전용 키도 워커에 넣어 둔다
+    "${boot[@]}" "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && (grep -qF '$(cut -d' ' -f2 "$SCALEOUT_KEY.pub")' ~/.ssh/authorized_keys || echo '$(cat "$SCALEOUT_KEY.pub")' >> ~/.ssh/authorized_keys)"
+  else
+    if ! ssh "${SSH_OPTS[@]}" -i "$SCALEOUT_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new "$target" true 2>/dev/null; then
+      say "워커($target)에 키를 넣어요 — 워커 맥의 로그인 비밀번호를 한 번 물어요"
+      ssh-copy-id -i "$SCALEOUT_KEY.pub" -o StrictHostKeyChecking=accept-new "$target" >/dev/null || die $E_UNREACHABLE "키를 못 넣음 — 워커의 원격 로그인(시스템 설정 → 일반 → 공유)이 켜졌는지 확인"
+    fi
+    boot=(ssh "${SSH_OPTS[@]}" -i "$SCALEOUT_KEY" -o IdentitiesOnly=yes "$target")
+    [ -n "$lan" ] || lan="${target#*@}"
+  fi
+
+  # 2) 워커 파일 올리고 설치
+  say "워커 「${n}」 설치 중…"
+  "${boot[@]}" "mkdir -p ~/.scaleout/pkg" || die $E_UNREACHABLE "워커에 폴더를 못 만듦"
+  local f
+  for f in runner.sh settings.json setup.sh; do
+    "${boot[@]}" "cat > ~/.scaleout/pkg/$f" < "$PKG/worker/$f" || die $E_UNREACHABLE "$f 를 못 올림"
+  done
+  local port="" args="--name $n --dir $dir --max-jobs $maxj"
+  if [ "$tunnel" = 1 ] && [ -n "$mh" ]; then
+    port="$(conf_get "$(wconf "$n")" PORT 2>/dev/null || true)"; [ -n "$port" ] || port="$(next_port)"
+    args="$args --main-host $mh --main-user $mu --port $port"
+  fi
+  local out; out="$("${boot[@]}" "bash ~/.scaleout/pkg/setup.sh $args" 2>&1)" || { warn "$out"; die $E_UNREACHABLE "워커 설치 실패"; }
+  local pub hk cl wu
+  pub="$(printf '%s\n' "$out" | sed -n 's/^SCALEOUT_PUBKEY //p')"
+  hk="$(printf '%s\n' "$out" | sed -n 's/^SCALEOUT_HOSTKEY //p')"
+  cl="$(printf '%s\n' "$out" | sed -n 's/^SCALEOUT_CLAUDE //p')"
+  wu="$(printf '%s\n' "$out" | sed -n 's/^SCALEOUT_USER //p')"
+  [ -n "$lan" ] || lan="$("${boot[@]}" "ipconfig getifaddr en0 || ipconfig getifaddr en1" 2>/dev/null | head -1)"
+
+  # 3) 메인 쪽: 터널 키 허용 · ssh 별칭 · 호스트 키 · 설정 저장
+  [ -n "$pub" ] && authorize_tunnel_key "$n" "$port" "$pub"
+  [ -n "$pub" ] || port=""
+  write_worker_ssh "$n" "$wu" "$port" "$lan"
+  if [ -n "$hk" ]; then
+    local kh="$HOME/.ssh/known_hosts" tmp; touch "$kh"
+    tmp="$(mktemp)"; grep -v "^scaleout-$n " "$kh" > "$tmp"; cat "$tmp" > "$kh"; rm -f "$tmp"
+    echo "scaleout-$n $hk" >> "$kh"
+  fi
+  local c; c="$(wconf "$n")"; mkdir -p "$WDIR"; : > "$c"
+  conf_set "$c" USER "$wu"; conf_set "$c" PORT "$port"; conf_set "$c" LAN "$lan"; conf_set "$c" DIR "$dir"
+  conf_set "$c" ADDED "$(date '+%F %T')"
+
+  say "  워커 사용자: $wu · 같은 망 주소: ${lan:-없음} · 터널 포트: ${port:-안 씀} · Claude: $cl"
+  if [ -n "$port" ]; then
+    printf '  터널 기다리는 중'
+    local i=0; while [ $i -lt 24 ]; do nc -z -G 2 localhost "$port" 2>/dev/null && break; printf '.'; sleep 5; i=$((i + 1)); done; echo
+    nc -z -G 2 localhost "$port" 2>/dev/null && say "  터널 열림 (localhost:$port)" || warn "터널이 아직 안 열렸어요 — 워커의 ~/.scaleout/tunnel.log 를 보세요 (같은 망이면 그래도 붙어요)"
+  fi
+  route "$n" >/dev/null || die $E_UNREACHABLE "설치는 했는데 워커에 다시 못 붙음 — scaleout status $n"
+  [ "$cl" = "none" ] && warn "워커에 Claude Code 가 없어요 — 워커에서 설치 · 로그인 해 주세요 (curl -fsSL https://claude.ai/install.sh | bash)"
+  if [ "$test" = 1 ] && [ "$cl" != "none" ]; then
+    say "  시험 일 하나 맡겨 볼게요…"
+    local id; id="$(printf '%s\n' "scaleout 연결 시험이야. 이 기기 이름(scutil --get ComputerName)만 한 줄로 답해. 파일은 고치지 마." | cmd_run -w "$n" -d "~")" || die $E_JOB_FAILED "시험 일을 못 맡김"
+    local res; res="$(cmd_wait "$id" -m 240)"; local rc=$?
+    [ $rc -eq 0 ] && say "  시험 통과: $res" || warn "시험 실패(rc=$rc): $res — 워커에서 Claude Code 로그인을 확인해 주세요"
+  fi
+  say "워커 「${n}」 준비 끝 — scaleout run -w $n (또는 auto)"
+}
+
+cmd_accept() {
+  local n="${1:-}"; shift || true; local port="" u="" lan="" key=""
+  while [ $# -gt 0 ]; do
+    case "$1" in --port) port="$2"; shift 2;; --user) u="$2"; shift 2;; --lan) lan="$2"; shift 2;; *) key="$key${key:+ }$1"; shift;; esac
+  done
+  key="${key#SCALEOUT_PUBKEY }"
+  [ -n "$n" ] && [ -n "$port" ] && [ -n "$u" ] && [ -n "$key" ] || die $E_USAGE "accept <이름> --port <포트> --user <사용자> [--lan <주소>] <공개키>"
+  mkdir -p "$WDIR"; authorize_tunnel_key "$n" "$port" "$key"
+  write_worker_ssh "$n" "$u" "$port" "$lan"
+  local c; c="$(wconf "$n")"; : > "$c"
+  conf_set "$c" USER "$u"; conf_set "$c" PORT "$port"; conf_set "$c" LAN "$lan"; conf_set "$c" DIR "~"; conf_set "$c" ADDED "$(date '+%F %T')"
+  say "워커 「${n}」 받아들임 — 메인의 scaleout 키(아래)를 워커 ~/.ssh/authorized_keys 에 넣어야 메인이 들어갈 수 있어요:"
+  cat "$SCALEOUT_KEY.pub"
+}
+
+# ── 초대: 워커에서 한 줄만 붙이면 끝나게 ──
+# 메인이 한 번 쓰는 등록 키를 만들고(메인 authorized_keys 에 「scaleout _enroll」 만 돌게 묶음),
+# 그 키와 설치 절차를 base64 한 줄로 찍는다. 워커는 그 줄로 메인에서 패키지를 받고, 설치하고, 자기 키를 등록하고, 메인 키를 받아 넣는다.
+cmd_invite() {
+  local n="${1:-}"; shift || true
+  [ -n "$n" ] || die $E_USAGE "invite <이름> [--dir ~/workspace] [--max-jobs 2] [--hours 24]"
+  case "$n" in *[!a-z0-9-]*) die $E_USAGE "이름은 영문 소문자 · 숫자 · - 만";; esac
+  local dir="~" maxj=2 hours=24
+  while [ $# -gt 0 ]; do
+    case "$1" in --dir) dir="$2"; shift 2;; --max-jobs) maxj="$2"; shift 2;; --hours) hours="$2"; shift 2;; *) die $E_USAGE "모르는 옵션 $1";; esac
+  done
+  [ -f "$MAIN_CONF" ] || cmd_init >/dev/null
+  local mh mu ml port inv key ak="$HOME/.ssh/authorized_keys" tmp
+  mh="$(conf_get "$MAIN_CONF" MAIN_HOST)"; mu="$(conf_get "$MAIN_CONF" MAIN_USER)"
+  ml="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
+  nc -z -G 2 localhost 22 2>/dev/null || die $E_USAGE "메인의 원격 로그인이 꺼져 있어요 — 시스템 설정 → 일반 → 공유 → 원격 로그인"
+  port="$(conf_get "$(wconf "$n")" PORT 2>/dev/null || true)"; [ -n "$port" ] || port="$(next_port)"
+  inv="$SCALEOUT_CONF/invites/$n"; rm -rf "$inv"; mkdir -p "$inv"; chmod 700 "$inv"
+  ssh-keygen -q -t ed25519 -N "" -f "$inv/enroll" -C "scaleout-invite-$n"
+  local c; c="$(wconf "$n")"; mkdir -p "$WDIR"; : > "$c"
+  conf_set "$c" PORT "$port"; conf_set "$c" DIR "$dir"; conf_set "$c" PENDING "1"
+  conf_set "$c" EXPIRES "$(( $(date +%s) + hours * 3600 ))"
+  mkdir -p "$HOME/.ssh"; chmod 700 "$HOME/.ssh"; touch "$ak"; chmod 600 "$ak"
+  tmp="$(mktemp)"; grep -v " scaleout-invite-$n\$" "$ak" > "$tmp"; cat "$tmp" > "$ak"; rm -f "$tmp"
+  printf 'restrict,command="%s _enroll %s" %s\n' "$HOME/.local/bin/scaleout" "$n" "$(cat "$inv/enroll.pub")" >> "$ak"
+  key="$(base64 < "$inv/enroll" | tr -d '\n')"
+  local join
+  join="$(cat <<JOIN
+set -e
+N='$n'; PORT='$port'; MH='$mh'; MU='$mu'; ML='$ml'; DIR='$dir'; MAXJ='$maxj'
+export PATH="/opt/homebrew/bin:/usr/local/bin:\$PATH"
+K="\$(mktemp)"; trap 'rm -f "\$K"' EXIT
+echo '$key' | base64 -D > "\$K"; chmod 600 "\$K"
+echo "[1/5] 원격 로그인 (메인이 들어올 길)"
+if ! nc -z -G 2 localhost 22 2>/dev/null; then
+  echo "  원격 로그인을 켜요 — 이 맥의 로그인 비밀번호를 한 번 물어요"
+  sudo launchctl enable system/com.openssh.sshd 2>/dev/null || true
+  sudo launchctl bootstrap system /System/Library/LaunchDaemons/ssh.plist 2>/dev/null || sudo systemsetup -setremotelogin on
+fi
+echo "[2/5] 메인으로 가는 길"
+EN=(ssh -i "\$K" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=15)
+if [ -n "\$ML" ] && nc -z -G 3 "\$ML" 22 2>/dev/null; then T="\$MU@\$ML"; echo "  같은 망 (\$ML)"
+else
+  command -v cloudflared >/dev/null || { echo "  cloudflared 설치"; brew install cloudflared >/dev/null; }
+  EN+=(-o "ProxyCommand=\$(command -v cloudflared) access ssh --hostname %h"); T="\$MU@\$MH"; echo "  Cloudflare 터널 (\$MH)"
+fi
+echo "[3/5] 패키지 받기 · 설치"
+mkdir -p ~/.scaleout/pkg
+"\${EN[@]}" -n "\$T" pkg | tar -xzf - -C ~/.scaleout/pkg
+A="--name \$N --dir \$DIR --max-jobs \$MAXJ"; [ -n "\$MH" ] && A="\$A --main-host \$MH --main-user \$MU --port \$PORT"
+bash ~/.scaleout/pkg/setup.sh \$A > ~/.scaleout/setup.out
+echo "[4/5] 메인에 등록 · 키 교환"
+{ cat ~/.scaleout/setup.out; echo "SCALEOUT_LAN \$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null)"; } | "\${EN[@]}" "\$T" register > ~/.scaleout/main.pub
+mkdir -p ~/.ssh; chmod 700 ~/.ssh; touch ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys
+grep -qF "\$(cut -d' ' -f2 ~/.scaleout/main.pub)" ~/.ssh/authorized_keys || cat ~/.scaleout/main.pub >> ~/.ssh/authorized_keys
+echo "[5/5] 확인"
+C="\$(PATH="\$HOME/.local/bin:\$PATH" command -v claude || true)"
+[ -n "\$C" ] || echo "  ※ 이 맥에 Claude Code 가 없어요: curl -fsSL https://claude.ai/install.sh | bash 뒤 claude 를 열어 로그인해 주세요"
+echo "끝 — 메인에서 scaleout status 로 「\${N}」 을 확인하세요"
+JOIN
+)"
+  say "워커 「$n」 초대 — ${hours}시간 안에 한 번만 쓸 수 있어요 (터널 포트 $port)"
+  say "워커 맥의 터미널에 아래 한 줄을 붙여 넣으세요. 원격 데스크톱으로 넣어도 돼요."
+  say "원격 로그인이 꺼져 있으면 비밀번호를 한 번 묻고, 워커 Claude Code 는 로그인돼 있어야 해요."
+  echo
+  # 절차는 bash 의 인자로 넘긴다 — 표준 입력으로 흘리면 안의 ssh 가 남은 절차를 먹고, sudo 비밀번호도 못 묻는다
+  echo "bash -c \"\$(echo $(printf '%s' "$join" | base64 | tr -d '\n') | base64 -D)\""
+}
+
+# 메인 authorized_keys 의 등록 키가 부르는 명령 (사람이 직접 부르지 않는다)
+cmd__enroll() {
+  local n="${1:-}" c inv; c="$(wconf "$n")"; inv="$SCALEOUT_CONF/invites/$n"
+  [ -n "$n" ] && [ -f "$c" ] && [ "$(conf_get "$c" PENDING)" = "1" ] && [ -d "$inv" ] || { echo "초대가 없거나 이미 썼어요" >&2; exit 5; }
+  [ "$(date +%s)" -le "$(conf_get "$c" EXPIRES)" ] || { echo "초대 기한이 지났어요 — 메인에서 scaleout invite $n 다시" >&2; exit 5; }
+  case "${SSH_ORIGINAL_COMMAND:-}" in
+    pkg) tar -czf - -C "$PKG/worker" runner.sh settings.json setup.sh ;;
+    register)
+      local in pub hk wu lan port tmp ak="$HOME/.ssh/authorized_keys" kh="$HOME/.ssh/known_hosts"
+      in="$(cat)"
+      pub="$(printf '%s\n' "$in" | sed -n 's/^SCALEOUT_PUBKEY //p' | head -1)"
+      hk="$(printf '%s\n' "$in" | sed -n 's/^SCALEOUT_HOSTKEY //p' | head -1)"
+      wu="$(printf '%s\n' "$in" | sed -n 's/^SCALEOUT_USER //p' | head -1)"
+      lan="$(printf '%s\n' "$in" | sed -n 's/^SCALEOUT_LAN //p' | head -1)"
+      port="$(conf_get "$c" PORT)"
+      [ -n "$wu" ] || { echo "워커 정보가 비었어요" >&2; exit 4; }
+      [ -n "$pub" ] && authorize_tunnel_key "$n" "$port" "$pub"
+      [ -n "$pub" ] || port=""
+      write_worker_ssh "$n" "$wu" "$port" "$lan"
+      if [ -n "$hk" ]; then touch "$kh"; tmp="$(mktemp)"; grep -v "^scaleout-$n " "$kh" > "$tmp"; cat "$tmp" > "$kh"; rm -f "$tmp"; echo "scaleout-$n $hk" >> "$kh"; fi
+      conf_set "$c" USER "$wu"; conf_set "$c" PORT "$port"; conf_set "$c" LAN "$lan"; conf_set "$c" PENDING "0"; conf_set "$c" ADDED "$(date '+%F %T')"
+      # 등록 키는 한 번만 — 지운다
+      tmp="$(mktemp)"; grep -v " scaleout-invite-$n\$" "$ak" > "$tmp"; cat "$tmp" > "$ak"; rm -f "$tmp"
+      rm -rf "$inv"
+      cat "$SCALEOUT_KEY.pub" ;;
+    *) echo "등록 키로는 pkg · register 만 돼요" >&2; exit 4 ;;
+  esac
+}
+
+cmd_remove() {
+  local n="${1:-}"; [ -n "$n" ] || die $E_USAGE "remove <이름>"; need_worker "$n"
+  if route "$n" >/dev/null; then rsh "$n" "bash ~/.scaleout/pkg/setup.sh --uninstall" 2>/dev/null | tail -1; fi
+  ssh_block_del "$SSHC" "scaleout $n"
+  local ak="$HOME/.ssh/authorized_keys" kh="$HOME/.ssh/known_hosts" tmp
+  [ -f "$ak" ] && { tmp="$(mktemp)"; grep -v " scaleout-$n\$" "$ak" > "$tmp"; cat "$tmp" > "$ak"; rm -f "$tmp"; }
+  [ -f "$kh" ] && { tmp="$(mktemp)"; grep -v "^scaleout-$n " "$kh" > "$tmp"; cat "$tmp" > "$kh"; rm -f "$tmp"; }
+  rm -f "$(wconf "$n")"
+  say "워커 「${n}」 뗌"
+}
+
+probe() {  # probe <이름> → "남은메모리% 도는일수" (못 붙으면 실패)
+  rsh "$1" 'm=$(sysctl -n kern.memorystatus_level 2>/dev/null || echo 0); r=0; for d in $HOME/.scaleout/jobs/*/; do [ -f "$d/started" ] && [ ! -f "$d/rc" ] && r=$((r+1)); done; q=$(ls $HOME/.scaleout/queue 2>/dev/null | wc -l | tr -d " "); echo "$m $((r+q))"' 2>/dev/null
+}
+
+cmd_ls() {
+  local w c
+  [ -n "$(workers)" ] || { say "워커 없음 — scaleout add <이름> <사용자@주소>"; return 0; }
+  for w in $(workers); do
+    c="$(wconf "$w")"
+    printf '%-12s 사용자=%s 터널포트=%s 같은망=%s 기본폴더=%s\n' "$w" "$(conf_get "$c" USER)" "$(conf_get "$c" PORT)" "$(conf_get "$c" LAN)" "$(conf_get "$c" DIR)"
+  done
+}
+
+cmd_status() {
+  local ws w r p; ws="${1:-$(workers)}"
+  say "메인 $(scutil --get LocalHostName 2>/dev/null) · 남은 메모리 $(free_mem_pct)%"
+  for w in $ws; do
+    need_worker "$w"
+    if r="$(route "$w")"; then
+      p="$(probe "$w")"
+      printf '%-12s 붙음(%s) · 남은 메모리 %s%% · 도는 일 %s\n' "$w" "${r#scaleout-$w}" "${p% *}" "${p#* }" | sed 's/붙음()/붙음(터널)/; s/붙음(-lan)/붙음(같은 망)/'
+    else
+      printf '%-12s 못 붙음 (잠들었거나 꺼짐)\n' "$w"
+    fi
+  done
+}
+
+cmd_doctor() {
+  local n="${1:-}"; [ -n "$n" ] || die $E_USAGE "doctor <이름>"; need_worker "$n"
+  rsh "$n" "$RP"' echo "기기: $(scutil --get ComputerName) · macOS $(sw_vers -productVersion) · $(sysctl -n machdep.cpu.brand_string) · 메모리 $(($(sysctl -n hw.memsize)/1073741824))GB · 남은 $(sysctl -n kern.memorystatus_level)%"
+for t in claude git gh node npm flutter xcodebuild brew; do v=--version; [ $t = xcodebuild ] && v=-version; printf "  %-10s %s\n" "$t" "$(command -v $t >/dev/null && ($t $v 2>/dev/null | head -1) || echo 없음)"; done
+echo "  실행기: $(launchctl print gui/$(id -u)/dev.scaleout.runner >/dev/null 2>&1 && echo 등록됨 || echo 없음) · 터널: $(launchctl print gui/$(id -u)/dev.scaleout.tunnel 2>/dev/null | sed -n "s/.*state = //p" | head -1)"
+echo "  디스크 여유: $(df -h /System/Volumes/Data | tail -1 | awk "{print \$4}")"'
+}
+
+pick_worker() {  # 남은 메모리 많고 도는 일 적은 워커
+  local best="" bests=-999 w p m r s
+  for w in $(workers); do
+    p="$(probe "$w")" || continue
+    m="${p% *}"; r="${p#* }"; s=$((m - r * 25))
+    [ "$s" -gt "$bests" ] && { bests="$s"; best="$w"; }
+  done
+  [ -n "$best" ] || return 1
+  echo "$best"
+}
+
+cmd_run() {
+  local w="auto" dir="" file=""
+  while [ $# -gt 0 ]; do
+    case "$1" in -w) w="$2"; shift 2;; -d) dir="$2"; shift 2;; -f) file="$2"; shift 2;; *) die $E_USAGE "run [-w 이름|auto] [-d 폴더] [-f 파일]";; esac
+  done
+  local tmp; tmp="$(mktemp)"
+  if [ -n "$file" ]; then cat "$file" > "$tmp"; else cat > "$tmp"; fi
+  [ -s "$tmp" ] || { rm -f "$tmp"; die $E_USAGE "지시가 비었어요"; }
+  if [ "$w" = "auto" ]; then w="$(pick_worker < /dev/null)" || { rm -f "$tmp"; die $E_UNREACHABLE "붙는 워커가 없어요 — scaleout status"; }; fi
+  need_worker "$w"
+  [ -n "$dir" ] || dir="$(conf_get "$(wconf "$w")" DIR)"; [ -n "$dir" ] || dir="~"
+  local jid; jid="$(date +%Y%m%d-%H%M%S)-$RANDOM"
+  rsh_in "$w" "mkdir -p ~/.scaleout/jobs/$jid ~/.scaleout/queue && cat > ~/.scaleout/jobs/$jid/prompt.md && printf '%s' '$dir' > ~/.scaleout/jobs/$jid/dir && touch ~/.scaleout/queue/$jid" < "$tmp" \
+    || { rm -f "$tmp"; die $E_UNREACHABLE "워커에 일을 못 넣음"; }
+  rm -f "$tmp"
+  echo "$jid@$w"
+}
+
+split_id() { JID="${1%@*}"; JW="${1##*@}"; [ "$JID" != "$1" ] || die $E_USAGE "작업 번호 꼴이 아니에요 (번호@워커)"; need_worker "$JW"; }
+
+fetch_result() {  # fetch_result <작업 번호> → 결과 출력, 종료 코드는 워커 rc 기준
+  local id="$1" rc out
+  mkdir -p "$SCALEOUT_CONF/results"
+  out="$SCALEOUT_CONF/results/$id.json"
+  rsh "$JW" "cat ~/.scaleout/jobs/$JID/out.json 2>/dev/null" > "$out"
+  rc="$(rsh "$JW" "cat ~/.scaleout/jobs/$JID/rc 2>/dev/null")"
+  local res; res="$(json_result "$out")"
+  if [ "$rc" = "0" ] && [ -n "$res" ]; then printf '%s\n' "$res"; return 0; fi
+  warn "워커 Claude 실패 (rc=$rc)"
+  rsh "$JW" "tail -15 ~/.scaleout/jobs/$JID/err.log 2>/dev/null" >&2
+  [ -n "$res" ] && printf '%s\n' "$res"
+  return $E_JOB_FAILED
+}
+
+cmd_wait() {
+  local id="${1:-}"; shift || true; [ -n "$id" ] || die $E_USAGE "wait <작업 번호> [-m 초]"
+  local max=540
+  while [ $# -gt 0 ]; do case "$1" in -m) max="$2"; shift 2;; *) die $E_USAGE "wait <작업 번호> [-m 초]";; esac; done
+  split_id "$id"
+  local start; start="$(date +%s)"
+  while :; do
+    if [ -n "$(rsh "$JW" "cat ~/.scaleout/jobs/$JID/rc 2>/dev/null")" ]; then fetch_result "$id"; return $?; fi
+    [ $(( $(date +%s) - start )) -ge "$max" ] && { say "아직 도는 중 — scaleout wait $id 로 이어서 기다리기"; return $E_RUNNING; }
+    sleep 10
+  done
+}
+
+cmd_result() { [ -n "${1:-}" ] || die $E_USAGE "result <작업 번호>"; split_id "$1"; fetch_result "$1"; }
+cmd_logs() { [ -n "${1:-}" ] || die $E_USAGE "logs <작업 번호>"; split_id "$1"; rsh "$JW" "d=~/.scaleout/jobs/$JID; for f in started finished rc; do [ -f \$d/\$f ] && echo \"\$f: \$(cat \$d/\$f)\"; done; echo '--- err.log'; tail -40 \$d/err.log 2>/dev/null"; }
+cmd_cancel() {
+  [ -n "${1:-}" ] || die $E_USAGE "cancel <작업 번호>"; split_id "$1"
+  rsh "$JW" "d=~/.scaleout/jobs/$JID; rm -f ~/.scaleout/queue/$JID; touch \$d/cancelled; [ -f \$d/pid ] && kill -TERM \$(cat \$d/pid) 2>/dev/null; [ -f \$d/rc ] || [ -f \$d/started ] || echo 130 > \$d/rc; echo 취소함"
+}
+cmd_jobs() {
+  local w
+  for w in ${1:-$(workers)}; do
+    route "$w" >/dev/null || { say "$w: 못 붙음"; continue; }
+    rsh "$w" "for d in \$(ls -1dt ~/.scaleout/jobs/*/ 2>/dev/null | head -10); do n=\$(basename \$d); if [ -f \$d/rc ]; then s=\"끝남 rc=\$(cat \$d/rc)\"; elif [ -f \$d/started ]; then s=도는중; else s=대기; fi; echo \"\$n@$w \$s\"; done"
+  done
+}
+cmd_exec() {
+  local n="${1:-}"; shift || true; [ "${1:-}" = "--" ] && shift
+  [ -n "$n" ] && [ $# -gt 0 ] || die $E_USAGE "exec <이름> -- <명령...>"
+  need_worker "$n"
+  local d; d="$(conf_get "$(wconf "$n")" DIR)"
+  rsh "$n" "$RP cd ${d:-~} 2>/dev/null; $*"
+}
+
+c="${1:-help}"; shift || true
+case "$c" in
+  init) cmd_init "$@";;
+  add) cmd_add "$@";;
+  accept) cmd_accept "$@";;
+  invite) cmd_invite "$@";;
+  _enroll) cmd__enroll "$@";;
+  remove|rm) cmd_remove "$@";;
+  ls|list) cmd_ls;;
+  status) cmd_status "$@";;
+  doctor) cmd_doctor "$@";;
+  run) cmd_run "$@";;
+  wait) cmd_wait "$@";;
+  result) cmd_result "$@";;
+  logs) cmd_logs "$@";;
+  cancel) cmd_cancel "$@";;
+  jobs) cmd_jobs "$@";;
+  exec) cmd_exec "$@";;
+  version|-v|--version) echo "scaleout $VERSION";;
+  help|-h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//';;
+  *) die $E_USAGE "모르는 명령 「${c}」 — scaleout help";;
+esac
