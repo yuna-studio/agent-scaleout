@@ -5,7 +5,7 @@
 # Works with bash 3.2 (stock macOS): no `wait -n`, no associative arrays, and ${var} before non-ASCII text.
 set -u
 B="$HOME/.scaleout"
-export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$HOME/Library/Android/sdk/platform-tools:${ANDROID_HOME:-$HOME/Android/Sdk}/platform-tools:$PATH"
 [ -f "$B/node.conf" ] && . "$B/node.conf"
 OS="$(uname -s)"
 VERSION="__VERSION__"
@@ -36,6 +36,25 @@ runner_ok() {
     elif crontab -l 2>/dev/null | grep -q scaleout; then echo true; else echo false; fi
   fi
 }
+devices_scan() {  # slow (xcrun devicectl can hang) — run in the background only
+  local a=0 i=0
+  command -v adb >/dev/null 2>&1 && a="$(adb devices 2>/dev/null | awk 'NR>1 && $2=="device"' | wc -l | tr -d ' ')"
+  if [ "$OS" = Darwin ] && [ -x /usr/bin/xcrun ] && xcode-select -p >/dev/null 2>&1; then
+    i="$(xcrun devicectl list devices 2>/dev/null | grep -E 'connected|available \(paired\)' | grep -E -c 'iPhone|iPad' || true)"   # not watches
+  elif command -v idevice_id >/dev/null 2>&1; then i="$(idevice_id -l 2>/dev/null | wc -l | tr -d ' ')"; fi
+  printf '{"android":%s,"ios":%s}' "${a:-0}" "${i:-0}" > "$B/devices.cache.tmp" && mv "$B/devices.cache.tmp" "$B/devices.cache"
+}
+devices() {  # USB-attached real devices {"android":N,"ios":N} — never blocks: answers from cache, refreshes in the background
+  local c="$B/devices.cache"
+  # DEVICE_SCAN=off in node.conf: never scan (write devices.cache yourself, e.g. {"android":2,"ios":0})
+  if [ "${DEVICE_SCAN:-on}" != off ] && { [ ! -f "$c" ] || [ -z "$(find "$c" -mmin -1 2>/dev/null)" ]; }; then
+    if mkdir "$B/devices.scan" 2>/dev/null; then
+      ( devices_scan; rm -rf "$B/devices.scan" ) >/dev/null 2>&1 &
+      # a scan stuck for more than 2 minutes is abandoned so the next call can retry
+    elif [ -n "$(find "$B/devices.scan" -maxdepth 0 -mmin +2 2>/dev/null)" ]; then rm -rf "$B/devices.scan"; fi
+  fi
+  cat "$c" 2>/dev/null || printf '{"android":0,"ios":0}'
+}
 skills_hash() { cat "$B/skills.hash" 2>/dev/null || echo none; }
 agents() {
   local out="" a
@@ -48,9 +67,9 @@ verb="${1:-}"; shift || true
 case "$verb" in
   version) echo "$VERSION" ;;
   metrics)
-    printf '{"os":"%s","arch":"%s","host":"%s","mem_free_pct":%s,"mem_total_gb":%s,"disk_free_gb":%s,"work_free_gb":%s,"load":%s,"cpus":%s,"running":%s,"queued":%s,"runner":%s,"agents":%s,"skills_hash":"%s","version":"%s"}\n' \
+    printf '{"os":"%s","arch":"%s","host":"%s","mem_free_pct":%s,"mem_total_gb":%s,"disk_free_gb":%s,"work_free_gb":%s,"load":%s,"cpus":%s,"running":%s,"queued":%s,"runner":%s,"agents":%s,"devices":%s,"skills_hash":"%s","version":"%s"}\n' \
       "$(j "$OS")" "$(uname -m)" "$(j "$(hostname)")" "$(mem_free_pct)" "$(mem_total_gb)" "$(disk_free_gb "$HOME")" \
-      "$(disk_free_gb "${WORK_ROOT:-$HOME}")" "$(load1)" "$(cpus)" "$(running_jobs)" "$(queued_jobs)" "$(runner_ok)" "$(agents)" "$(skills_hash)" "$VERSION" ;;
+      "$(disk_free_gb "${WORK_ROOT:-$HOME}")" "$(load1)" "$(cpus)" "$(running_jobs)" "$(queued_jobs)" "$(runner_ok)" "$(agents)" "$(devices)" "$(skills_hash)" "$VERSION" ;;
 
   submit)  # submit <jid> <agent> <timeout_min> <workdir>   (prompt on stdin)
     jid="$1"; d="$B/jobs/$jid"; mkdir -p "$d" "$B/queue"

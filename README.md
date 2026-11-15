@@ -86,7 +86,7 @@ scaleout exec build-01 -- df -h                   # any shell command on a node
 | `-a claude\|codex\|gemini` | pick an agent (default: the node's default) |
 | `-d DIR` | working folder on the node (default: the node's `--dir`) |
 | `--sync DIR` | work on an orchestrator folder: copied to the node before, copied back after |
-| `--tags a,b` | node requirements, e.g. `xcode`, `gpu`, `windows` |
+| `--tags a,b` | node requirements, e.g. `xcode`, `gpu`, `windows`; `android-device` / `ios-device` = needs a phone plugged into the node |
 | `--timeout MIN` | hard limit (default 180) |
 
 Exit codes: `0` ok · `1` agent failed · `2` still running · `3` no reachable node · `4` usage · `5` not found.
@@ -118,9 +118,34 @@ Write tasks so they stand alone — the node's agent has not seen your conversat
 | finished job folders | 3 days | removed — results are fetched and deleted right away anyway |
 | runner service missing | — | re-registered (`ctl repair`) |
 | free disk when a job starts | `< 2 GB` | job refused (exit 28) instead of filling the disk |
+| free memory when a job starts | `< 12 %` | the node holds the job (never starts a second agent into swap); after 10 min the orchestrator moves it to another node |
+| phones attached | — | `android-device` / `ios-device` jobs go only to nodes with a free phone of that kind, one job per phone |
 
 Change with `scaleout config KEY VALUE` (e.g. `scaleout config min_free_disk_gb 10`) or per node (`scaleout config --node build-01 max_jobs 1`).
 Machine-wide cleanup (Docker prune, unavailable simulators) runs only when you ask: `scaleout cleanup NODE --deep`.
+
+## Real devices
+
+Nodes count USB-attached phones (`adb devices`, `xcrun devicectl`) and report them in `scaleout status` (`A1 I1`).
+Tag a job `android-device` or `ios-device` and it waits for a node with a free phone. Pairing a phone (USB debugging,
+"Trust this computer", iOS Developer Mode) is a one-time step on the node. Real phones are also the cheapest way to make
+small nodes useful: an Android emulator alone takes ~4.5 GB of RAM, a phone takes none.
+
+## Sizing nodes
+
+What one mobile job roughly needs (measured on Apple Silicon Macs running Flutter projects):
+
+| part | memory |
+|---|---|
+| coding agent (Claude Code CLI) | 0.3–0.5 GB |
+| Gradle / Xcode build | 2–3 GB |
+| iOS Simulator | ~2 GB |
+| Android emulator | ~4.5 GB |
+| real phone | ~0 GB |
+
+So an 8 GB node runs one job with a real phone (no emulator), a 16 GB node runs two or three, and the CPU becomes the
+limit after that. 256 GB of disk is enough for Xcode, one simulator runtime, the Android SDK and caches (the node cleans
+itself below 8 GB free). Start with `--max-jobs 1` on 8 GB nodes; the node's memory guard also holds extra jobs.
 
 ## Skills sync
 

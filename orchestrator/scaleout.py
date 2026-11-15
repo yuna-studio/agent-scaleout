@@ -51,6 +51,7 @@ DEFAULTS: Dict[str, Any] = {
     "cleanup_below_disk_gb": 8,  # ask the node to reclaim disk below this
     "job_timeout_min": 180,
     "stall_min": 5,              # running job whose heartbeat is older than this is considered dead
+    "node_wait_min": 10,         # job handed to a node but not started there (node short on memory) -> move it
     "offline_grace_min": 10,     # node unreachable this long -> its jobs are retried elsewhere
     "retries": 2,
     "keep_job_days": 3,
@@ -678,7 +679,12 @@ def submit_job(cfg: Dict[str, Any], prompt: str, node: Optional[str] = None, age
     return jid
 
 
-def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[str, Any]], load: Dict[str, int]) -> Optional[str]:
+DEVICE_TAGS = ("android-device", "ios-device")
+
+
+def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[str, Any]], load: Dict[str, int],
+              dev_load: Optional[Dict[Tuple[str, str], int]] = None) -> Optional[str]:
+    dev_load = dev_load or {}
     best, best_score = None, -1e9
     for name, n in cfg["nodes"].items():
         if n.get("pending") or (j.get("want_node") and name != j["want_node"]):
@@ -686,7 +692,15 @@ def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[st
         st = metrics.get(name, {})
         if node_health(cfg, name, st) != "ok":
             continue
-        if not set(j.get("tags") or []) <= set(n.get("tags") or []) | {st.get("os", "").lower()}:
+        if not j.get("want_node") and (j.get("avoid") or {}).get(name, 0) > now():
+            continue
+        devs = st.get("devices") or {}
+        have = set(n.get("tags") or []) | {st.get("os", "").lower()}
+        have |= {f"{k}-device" for k, v in devs.items() if int(v or 0) > 0}
+        if not set(j.get("tags") or []) <= have:
+            continue
+        # one job per attached phone: a job tagged android-device / ios-device needs a free device of that kind
+        if any(int(devs.get(t[:-7], 0) or 0) <= dev_load.get((name, t), 0) for t in (j.get("tags") or []) if t in DEVICE_TAGS):
             continue
         agent = j.get("agent") or "default"
         if agent not in ("default", "custom") and agent not in (st.get("agents") or []):
@@ -790,6 +804,12 @@ def collect(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[str,
         n.ctl("rm", j["id"])
         j.update({"status": "done" if rc == 0 else ("cancelled" if rc == 130 else "failed"), "rc": rc, "finished_at": now()})
         j["history"].append({"t": now(), "event": j["status"], "node": name, "rc": rc})
+    elif state == "queued" and now() - j.get("dispatched_at", now()) > d.get("node_wait_min", 10) * 60:
+        # the node accepted it but never started it (its runner holds jobs while memory is short): try another node
+        n.ctl("rm", j["id"])
+        j.setdefault("avoid", {})[name] = now() + 30 * 60
+        j["history"].append({"t": now(), "event": "moved", "node": name, "why": f"not started on {name} in {d.get('node_wait_min', 10)} min"})
+        j.update({"status": "queued", "node": None})
     elif state in ("missing", "lost"):
         requeue(cfg, j, f"job vanished on {name}")
 
@@ -871,17 +891,24 @@ def tick(verbose: bool = False) -> None:
                 collect(cfg, j, metrics)
                 save_job(j)
         load: Dict[str, int] = {}
+        dev_load: Dict[Tuple[str, str], int] = {}
         for j in jobs:
             if j.get("status") in ("dispatched", "running") and j.get("node"):
                 load[j["node"]] = load.get(j["node"], 0) + 1
+                for t in j.get("tags") or []:
+                    if t in DEVICE_TAGS:
+                        dev_load[(j["node"], t)] = dev_load.get((j["node"], t), 0) + 1
         for name, st in metrics.items():  # work the node already has (other orchestrators, manual jobs)
             load[name] = max(load.get(name, 0), int(st.get("running", 0)) + int(st.get("queued", 0)))
         for j in jobs:
             if j.get("status") != "queued":
                 continue
-            name = pick_node(cfg, j, metrics, load)
+            name = pick_node(cfg, j, metrics, load, dev_load)
             if name and dispatch(cfg, j, name):
                 load[name] = load.get(name, 0) + 1
+                for t in j.get("tags") or []:
+                    if t in DEVICE_TAGS:
+                        dev_load[(name, t)] = dev_load.get((name, t), 0) + 1
                 save_job(j)
                 if verbose:
                     say(f"dispatched {j['id']} -> {name}")
@@ -1012,18 +1039,24 @@ def cmd_nodes(a) -> None:
             f"agent={n.get('agent', 'claude')} max={n.get('max_jobs', 2)} tags={','.join(n.get('tags') or []) or '-'}{' (invite pending)' if n.get('pending') else ''}")
 
 
+def fmt_devices(st: Dict[str, Any]) -> str:
+    d = st.get("devices") or {}
+    parts = [f"{k[0].upper()}{v}" for k, v in (("android", d.get("android", 0)), ("ios", d.get("ios", 0))) if int(v or 0)]
+    return " ".join(parts) or "-"
+
+
 def cmd_status(a) -> None:
     cfg = load_cfg()
     names = a.names or None
     metrics = refresh_metrics(cfg, names, max_age=0)
     say(f"orchestrator {socket.gethostname().split('.')[0]} · agent-scaleout {VERSION}")
-    say(f"{'node':<14}{'state':<12}{'route':<8}{'mem free':>9}{'disk free':>11}{'load':>8}{'jobs':>7}  agents")
+    say(f"{'node':<14}{'state':<12}{'route':<8}{'mem free':>9}{'disk free':>11}{'load':>8}{'jobs':>7}  {'devices':<9}agents")
     for name in sorted(metrics):
         st = metrics[name]
         h = node_health(cfg, name, st)
         route = "-" if not st.get("online") else ("lan" if str(st.get("route", "")).endswith("-lan") else "tunnel")
         say(f"{name:<14}{h:<12}{route:<8}{str(st.get('mem_free_pct', '-')) + '%':>9}{str(st.get('disk_free_gb', '-')) + 'GB':>11}"
-            f"{str(st.get('load', '-')):>8}{str(st.get('running', 0)) + '+' + str(st.get('queued', 0)):>7}  {','.join(st.get('agents') or []) or '-'}")
+            f"{str(st.get('load', '-')):>8}{str(st.get('running', 0)) + '+' + str(st.get('queued', 0)):>7}  {fmt_devices(st):<9}{','.join(st.get('agents') or []) or '-'}")
     q = [j for j in all_jobs() if j.get("status") in ("queued", "dispatched", "running")]
     say(f"queue: {sum(1 for j in q if j['status'] == 'queued')} waiting · {sum(1 for j in q if j['status'] != 'queued')} running")
 

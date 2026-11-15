@@ -7,7 +7,7 @@
 set -u
 B="$HOME/.scaleout"; Q="$B/queue"; J="$B/jobs"
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
-MAX_JOBS=2; AGENT=claude; AGENT_CMD=""; MIN_FREE_GB=2
+MAX_JOBS=2; AGENT=claude; AGENT_CMD=""; MIN_FREE_GB=2; MIN_FREE_MEM_PCT=12
 [ -f "$B/node.conf" ] && . "$B/node.conf"
 mkdir -p "$Q" "$J" "$B/work"
 
@@ -21,6 +21,10 @@ echo $$ > "$LOCK/pid"; trap 'rm -rf "$LOCK"' EXIT
 
 running() { jobs -rp | wc -l | tr -d ' '; }
 disk_free_gb() { df -Pk "$HOME" | awk 'NR==2 {printf "%d", $4/1048576}'; }
+mem_free_pct() {
+  if [ "$(uname -s)" = Darwin ]; then sysctl -n kern.memorystatus_level 2>/dev/null || echo 100
+  else awk '/MemTotal/ {t=$2} /MemAvailable/ {a=$2} END {if (t) printf "%d", a*100/t; else print 100}' /proc/meminfo; fi
+}
 
 agent_cmd() {  # agent_cmd <agent> -> command line that reads the prompt on stdin and writes the answer to stdout
   local s=""; [ -f "$B/settings/claude.json" ] && s="--settings $B/settings/claude.json"
@@ -63,6 +67,10 @@ while :; do
   if [ ! -e "$1" ]; then [ "$(running)" -eq 0 ] && break; sleep 2; continue; fi
   for f in "$@"; do
     while [ "$(running)" -ge "$MAX_JOBS" ]; do sleep 2; done
+    # do not start another agent while this machine is short on memory (other apps, other agents);
+    # the job waits here and the orchestrator moves it elsewhere if it waits too long
+    while [ "$(running)" -gt 0 ] && [ "$(mem_free_pct)" -lt "$MIN_FREE_MEM_PCT" ]; do sleep 5; done
+    if [ "$(mem_free_pct)" -lt "$MIN_FREE_MEM_PCT" ]; then sleep 15; continue 2; fi
     id="$(basename "$f")"; rm -f "$f"
     [ -d "$J/$id" ] || continue
     run_job "$J/$id" &

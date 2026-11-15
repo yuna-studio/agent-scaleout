@@ -16,6 +16,7 @@ function Mem-TotalGB { $o = Get-CimInstance Win32_OperatingSystem; return [int](
 function Running-Jobs { @(Get-ChildItem (Join-Path $B "jobs") -Directory -ErrorAction SilentlyContinue | Where-Object { (Test-Path "$($_.FullName)\started") -and -not (Test-Path "$($_.FullName)\rc") }).Count }
 function Queued-Jobs { @(Get-ChildItem (Join-Path $B "queue") -File -ErrorAction SilentlyContinue).Count }
 function Agents { $a = @(); foreach ($x in "claude", "codex", "gemini") { if (Get-Command $x -ErrorAction SilentlyContinue) { $a += $x } }; if ($Conf.AGENT_CMD) { $a += "custom" }; return , $a }
+function Devices { $a = 0; if (Get-Command adb -ErrorAction SilentlyContinue) { $a = @(adb devices | Select-Object -Skip 1 | Where-Object { $_ -match "\tdevice$" }).Count }; return @{ android = $a; ios = 0 } }
 function Runner-Ok { return [bool](Get-ScheduledTask -TaskName "scaleout-runner" -ErrorAction SilentlyContinue) }
 function Read-StdinBytes([string]$to) { $in = [Console]::OpenStandardInput(); $fs = [IO.File]::Create($to); $in.CopyTo($fs); $fs.Close() }
 function Kick { Start-ScheduledTask -TaskName "scaleout-runner" -ErrorAction SilentlyContinue }
@@ -27,7 +28,7 @@ switch ($Verb) {
     $n = [Environment]::ProcessorCount
     [ordered]@{ os = "Windows"; arch = $env:PROCESSOR_ARCHITECTURE; host = $env:COMPUTERNAME; mem_free_pct = (Mem-FreePct); mem_total_gb = (Mem-TotalGB)
       disk_free_gb = (Disk-FreeGB); work_free_gb = (Disk-FreeGB $Conf.WORK_ROOT); load = [math]::Round($cpu / 100 * $n, 2); cpus = $n
-      running = (Running-Jobs); queued = (Queued-Jobs); runner = (Runner-Ok); agents = (Agents)
+      running = (Running-Jobs); queued = (Queued-Jobs); runner = (Runner-Ok); agents = (Agents); devices = (Devices)
       skills_hash = $(if (Test-Path "$B\skills.hash") { (Get-Content "$B\skills.hash" -Raw).Trim() } else { "none" }); version = $Version } | ConvertTo-Json -Compress
   }
   "submit" {

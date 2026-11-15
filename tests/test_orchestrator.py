@@ -43,7 +43,8 @@ def make_node(name: str) -> Path:
         (b / d).mkdir()
     shutil.copy(ROOT / "node/unix/ctl.sh", b / "bin/ctl")
     shutil.copy(ROOT / "node/unix/runner.sh", b / "bin/runner.sh")
-    (b / "node.conf").write_text(f"NAME={name}\nWORK_ROOT=~/work\nMAX_JOBS=1\nAGENT=claude\nMIN_FREE_GB=0\nRUNNER=manual\n")
+    (b / "node.conf").write_text(f"NAME={name}\nWORK_ROOT=~/work\nMAX_JOBS=1\nAGENT=claude\nMIN_FREE_GB=0\nMIN_FREE_MEM_PCT=0\nRUNNER=manual\nDEVICE_SCAN=off\n")
+    (b / "devices.cache").write_text('{"android":0,"ios":0}')
     (h / ".local/bin").mkdir(parents=True)
     (h / ".local/bin/claude").write_text(STUB)
     for f in (b / "bin/ctl", b / "bin/runner.sh", h / ".local/bin/claude"):
@@ -209,7 +210,54 @@ class E2E(unittest.TestCase):
         self.assertEqual(so.load_job(jid)["status"], "done")
         self.assertEqual((src / "output.txt").read_text(), "hello")
 
-    def test_8_helpers(self):
+    def test_8_job_held_by_busy_node_moves(self):
+        conf = HOMES["n1"] / ".scaleout/node.conf"
+        orig = conf.read_text()
+        conf.write_text(orig.replace("MIN_FREE_MEM_PCT=0", "MIN_FREE_MEM_PCT=101"))   # n1 "never has enough memory"
+        for h in HOMES.values():
+            (h / ".local/bin/claude").write_text(STUB)
+        cfg = so.load_cfg()
+        cfg["nodes"]["n2"]["tags"] = ["n1", "n2"]; so.save_cfg(cfg)
+        jid = so.submit_job(cfg, "held", tags=["n1"])
+        cfg["nodes"]["n2"]["tags"] = ["n2"]; so.save_cfg(cfg)   # first dispatch can only go to n1
+        so.tick()
+        self.assertEqual(so.load_job(jid)["node"], "n1")
+        time.sleep(3)
+        self.assertEqual(json.loads(fake_ctl(so.Node("n1", so.load_cfg()), "state", jid).stdout)["state"], "queued")
+        j = so.load_job(jid); j["dispatched_at"] -= 3600; so.save_job(j)
+        cfg = so.load_cfg(); cfg["nodes"]["n2"]["tags"] = ["n1", "n2"]; so.save_cfg(cfg)
+        so.tick()
+        j = so.load_job(jid)
+        self.assertTrue(any(h["event"] == "moved" for h in j["history"]), j["history"])
+        self.assertEqual(j["attempts"], 0, "a job that never started is moved, not counted as a failure")
+        for _ in range(5):
+            so.tick(); settle()
+            if so.load_job(jid)["status"] == "done":
+                break
+        self.assertEqual((so.load_job(jid)["status"], so.load_job(jid)["node"]), ("done", "n2"))
+        conf.write_text(orig)
+        cfg = so.load_cfg(); cfg["nodes"]["n2"]["tags"] = ["n2"]; so.save_cfg(cfg)
+
+    def test_9_real_device_jobs(self):
+        (HOMES["n2"] / ".scaleout/devices.cache").write_text('{"android":1,"ios":0}')
+        (HOMES["n2"] / ".local/bin/claude").write_text(STUB.replace("*HANG*) sleep 600;;", "*HANG*) sleep 4;;"))
+        cfg = so.load_cfg()
+        a = so.submit_job(cfg, "HANG on phone", tags=["android-device"])
+        b = so.submit_job(cfg, "second phone job", tags=["android-device"])
+        c = so.submit_job(cfg, "needs an iPhone", tags=["ios-device"])
+        so.tick()
+        self.assertEqual((so.load_job(a)["status"], so.load_job(a)["node"]), ("dispatched", "n2"))
+        self.assertEqual(so.load_job(b)["status"], "queued", "one job per attached phone")
+        self.assertEqual(so.load_job(c)["status"], "queued", "no node has an iPhone")
+        for _ in range(8):
+            settle(); so.tick()
+            if so.load_job(b)["status"] == "done":
+                break
+        self.assertEqual((so.load_job(a)["status"], so.load_job(b)["status"], so.load_job(b)["node"]), ("done", "done", "n2"))
+        so.cmd_cancel(type("A", (), {"job": c})())
+        self.assertEqual(so.fmt_devices({"devices": {"android": 1, "ios": 2}}), "A1 I2")
+
+    def test_99_helpers(self):
         self.assertEqual(so.parse_setup("x\nSCALEOUT_USER bob\nSCALEOUT_AGENTS [\"claude\"]\n")["user"], "bob")
         so.ssh_block_put("scaleout t", "Host scaleout-t\n  Port 1")
         so.ssh_block_put("scaleout t", "Host scaleout-t\n  Port 2")
