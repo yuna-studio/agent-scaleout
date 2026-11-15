@@ -1,98 +1,201 @@
-# mac-scaleout
+# agent-scaleout
 
-메인 맥이 다른 맥(워커)에 **Claude Code 일을 나눠 맡기고 결과만 받아 오는** 작은 도구예요.
-메인 메모리 · CPU가 모자라거나, 오래 걸리는 빌드 · 테스트 · 조사를 옆 맥에서 돌리고 싶을 때 써요.
+**Turn the spare computers on your network into a pool for coding agents.**
+One machine (the *orchestrator*) keeps a queue of jobs for Claude Code, Codex, Gemini CLI or any command,
+watches every *node*'s memory, disk and load, hands each job to the least-busy healthy node, collects the result,
+notices when something hangs, retries elsewhere, and cleans nodes up before their disks fill.
 
 ```
-메인 맥 ── scaleout run ──▶ 워커 대기열(~/.scaleout/queue)
-   ▲                           │ 워커 로그인 세션의 실행기(LaunchAgent)가 집어 감
-   │                           ▼
-   └── scaleout wait ◀── 워커의 Claude Code(claude -p) 최종 보고
+            ┌──────────────── orchestrator ─────────────────┐
+ you ──►    │ queue · scheduler · health · retries · cleanup │
+ (CLI or    └───────┬──────────────┬──────────────┬──────────┘
+  a Claude          │ ssh          │ ssh          │ ssh (or reverse tunnel)
+  subagent)   ┌─────▼────┐   ┌─────▼────┐   ┌─────▼────┐
+              │  node A  │   │  node B  │   │  node C  │   old laptops, mini PCs,
+              │  macOS   │   │  Linux   │   │ Windows  │   a desktop under the desk…
+              └──────────┘   └──────────┘   └──────────┘
 ```
 
-- **어느 망에 있어도 붙어요.** 워커가 메인의 Cloudflare SSH 터널로 역방향 터널을 걸어 둬요(메인 `localhost:22xx` → 워커 SSH). 같은 와이파이면 직접도 붙어요.
-- **워커 로그인을 그대로 써요.** 토큰을 따로 만들지 않아요(아래 「왜 이렇게 만들었나」).
-- **macOS 기본만으로 돌아요.** bash 3.2 · ssh · launchd. 터널을 쓰면 워커에 `cloudflared`(설치기가 Homebrew로 깔아요).
+- **No server, no cloud, no daemon on nodes beyond a tiny runner.** Plain SSH. The orchestrator is one Python 3.9+ file (stdlib only); nodes run small shell / PowerShell scripts.
+- **Bring any agent and any account.** Each node uses whatever agent CLI is installed and signed in there — different Claude accounts, Codex, Gemini, or your own command.
+- **Built for cheap, mismatched hardware.** Nodes below the free-disk / free-memory thresholds get no work and are cleaned automatically; one or two jobs per node.
+- **Set up once, then hands-off.** Attaching a node is one command on the orchestrator, or one pasted line on the node. After that the orchestrator administers it: updates, cleanup, skills, runners, shell commands.
 
-## 준비물
+> Status: **v0.2, early.** A macOS orchestrator with macOS nodes is used daily. **Linux and Windows node support is written but has not been tested on real machines yet** — reports and fixes are very welcome.
 
-| 어디 | 무엇 |
+## Contents
+[Install](#install) · [Attach nodes](#attach-nodes) · [Run jobs](#run-jobs) · [Use from Claude Code](#use-from-claude-code) · [How it works](#how-it-works) · [Resource guard](#resource-guard--self-healing) · [Skills sync](#skills-sync) · [Orchestrator folders](#working-on-orchestrator-folders) · [GitHub runners](#github-actions-runners) · [Security](#security) · [Commands](#command-reference) · [Troubleshooting](#troubleshooting) · [Relocating folders](#bonus-relocate-heavy-folders-to-another-disk)
+
+## Install
+
+On the orchestrator (macOS or Linux; needs `python3`, `ssh`, `tar`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/yuna-studio/agent-scaleout/main/install.sh | sh
+scaleout install-daemon      # recommended: keep scheduling and healing in the background
+```
+
+The installer copies everything to `~/.local/share/agent-scaleout`, links `~/.local/bin/scaleout`, runs `scaleout init`
+(creates an SSH key, records this machine's LAN address) and, if Claude Code is present, installs a `scaleout` subagent.
+The orchestrator's own SSH server must be on for invites (macOS: *System Settings → General → Sharing → Remote Login*).
+
+## Attach nodes
+
+Every node needs an SSH server (the invite turns it on), a signed-in coding agent (e.g. Claude Code), and power settings that keep it awake.
+
+**A. From the orchestrator only** — the node already accepts SSH (macOS / Linux):
+
+```bash
+scaleout add build-01 alice@192.168.1.23 --dir ~/scaleout-work --tags linux,docker
+```
+You type the node's password once (to install the key). The orchestrator uploads the node package, registers the runner service,
+pins the host key (no yes/no prompt) and runs a test job.
+
+**B. One line on the node** — a new machine, SSH maybe off:
+
+```bash
+scaleout invite build-02                 # macOS / Linux node
+scaleout invite build-win --os windows   # Windows 10/11 node
+```
+It prints one line. Paste it into a terminal (or an Administrator PowerShell) on the node — in person or through any remote desktop.
+The line turns the SSH server on (asking for that machine's password once), downloads the node package *from the orchestrator*,
+installs it, registers the node and exchanges keys. Invite keys are single-use, expire after 24 h and can do nothing but enroll.
+
+**Nodes outside the LAN.** If the orchestrator has a public SSH endpoint, nodes keep a reverse tunnel to it and work from anywhere:
+
+```bash
+scaleout init --tunnel-host ssh.example.com                                                        # plain SSH
+scaleout init --tunnel-host ssh.example.com --tunnel-proxy "cloudflared access ssh --hostname %h"  # e.g. Cloudflare Tunnel
+```
+Tunnels are optional; on one LAN nothing extra is needed. (Reverse tunnels are not implemented for Windows nodes yet.)
+
+## Run jobs
+
+```bash
+scaleout status                                   # health, route, free memory/disk, load, jobs and agents per node
+echo "Run the test suite in ./api and summarise failures" | scaleout run -d ~/src/app
+id=$(scaleout submit -f task.md --tags xcode)     # queue and return immediately
+scaleout wait "$id"                               # result (exit 2 = still running, run it again)
+scaleout jobs · logs ID · cancel ID · result ID
+scaleout exec build-01 -- df -h                   # any shell command on a node
+```
+
+| option | meaning |
 |---|---|
-| 메인 | 원격 로그인 켜짐 · (밖에서도 붙이려면) `ssh://localhost:22`로 가는 Cloudflare Tunnel 호스트 |
-| 워커 | Claude Code 설치 · 로그인, 전원 연결 시 잠자기 방지. 원격 로그인은 꺼져 있어도 돼요(초대 방식이 켜 줘요) |
+| `-w NODE` | pin a node (default `auto`: least-loaded healthy node) |
+| `-a claude\|codex\|gemini` | pick an agent (default: the node's default) |
+| `-d DIR` | working folder on the node (default: the node's `--dir`) |
+| `--sync DIR` | work on an orchestrator folder: copied to the node before, copied back after |
+| `--tags a,b` | node requirements, e.g. `xcode`, `gpu`, `windows` |
+| `--timeout MIN` | hard limit (default 180) |
 
-## 설치
+Exit codes: `0` ok · `1` agent failed · `2` still running · `3` no reachable node · `4` usage · `5` not found.
 
-### 1. 메인에서 한 번
+## Use from Claude Code
+
+`scaleout init` installs `~/.claude/agents/scaleout.md`. In any session:
+
+> "Use the scaleout subagent to run the full E2E suite on a free machine and report failures. Repo: …, branch: …, push fixes to a new branch."
+
+The subagent is a cheap relay (Haiku): it queues the task, waits, and returns the node agent's report verbatim.
+Write tasks so they stand alone — the node's agent has not seen your conversation.
+
+## How it works
+
+- **Queue on the orchestrator** (`~/.local/state/scaleout`). `scaleout daemon` (or any `run`/`wait`) does a *tick*: refresh node metrics → collect finished work → retry lost work → dispatch queued jobs → maintenance.
+- **Node control is one script** (`~/.scaleout/bin/ctl`, or `ctl.ps1` on Windows) with verbs such as `metrics`, `submit`, `state`, `result`, `cleanup`. The orchestrator never needs to know a node's OS.
+- **Jobs run inside the node's login session**, started by its service manager whenever the node's queue is non-empty: a LaunchAgent with `QueueDirectories` (macOS), a `systemd --user` path unit (Linux, cron fallback), a scheduled task (Windows). On macOS this matters: an SSH session cannot read the login keychain, so agents look "not logged in" when started over plain SSH.
+- **Heartbeats.** The node runner touches a heartbeat every 10 s and enforces the timeout. A stale heartbeat (default 5 min), a vanished job, or a node offline for 10 min puts the job back in the queue (2 retries by default); the orphan is cancelled when that node returns.
+- **Scheduling score** = free memory % + free disk − 30 × jobs on the node − load per CPU, among nodes that are healthy, have the required tags and agent, and are under their `max_jobs`.
+
+## Resource guard & self-healing
+
+| check | default | what happens |
+|---|---|---|
+| free disk on a node | `< 5 GB` | no new jobs (`disk-full`) |
+| free memory on a node | `< 15 %` | no new jobs (`mem-full`) |
+| free disk on a node | `< 8 GB` | node cleanup (old job folders, package caches; below 5 GB also caches under the node's home), at most hourly |
+| finished job folders | 3 days | removed — results are fetched and deleted right away anyway |
+| runner service missing | — | re-registered (`ctl repair`) |
+| free disk when a job starts | `< 2 GB` | job refused (exit 28) instead of filling the disk |
+
+Change with `scaleout config KEY VALUE` (e.g. `scaleout config min_free_disk_gb 10`) or per node (`scaleout config --node build-01 max_jobs 1`).
+Machine-wide cleanup (Docker prune, unavailable simulators) runs only when you ask: `scaleout cleanup NODE --deep`.
+
+## Skills sync
+
+`~/.claude/skills`, `~/.claude/agents` and `~/.claude/commands` on the orchestrator are copied to nodes automatically before a
+dispatch whenever they changed (content hash), or on demand with `scaleout sync-skills`. Edit the list in
+`~/.config/scaleout/config.json` → `skills.paths`, or turn it off with `"auto": false`.
+
+## Working on orchestrator folders
+
+`--sync DIR` streams `DIR` (minus `node_modules`, `build`, `.gradle`, `.dart_tool`) to a fresh folder on the node, runs the job
+there, then streams the folder back into `DIR`. It works for every node OS and survives flaky Wi-Fi.
+A live network mount is possible too (share the folder over SMB and mount it on the nodes), but builds over SMB are slow and
+break when the link drops, so the pool does not depend on it.
+
+## GitHub Actions runners
+
+Put self-hosted runners on nodes (uses your `gh` login; needs admin on the org/repo):
+
 ```bash
-gh repo clone yuna-studio/mac-scaleout && ./mac-scaleout/install.sh
+scaleout runner add build-01 --org my-org --labels scaleout,linux,x64
+scaleout runner ls --org my-org
+scaleout runner remove build-01 --org my-org
 ```
-- `~/.local/share/scaleout`에 복사하고 `~/.local/bin/scaleout`을 만들어요.
-- Cloudflare 설정(`~/.cloudflared/config.yml`)에서 SSH 호스트를 찾아요. 다른 호스트면 `./install.sh --main-host <호스트>`로 넘겨요.
-- Claude 서브에이전트 `scaleout`(`~/.claude/agents/scaleout.md`)도 깔아요.
+Runners live in `~/.scaleout/gh-runners/` on the node and run as the node user (launchd / systemd --user).
 
-### 2. 워커 붙이기 (둘 중 하나)
+## Security
 
-**A. 메인에서만 (워커 원격 로그인이 켜져 있고 같은 망일 때)**
-```bash
-scaleout add macbook kong@192.168.0.10 --dir ~/workspace
+- Orchestrator → node: a dedicated key `~/.ssh/scaleout_ed25519`. Host keys are pinned at enrollment (`HostKeyAlias scaleout-NAME`).
+- Node → orchestrator (tunnels only): the node key is added with `restrict,port-forwarding,permitlisten="localhost:PORT",command=…` — it can open its tunnel and nothing else.
+- Invite keys: `restrict,command="scaleout _enroll NAME"`, single use, expiring.
+- Jobs run with the node user's rights. For Claude Code, `~/.scaleout/settings/claude.json` allows edits, git, package managers and read-only tools, and **denies** force pushes, pushes to `main`/`master`/`dev`/`release*`, `gh pr merge`, workflow runs, releases, `rm -rf`, `sudo` and common deploy commands. Edit it per node; upgrades keep your copy.
+- Treat nodes as trusted machines on a trusted network: an agent with shell access can do whatever the node user can.
+
+## Command reference
+
 ```
-워커 비밀번호를 한 번 묻고, 나머지는 메인이 SSH로 다 해요. 실행기 · 터널 · 키 교환 · 시험 일까지예요.
-
-**B. 초대 한 줄 (워커가 다른 망이거나 원격 로그인이 꺼져 있을 때)**
-```bash
-scaleout invite macbook --dir ~/workspace     # 메인 — 한 줄짜리 명령이 나와요
+scaleout init [--tunnel-host H] [--tunnel-proxy CMD] [--lan IP] [--user U]
+scaleout add NAME user@host | --ssh ALIAS   [--dir D] [--max-jobs N] [--agent A] [--tags a,b] [--no-tunnel] [--no-test]
+scaleout invite NAME [--os unix|windows] [--hours 24] [--dir D] [--max-jobs N] [--agent A] [--tags a,b]
+scaleout remove NAME · nodes · status [NAME…] · doctor NAME · update [NAME…]
+scaleout submit|run [-f FILE] [-w NODE] [-a AGENT] [-d DIR] [--sync DIR] [--tags a,b] [--timeout MIN]
+scaleout wait|result|logs|cancel JOB · jobs [-n N] · gc
+scaleout exec NAME -- CMD · cleanup [NAME…] [--aggressive|--deep] · sync-skills [NAME…]
+scaleout config [KEY [VALUE]] [--node NAME] · tick · daemon · install-daemon
+scaleout runner add|remove|ls [NAME] --org ORG|--repo OWNER/REPO [--labels L] [--runner-name N]
 ```
-나온 한 줄(`bash -c "$(echo … | base64 -D)"`)을 **워커 터미널에 붙여 넣으면** 끝이에요. 원격 데스크톱으로 넣어도 돼요.
-- 원격 로그인이 꺼져 있으면 켜요(그때 워커 비밀번호를 한 번 물어요).
-- 메인에서 패키지를 받아 설치하고, 자기 키를 메인에 등록하고, 메인 키를 받아 넣어요.
-- 초대 키는 24시간 안에 **한 번만** 써지고, 메인에서 `scaleout _enroll`만 돌게 묶여 있어요.
 
-## 쓰는 법
+## Troubleshooting
 
-```bash
-scaleout status                         # 워커마다 붙는지 · 남은 메모리 · 도는 일
-id=$(echo "레포 받아서 테스트 돌리고 결과만 알려줘" | scaleout run -w auto -d ~/workspace)
-scaleout wait "$id"                     # 끝나면 워커 Claude의 최종 보고 (540초마다 끊어서, 아직이면 종료 코드 2)
-scaleout jobs | logs <id> | cancel <id> | result <id>
-scaleout exec macbook -- df -h          # 워커에서 셸 명령
-scaleout doctor macbook                 # 워커 사양 · 도구 · 실행기 · 터널 상태
-scaleout remove macbook                 # 워커 떼기 (양쪽 설정 정리)
-```
-- `-w auto`는 남은 메모리가 많고 도는 일이 적은 워커를 골라요.
-- Claude Code 안에서는 서브에이전트로 맡겨요: 「scaleout 서브에이전트로 이 빌드를 워커에서 돌려 줘」. 지시에는 워커에서 할 일 · 폴더 · 결과를 남길 곳(예: 브랜치 푸시)을 다 적어요. 워커 Claude는 메인 대화를 몰라요.
-- 종료 코드: 0 성공 · 1 워커 Claude 실패 · 2 아직 도는 중 · 3 워커에 못 붙음 · 4 사용법 · 5 없음
-
-## 워커가 무인으로 할 수 있는 것
-
-`~/.scaleout/settings.json`(처음 설치 때만 깔고, 고치면 그대로 둬요)
-- **허용:** 파일 읽기 · 쓰기, git, `gh pr create/view`, npm · node · flutter · xcodebuild 같은 빌드 도구, 읽기 명령
-- **막음:** 강제 푸시, main · master · dev · release 푸시, `gh pr merge`, 워크플로 실행, 릴리스, `rm -rf`, `sudo`, firebase · wrangler 배포
-
-## 보안
-
-- 메인 → 워커: 전용 키 `~/.ssh/scaleout_ed25519`
-- 워커 → 메인: 워커 키는 메인 `authorized_keys`에 `restrict,port-forwarding,permitlisten="localhost:<포트>",command=…`로 들어가요. **터널만 열 수 있고 메인 셸에는 못 들어와요.**
-- 초대 키: `restrict,command="scaleout _enroll <이름>"` — 패키지 받기 · 등록만 되고, 쓰면 바로 지워지고, 기한이 지나면 안 먹어요.
-
-## 왜 이렇게 만들었나 (함정들)
-
-- **SSH 세션은 맥 키체인을 못 열어요.** 그래서 SSH로 `claude -p`를 돌리면 로그인돼 있어도 「Not logged in」이 나와요. 일은 워커 **로그인 세션의 LaunchAgent**(`dev.scaleout.runner`, `QueueDirectories`)가 돌려요.
-- **명령을 슬랙 · 폰으로 옮겨 붙이면 깨져요.** 줄 앞 공백이 특수 공백(`\240`)으로, 따옴표가 바뀌어요. 그래서 파일은 SSH로 보내고, 초대는 base64 한 줄이에요.
-- **절차를 `| bash`로 흘리면 안에서 `ssh`가 남은 절차를 먹어요.** 그래서 `bash -c "…"` 꼴이에요(비밀번호 질문도 이래야 돼요).
-- **macOS 기본 bash는 3.2예요.** `wait -n` · 연관 배열이 없고, `$이름` 바로 뒤의 한글을 이름으로 읽기도 해요. 그래서 `${이름}`으로 감싸요.
-- **터널을 다시 올리면 그 터널로 들어온 설치가 끊겨요.** 그래서 설정이 그대로면 그대로 두고, 바뀌면 몇 초 뒤 따로 올려요.
-
-## 파일
-
-| 경로 | 무엇 |
+| symptom | fix |
 |---|---|
-| `bin/scaleout` | 메인 CLI |
-| `lib/common.sh` | 공용 함수 |
-| `worker/setup.sh` | 워커 설치 · 제거 (`--uninstall`) |
-| `worker/runner.sh` | 워커 실행기 (동시 `MAX_JOBS`개, 일마다 `JOB_MINUTES` 한도) |
-| `worker/settings.json` | 워커 Claude 허용 목록 기본값 |
-| `claude/scaleout.md` | Claude 서브에이전트 정의 |
-| `tests/smoke.sh` | 시험 (워커 · 네트워크 없이) |
+| node `offline` | asleep or off. Keep nodes plugged in and awake (macOS: *Battery → Prevent automatic sleeping on power adapter*). |
+| node `runner-down` | the orchestrator re-registers it within 10 min, or run `scaleout update NAME`. |
+| agent says "not logged in" | sign in to the agent **on the node** (run `claude` there once). |
+| job fails at once with rc 28 | node disk almost full → `scaleout cleanup NAME --aggressive`. |
+| tunnel never comes up | read `~/.scaleout/tunnel.log` on the node; the LAN route still works when the node is home. |
+| pasted commands break | chat apps can turn spaces into non-breaking spaces; invites are one base64 line for that reason. |
 
-시험: `bash tests/smoke.sh`
+## Bonus: relocate heavy folders to another disk
+
+`tools/relocate.sh` moves folders (workspaces, build caches) to another disk and leaves a symlink, so every path keeps working.
+It copies first, swaps in seconds, and adds Claude Code project-history aliases for the new real path.
+
+```bash
+tools/relocate.sh copy /Volumes/BigSSD ~/workspace ~/.gradle    # 1) copy while you keep working
+tools/relocate.sh swap /Volumes/BigSSD ~/workspace ~/.gradle    # 2) quick re-sync, then swap to a symlink
+tools/relocate.sh back ~/workspace                              # undo
+```
+Use `KEEP_OLD=1` when the folder is the current directory of a running program (the old copy is kept aside instead of deleted).
+
+## Development
+
+```bash
+python3 tests/test_orchestrator.py    # end-to-end with two fake nodes: dispatch, results, failures, stalls, offline retry, disk guard, --sync
+```
+Contributions welcome — especially Linux and Windows node testing. MIT licensed.
+
+한국어 안내: [README.ko.md](README.ko.md)

@@ -1,19 +1,30 @@
-#!/bin/bash
-# mac-scaleout 설치 (메인 맥에서 한 번)
-#   gh repo clone yuna-studio/mac-scaleout && ./mac-scaleout/install.sh
-#   ./install.sh --main-host macmini-ssh.example.com   # Cloudflare SSH 터널 호스트를 직접 줄 때
-# 그다음 워커마다: scaleout add <이름> <사용자@주소>   (워커는 원격 로그인 · Claude Code 로그인만 미리)
+#!/bin/sh
+# agent-scaleout — orchestrator installer (macOS / Linux). Run once on the machine that hands out work.
+#
+#   curl -fsSL https://raw.githubusercontent.com/yuna-studio/agent-scaleout/main/install.sh | sh
+#   # or from a clone:  ./install.sh [scaleout init options, e.g. --tunnel-host ssh.example.com --tunnel-proxy "cloudflared access ssh --hostname %h"]
+#
+# Installs into ~/.local/share/agent-scaleout and links ~/.local/bin/scaleout. Needs python3 (3.9+), ssh, tar.
+# Nodes need nothing from you here: attach them with `scaleout add` or `scaleout invite`.
 set -e
-SRC="$(cd "$(dirname "$0")" && pwd)"
-DEST="$HOME/.local/share/scaleout"
+REPO="${SCALEOUT_REPO:-https://github.com/yuna-studio/agent-scaleout}"
+DEST="$HOME/.local/share/agent-scaleout"
+command -v python3 >/dev/null || { echo "python3 is required (macOS: xcode-select --install)"; exit 1; }
+command -v ssh >/dev/null || { echo "ssh is required"; exit 1; }
+
+SRC="$(cd "$(dirname "$0")" 2>/dev/null && pwd || true)"
+if [ -z "$SRC" ] || [ ! -f "$SRC/orchestrator/scaleout.py" ]; then   # piped from curl: fetch the repo
+  TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+  if command -v git >/dev/null; then git clone -q --depth 1 "$REPO" "$TMP/src"
+  else curl -fsSL "$REPO/archive/refs/heads/main.tar.gz" | tar -xz -C "$TMP" && mv "$TMP"/agent-scaleout-* "$TMP/src"; fi
+  SRC="$TMP/src"
+fi
+
 mkdir -p "$DEST" "$HOME/.local/bin"
-# 패키지를 고정 자리로 복사 — 받은 폴더를 지워도 계속 돈다
-for d in bin lib worker claude; do rm -rf "$DEST/$d"; cp -R "$SRC/$d" "$DEST/$d"; done
-cp "$SRC/README.md" "$DEST/README.md" 2>/dev/null || true
-chmod +x "$DEST/bin/scaleout" "$DEST/worker/"*.sh
-ln -sf "$DEST/bin/scaleout" "$HOME/.local/bin/scaleout"
+for d in orchestrator node agents tools; do rm -rf "$DEST/$d"; cp -R "$SRC/$d" "$DEST/$d"; done
+cp "$SRC/README.md" "$SRC/LICENSE" "$DEST/" 2>/dev/null || true
+chmod +x "$DEST/orchestrator/scaleout.py" "$DEST/tools/"*.sh "$DEST/node/unix/"*.sh
+ln -sf "$DEST/orchestrator/scaleout.py" "$HOME/.local/bin/scaleout"
 "$HOME/.local/bin/scaleout" init "$@"
-case ":$PATH:" in
-  *":$HOME/.local/bin:"*) ;;
-  *) echo; echo "※ ~/.local/bin 이 PATH 에 없어요. ~/.zshrc 에 넣어 주세요: export PATH=\"\$HOME/.local/bin:\$PATH\"";;
-esac
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) echo; echo "Add ~/.local/bin to PATH:  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc  (or ~/.bashrc)";; esac
+echo "Optional: keep the scheduler running in the background:  scaleout install-daemon"

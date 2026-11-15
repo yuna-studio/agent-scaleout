@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""End-to-end tests without SSH or real agents.
+
+Two fake nodes are real node/unix scripts living in temp HOME folders; the orchestrator's Node.ctl/route are
+patched to call those scripts locally. A stub `claude` echoes the prompt (or sleeps, to simulate a hang).
+Run: python3 tests/test_orchestrator.py
+"""
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+TMP = Path(tempfile.mkdtemp(prefix="scaleout-test-"))
+os.environ["SCALEOUT_CONF"] = str(TMP / "conf")
+os.environ["SCALEOUT_STATE"] = str(TMP / "state")
+os.environ["SCALEOUT_KEY"] = str(TMP / "key")
+spec = importlib.util.spec_from_file_location("scaleout", ROOT / "orchestrator" / "scaleout.py")
+so = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(so)  # type: ignore[union-attr]
+so.SSH_CONFIG = TMP / "ssh_config"
+so.AUTH_KEYS = TMP / "authorized_keys"
+so.KNOWN_HOSTS = TMP / "known_hosts"
+
+STUB = """#!/bin/bash
+p="$(cat)"
+case "$p" in *HANG*) sleep 600;; *FAIL*) echo "boom" >&2; exit 3;; esac
+printf '{"result":"done: %s on %s","is_error":false}' "$p" "$(basename "$HOME")"
+"""
+
+
+def make_node(name: str) -> Path:
+    h = TMP / name
+    b = h / ".scaleout"
+    (b / "bin").mkdir(parents=True)
+    for d in ("queue", "jobs", "work", "settings"):
+        (b / d).mkdir()
+    shutil.copy(ROOT / "node/unix/ctl.sh", b / "bin/ctl")
+    shutil.copy(ROOT / "node/unix/runner.sh", b / "bin/runner.sh")
+    (b / "node.conf").write_text(f"NAME={name}\nWORK_ROOT=~/work\nMAX_JOBS=1\nAGENT=claude\nMIN_FREE_GB=0\nRUNNER=manual\n")
+    (h / ".local/bin").mkdir(parents=True)
+    (h / ".local/bin/claude").write_text(STUB)
+    for f in (b / "bin/ctl", b / "bin/runner.sh", h / ".local/bin/claude"):
+        f.chmod(0o755)
+    return h
+
+
+HOMES = {}
+OFFLINE = set()
+RUNNERS = []
+
+
+def fake_ctl(self, verb, *args, input=None, timeout=60):
+    if self.name in OFFLINE:
+        return subprocess.CompletedProcess([], 255, b"", b"unreachable")
+    h = HOMES[self.name]
+    env = dict(os.environ, HOME=str(h), PATH=f"{h}/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+    r = subprocess.run(["bash", str(h / ".scaleout/bin/ctl"), verb, *args], input=input, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=timeout)
+    if verb == "submit":  # the node's service manager would start the runner now
+        RUNNERS.append(subprocess.Popen(["bash", str(h / ".scaleout/bin/runner.sh")], env=env, start_new_session=True))
+    return r
+
+
+so.Node.ctl = fake_ctl
+so.Node.route = lambda self, fresh=False: None if self.name in OFFLINE else "local"
+
+
+def settle(seconds=8):
+    end = time.time() + seconds
+    while time.time() < end and any(p.poll() is None for p in RUNNERS):
+        time.sleep(0.3)
+
+
+class E2E(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cfg = so.load_cfg()
+        cfg["orchestrator"] = {"user": "me", "lan": "127.0.0.1", "tunnel": {}}
+        cfg["defaults"].update({"metrics_ttl_s": 0, "min_free_disk_gb": 0, "cleanup_below_disk_gb": 0, "stall_min": 1, "offline_grace_min": 0})
+        cfg["skills"]["auto"] = False
+        for n in ("n1", "n2"):
+            HOMES[n] = make_node(n)
+            cfg["nodes"][n] = {"os": "Darwin", "user": "me", "lan": "x", "max_jobs": 1, "agent": "claude", "tags": [n]}
+        so.save_cfg(cfg)
+
+    def test_1_metrics(self):
+        m = so.refresh_metrics(so.load_cfg(), max_age=0)
+        for n in ("n1", "n2"):
+            self.assertTrue(m[n]["online"], m[n])
+            self.assertIn("claude", m[n]["agents"])
+            self.assertGreaterEqual(m[n]["disk_free_gb"], 1)
+
+    def test_2_spread_and_collect(self):
+        cfg = so.load_cfg()
+        ids = [so.submit_job(cfg, f"task-{i}") for i in range(3)]
+        so.tick()
+        nodes = {so.load_job(i)["node"] for i in ids if so.load_job(i)["status"] == "dispatched"}
+        self.assertEqual(nodes, {"n1", "n2"}, "two nodes with max_jobs=1 should each get one job")
+        for _ in range(6):
+            settle()
+            so.tick()
+            if all(so.load_job(i)["status"] == "done" for i in ids):
+                break
+        for i in ids:
+            rc, text = so.job_output(so.load_job(i))
+            self.assertEqual(rc, 0, text)
+            self.assertTrue(text.startswith("done: task-"), text)
+        # finished job folders are removed from the nodes (disk recovery)
+        for h in HOMES.values():
+            self.assertEqual([p.name for p in (h / ".scaleout/jobs").iterdir()], [])
+
+    def test_3_failure_reported(self):
+        cfg = so.load_cfg()
+        jid = so.submit_job(cfg, "please FAIL", node="n1")
+        for _ in range(5):
+            so.tick(); settle()
+            if so.load_job(jid)["status"] in ("done", "failed"):
+                break
+        so.tick()
+        j = so.load_job(jid)
+        self.assertEqual(j["status"], "failed")
+        rc, text = so.job_output(j)
+        self.assertEqual(rc, 1)
+        self.assertIn("boom", text)
+
+    def test_4_stall_is_retried_elsewhere(self):
+        cfg = so.load_cfg()
+        jid = so.submit_job(cfg, "HANG forever", tags=["n1"])
+        so.tick()
+        self.assertEqual(so.load_job(jid)["node"], "n1")
+        time.sleep(2)
+        # simulate a crashed runner: kill everything, age the heartbeat
+        for p in RUNNERS:
+            try:
+                os.killpg(p.pid, 9)
+            except ProcessLookupError:
+                pass
+        hb = HOMES["n1"] / ".scaleout/jobs" / jid / "heartbeat"
+        old = time.time() - 600
+        os.utime(hb, (old, old))
+        cfg = so.load_cfg(); cfg["nodes"]["n2"]["tags"] = ["n1", "n2"]; so.save_cfg(cfg)   # let n2 take it
+        (HOMES["n2"] / ".local/bin/claude").write_text(STUB.replace("*HANG*) sleep 600;;", "*HANG*) ;;"))
+        so.tick()
+        j = so.load_job(jid)
+        self.assertEqual(j["attempts"], 1)
+        self.assertTrue(any(h["event"] == "retry" and "stalled" in h.get("why", "") for h in j["history"]), j["history"])
+        for _ in range(5):
+            settle(); so.tick()
+            if so.load_job(jid)["status"] == "done":
+                break
+        j = so.load_job(jid)
+        self.assertEqual((j["status"], j["node"]), ("done", "n2"), j)
+        so.tick()  # orphan on n1 cleaned
+        self.assertFalse((HOMES["n1"] / ".scaleout/jobs" / jid).exists())
+
+    def test_5_offline_node_jobs_move(self):
+        cfg = so.load_cfg()
+        cfg["nodes"]["n2"]["tags"] = ["n2"]; so.save_cfg(cfg)
+        (HOMES["n1"] / ".local/bin/claude").write_text(STUB.replace("*HANG*) sleep 600;;", "*HANG*) sleep 30;;"))
+        jid = so.submit_job(cfg, "HANG a bit", node="n1")
+        so.tick()
+        self.assertEqual(so.load_job(jid)["status"], "dispatched")
+        OFFLINE.add("n1")
+        j = so.load_job(jid); j["last_seen"] -= 3600; so.save_job(j)
+        so.tick()
+        j = so.load_job(jid)
+        self.assertEqual(j["status"], "queued", j)
+        self.assertIn("offline", j["history"][-1]["why"])
+        OFFLINE.discard("n1")
+        so.load_cfg()
+        for p in RUNNERS:
+            try:
+                os.killpg(p.pid, 9)
+            except ProcessLookupError:
+                pass
+        so.cmd_cancel(type("A", (), {"job": jid})())
+
+    def test_6_full_disk_node_is_skipped(self):
+        cfg = so.load_cfg()
+        cfg["defaults"]["min_free_disk_gb"] = 10 ** 6
+        so.save_cfg(cfg)
+        jid = so.submit_job(cfg, "anything")
+        so.tick()
+        self.assertEqual(so.load_job(jid)["status"], "queued")
+        st = json.loads((TMP / "state/nodes/n1.json").read_text())
+        self.assertEqual(so.node_health(cfg, "n1", st), "disk-full")
+        cfg["defaults"]["min_free_disk_gb"] = 0
+        so.save_cfg(cfg)
+        so.cmd_cancel(type("A", (), {"job": jid})())
+
+    def test_7_sync_folder_round_trip(self):
+        src = TMP / "project"
+        src.mkdir()
+        (src / "input.txt").write_text("hello")
+        (HOMES["n2"] / ".local/bin/claude").write_text('#!/bin/bash\ncat > /dev/null; cp input.txt output.txt; echo \'{"result":"copied"}\'\n')
+        cfg = so.load_cfg()
+        jid = so.submit_job(cfg, "copy", node="n2", sync=str(src))
+        for _ in range(6):
+            so.tick(); settle()
+            if so.load_job(jid)["status"] == "done":
+                break
+        so.tick()
+        self.assertEqual(so.load_job(jid)["status"], "done")
+        self.assertEqual((src / "output.txt").read_text(), "hello")
+
+    def test_8_helpers(self):
+        self.assertEqual(so.parse_setup("x\nSCALEOUT_USER bob\nSCALEOUT_AGENTS [\"claude\"]\n")["user"], "bob")
+        so.ssh_block_put("scaleout t", "Host scaleout-t\n  Port 1")
+        so.ssh_block_put("scaleout t", "Host scaleout-t\n  Port 2")
+        txt = so.SSH_CONFIG.read_text()
+        self.assertEqual(txt.count("Host scaleout-t\n"), 1)
+        self.assertIn("Port 2", txt)
+        import tarfile, io
+        names = tarfile.open(fileobj=io.BytesIO(so.node_package("unix"))).getnames()
+        self.assertTrue({"ctl.sh", "runner.sh", "setup.sh", "claude-settings.json"} <= set(names), names)
+        names = tarfile.open(fileobj=io.BytesIO(so.node_package("windows"))).getnames()
+        self.assertTrue({"ctl.ps1", "runner.ps1", "setup.ps1"} <= set(names), names)
+
+
+if __name__ == "__main__":
+    try:
+        unittest.main(verbosity=2)
+    finally:
+        for p in RUNNERS:
+            try:
+                os.killpg(p.pid, 9)
+            except (ProcessLookupError, PermissionError):
+                pass
+        shutil.rmtree(TMP, ignore_errors=True)

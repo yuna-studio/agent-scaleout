@@ -1,0 +1,58 @@
+# agent-scaleout (한국어)
+
+**집이나 사무실에 놀고 있는 컴퓨터들을 코딩 에이전트용 작업 풀로 묶어요.**
+한 대(**오케스트레이터**)가 Claude Code · Codex · Gemini CLI(또는 아무 명령) 일을 대기열로 모아 두고 이렇게 해요.
+- 각 **노드**의 메모리 · 디스크 · 부하를 보고, 가장 한가한 노드에 일을 나눠 줘요.
+- 결과를 받아 오고, 멈춘 일은 다른 노드에서 다시 돌려요.
+- 노드 디스크가 차기 전에 정리해요.
+
+- **서버 · 클라우드 필요 없음.** SSH만 써요. 오케스트레이터는 Python 3.9+ 파일 하나(기본 라이브러리만)이고, 노드는 작은 셸 · PowerShell 스크립트예요.
+- **에이전트 · 계정은 노드마다 달라도 돼요.** 각 노드에 설치 · 로그인된 에이전트를 그대로 써요. 서로 다른 Claude 계정, Codex, Gemini, 직접 만든 명령 다 돼요.
+- **저사양 PC를 막 이어 붙여도 돼요.** 디스크 · 메모리가 기준보다 적은 노드에는 일을 안 보내고 자동으로 정리해요.
+- **한 번 붙이면 끝.** 노드 붙이기는 오케스트레이터에서 명령 하나, 또는 노드에 한 줄 붙여넣기예요. 그 뒤로는 오케스트레이터가 관리자처럼 다 해요(업데이트 · 정리 · 스킬 · 러너 · 명령).
+
+> 상태: **v0.2 초기 버전.** macOS 오케스트레이터 + macOS 노드는 매일 쓰고 있어요. **Linux · Windows 노드는 코드만 있고 실제 기기에서 시험하지 못했어요.**
+
+## 설치 (오케스트레이터에서 한 번)
+```bash
+curl -fsSL https://raw.githubusercontent.com/yuna-studio/agent-scaleout/main/install.sh | sh
+scaleout install-daemon   # 권장: 배정 · 회수 · 복구를 뒤에서 계속
+```
+오케스트레이터의 SSH 서버가 켜져 있어야 초대가 돼요. macOS는 시스템 설정 → 일반 → 공유 → 원격 로그인이에요.
+
+## 노드 붙이기
+노드에 필요한 건 세 가지예요. SSH 서버(초대가 켜 줘요), 로그인된 코딩 에이전트, 잠들지 않게 하는 전원 설정.
+
+- **A. 오케스트레이터에서만:** `scaleout add build-01 kong@192.168.0.10`
+  - 노드 비밀번호를 한 번만 물어요.
+  - 패키지 설치, 실행기 등록, 호스트 키 고정(yes/no 질문 없음), 시험 일까지 알아서 해요.
+- **B. 노드에 한 줄:** `scaleout invite build-02` (Windows는 `--os windows`)
+  - 나온 한 줄을 노드 터미널(Windows는 관리자 PowerShell)에 붙여요. 원격 데스크톱으로 넣어도 돼요.
+  - SSH 서버를 켜고, 오케스트레이터에서 패키지를 받아 설치하고, 등록과 키 교환까지 해요.
+  - 초대 키는 24시간 · 1회용이고, 등록 말고는 아무것도 못 해요.
+- **다른 망의 노드:** 오케스트레이터에 공개 SSH 주소가 있으면 `scaleout init --tunnel-host 주소 [--tunnel-proxy "cloudflared access ssh --hostname %h"]`로 켜요. 그러면 노드가 역방향 터널로 붙어요. 같은 망이면 필요 없어요.
+
+## 일 맡기기
+```bash
+scaleout status                                    # 노드별 상태 · 남은 메모리 · 디스크 · 부하 · 일 · 에이전트
+echo "api 테스트 돌리고 실패만 요약해" | scaleout run -d ~/src/app
+id=$(scaleout submit -f task.md --tags xcode); scaleout wait "$id"
+scaleout run --sync ~/work/proj -f task.md        # 오케스트레이터 폴더를 노드로 보내 작업 → 다시 받아 옴
+scaleout exec build-01 -- df -h                    # 노드에서 아무 명령
+```
+- Claude Code 안에서는 「scaleout 서브에이전트로 …를 남는 기기에서 돌려 줘」라고 하면 돼요.
+- 노드 에이전트는 지금 대화를 모르니, 지시만 보고도 일할 수 있게 써 주세요.
+
+## 자원 지킴 · 자동 복구
+- **기준 아래면 일을 안 보내요:** 디스크 5GB 미만, 메모리 15% 미만인 노드요.
+- **디스크 정리:** 8GB 미만이면 오래된 작업 · 패키지 캐시를 지워요(한 시간에 한 번). 5GB 미만이면 홈 안 캐시까지 지워요.
+- **멈춘 일 · 사라진 노드:** 하트비트가 5분 끊기거나 노드가 10분 안 보이면 다른 노드로 다시 맡겨요(기본 2번). 실행기가 빠져 있으면 다시 등록해요.
+- **기기 전체 정리:** Docker prune, 시뮬레이터 정리는 사람이 `scaleout cleanup 노드 --deep`으로 부를 때만 해요.
+
+## 그 밖
+- **스킬 동기화:** 오케스트레이터의 `~/.claude/skills · agents · commands`가 바뀌면 일 보내기 전에 노드로 자동 복사돼요(`scaleout sync-skills`로 직접도 가능).
+- **GitHub 러너:** `scaleout runner add 노드 --org 조직`으로 노드에 자체 호스팅 러너를 깔아요.
+- **보안:** 노드 키는 오케스트레이터에 「터널만 열 수 있게」 묶여 있어요. 노드 Claude는 강제 푸시, main · dev · release 푸시, 머지, 배포, `rm -rf`, `sudo`가 막혀 있어요(`~/.scaleout/settings/claude.json`).
+- **무거운 폴더 옮기기:** `tools/relocate.sh`로 작업 폴더 · 캐시를 외장 SSD로 옮기고 링크를 남겨요. 경로는 그대로예요.
+
+자세한 내용은 영어 [README.md](README.md)를 봐 주세요.
