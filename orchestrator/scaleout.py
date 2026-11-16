@@ -1170,13 +1170,7 @@ def collect(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[str,
         rc = int(s.get("rc", 1))
         try:   # Claude Code reports tokens, cost and turns in its JSON answer
             rep = json.loads(out.decode(errors="replace").strip().splitlines()[-1])
-            u = rep.get("usage") or {}
-            if u:
-                j["usage"] = {"in": int(u.get("input_tokens", 0)), "out": int(u.get("output_tokens", 0)),
-                              "cache_read": int(u.get("cache_read_input_tokens", 0)),
-                              "cache_write": int(u.get("cache_creation_input_tokens", 0))}
-                j["cost_usd"] = float(rep.get("total_cost_usd") or 0)
-                j["turns"] = int(rep.get("num_turns") or 0)
+            j.update(report_usage(rep))
         except (ValueError, IndexError, AttributeError, TypeError):
             pass
         if s.get("mem_mb") is not None:
@@ -2288,7 +2282,37 @@ def claude_now_lines(cn: Dict[str, Any], width: int = 6) -> List[str]:
         L.append(line)
     if len(cn["sessions"]) > width:
         L.append(f"  … {len(cn['sessions']) - width} more")
+    for name, st in sorted(cn.get("nodes", {}).items()):
+        c = st.get("claude") or {}
+        if not st.get("running") and not c.get("subagents"):
+            continue
+        line = f"  {fit(name + ' (node)', 16)} jobs {st.get('running', 0)}"
+        if c.get("subagents"):
+            line += f"  {c['subagents']} subagent(s): " + " · ".join(c.get("descs") or [])[:70]
+        L.append(line)
     return L
+
+
+def report_usage(rep: Dict[str, Any]) -> Dict[str, Any]:
+    """Tokens, cost, turns and subagents of a `claude -p --output-format json` answer. `modelUsage` covers the whole run
+    (every model, subagents included); `usage` holds only the last turn, so it is the fallback for older Claude Code."""
+    out: Dict[str, Any] = {}
+    mu = rep.get("modelUsage") or {}
+    u = rep.get("usage") or {}
+    if mu:
+        out["usage"] = {"in": sum(int(v.get("inputTokens", 0)) for v in mu.values()),
+                        "out": sum(int(v.get("outputTokens", 0)) for v in mu.values()),
+                        "cache_read": sum(int(v.get("cacheReadInputTokens", 0)) for v in mu.values()),
+                        "cache_write": sum(int(v.get("cacheCreationInputTokens", 0)) for v in mu.values())}
+    elif u:
+        out["usage"] = {"in": int(u.get("input_tokens", 0)), "out": int(u.get("output_tokens", 0)),
+                        "cache_read": int(u.get("cache_read_input_tokens", 0)),
+                        "cache_write": int(u.get("cache_creation_input_tokens", 0))}
+    if out:
+        out["cost_usd"] = float(rep.get("total_cost_usd") or 0)
+        out["turns"] = int(rep.get("num_turns") or 0)
+        out["subagents"] = int((rep.get("subagent_stats") or {}).get("spawned") or 0)
+    return out
 
 
 def job_usage(seconds: int) -> Dict[str, Dict[str, float]]:
@@ -2559,7 +2583,9 @@ def top_lines(cfg: Dict[str, Any], lu: "LocalUsage", interval: int) -> List[str]
             L.append(f"      waits for room — {j['wait'][:110]}")
     L.append("")
     try:
-        L.extend(claude_now_lines(claude_now()))
+        cn = claude_now()
+        cn["nodes"] = {n: read_json(node_state_path(n), {}) for n in cfg["nodes"] if not cfg["nodes"][n].get("local")}
+        L.extend(claude_now_lines(cn))
         L.append("")
     except Exception:   # the dashboard never dies on a transcript it cannot read
         pass

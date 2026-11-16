@@ -76,13 +76,27 @@ agents() {
   echo "[${out%,}]"
 }
 
+claude_now() {  # subagents running under the agents here: {"subagents":N,"descs":[…]} (a transcript written in the last 10 min, not finished)
+  local n=0 d="" f m desc
+  if [ -d "$HOME/.claude/projects" ]; then
+    while IFS= read -r f; do
+      m="${f%.jsonl}.meta.json"
+      [ -f "$m" ] && grep -q '"finished":true' "$m" && continue
+      n=$((n + 1))
+      desc="$(sed -n 's/.*"description":"\([^"]*\)".*/\1/p' "$m" 2>/dev/null | head -1 | cut -c1-40)"
+      [ -n "$desc" ] && [ "$n" -le 3 ] && d="${d}\"$(j "$desc")\","
+    done < <(find "$HOME/.claude/projects" -path '*/subagents/*.jsonl' -mmin -10 2>/dev/null)
+  fi
+  printf '{"subagents":%s,"descs":[%s]}' "$n" "${d%,}"
+}
+
 verb="${1:-}"; shift || true
 case "$verb" in
   version) echo "$VERSION" ;;
   metrics)
-    printf '{"os":"%s","arch":"%s","host":"%s","mem_free_pct":%s,"mem_total_gb":%s,"disk_free_gb":%s,"work_free_gb":%s,"load":%s,"cpus":%s,"running":%s,"queued":%s,"runner":%s,"agents":%s,"devices":%s,"skills_hash":"%s","version":"%s"}\n' \
+    printf '{"os":"%s","arch":"%s","host":"%s","mem_free_pct":%s,"mem_total_gb":%s,"disk_free_gb":%s,"work_free_gb":%s,"load":%s,"cpus":%s,"running":%s,"queued":%s,"runner":%s,"agents":%s,"devices":%s,"claude":%s,"skills_hash":"%s","version":"%s"}\n' \
       "$(j "$OS")" "$(uname -m)" "$(j "$(hostname)")" "$(mem_free_pct)" "$(mem_total_gb)" "$(disk_free_gb "$HOME")" \
-      "$(disk_free_gb "${WORK_ROOT:-$HOME}")" "$(load1)" "$(cpus)" "$(running_jobs)" "$(queued_jobs)" "$(runner_ok)" "$(agents)" "$(devices)" "$(skills_hash)" "$VERSION" ;;
+      "$(disk_free_gb "${WORK_ROOT:-$HOME}")" "$(load1)" "$(cpus)" "$(running_jobs)" "$(queued_jobs)" "$(runner_ok)" "$(agents)" "$(devices)" "$(claude_now)" "$(skills_hash)" "$VERSION" ;;
 
   submit)  # submit <jid> <agent> <timeout_min> <workdir> [resume-session-id]   (prompt on stdin)
     jid="$1"; d="$B/jobs/$jid"; mkdir -p "$d" "$B/queue"

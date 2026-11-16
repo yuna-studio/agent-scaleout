@@ -443,6 +443,16 @@ class E2E(unittest.TestCase):
             self.assertEqual([s["desc"] for s in cn["sessions"][0]["subs"]], ["job a1"], "finished and stale subagents are not running")
             self.assertIn("1 subagent(s): job a1", "\n".join(so.claude_now_lines(cn)))
             self.assertEqual((so.cols("아이디어"), so.fit("아이디어", 10), so.fit("아이디어", 5)), (8, "아이디어  ", "아이 "), "Korean takes two columns")
+            cn["nodes"] = {"m1": {"running": 1, "claude": {"subagents": 2, "descs": ["build", "test"]}}, "m2": {"running": 0, "claude": {"subagents": 0}}}
+            text = "\n".join(so.claude_now_lines(cn))
+            self.assertIn("m1 (node)", text)
+            self.assertIn("2 subagent(s): build · test", text)
+            self.assertNotIn("m2 (node)", text, "an idle node is not listed")
+            # node jobs: the whole run counts (modelUsage), not the last turn (usage)
+            rep = {"usage": {"output_tokens": 9}, "modelUsage": {"a": {"outputTokens": 50, "inputTokens": 1}, "b": {"outputTokens": 2}},
+                   "total_cost_usd": 1.5, "num_turns": 3, "subagent_stats": {"spawned": 4}}
+            self.assertEqual(so.report_usage(rep)["usage"]["out"], 52)
+            self.assertEqual((so.report_usage(rep)["subagents"], so.report_usage({"usage": {"output_tokens": 9}})["usage"]["out"]), (4, 9))
             lu = so.LocalUsage()
             lu.CACHE = TMP / "usage-cache-test.json"
             lu.offsets, lu.hours = {}, {}
