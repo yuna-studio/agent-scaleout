@@ -105,8 +105,8 @@ scaleout claude-setup --remove
 - **Rules**: `~/.claude/CLAUDE.md` gets one import line pointing at `agents/claude/scaleout-rules.md` of the installed copy,
   so the rules update with the tool. They tell every session what to keep local (conversation, edits, quick checks) and
   what to send to nodes (full builds, test suites, E2E, long jobs), and how.
-- **Hook**: a `PreToolUse` hook on Bash. When this machine has less than `MIN_FREE` % memory free
-  (`~/.config/scaleout/hook.conf`, default 25) and a node is healthy, heavy commands (`flutter build/test`, `xcodebuild`,
+- **Hook**: a `PreToolUse` hook on Bash. When this machine has less than `MIN_FREE` % memory free or a 1-minute load
+  above `MAX_LOAD_PER_CPU` × cores (`~/.config/scaleout/hook.conf`, defaults 25 and 3) and a node is healthy, heavy commands (`flutter build/test`, `xcodebuild`,
   `gradlew assemble/test`, Maestro, Playwright, `npm test/build`, emulators) are refused with a message telling Claude
   to send them to a node. `SCALEOUT_LOCAL=1` in a command bypasses it. Everything else passes.
 - The `scaleout` subagent relays a task to a node and returns the report verbatim. In any session:
@@ -137,8 +137,23 @@ Write tasks so they stand alone — the node's agent has not seen your conversat
 | free disk when a job starts | `< 2 GB` | job refused (exit 28) instead of filling the disk |
 | free memory when a job starts | `< 12 %` | the node holds the job (never starts a second agent into swap); after 10 min the orchestrator moves it to another node |
 | phones attached | — | `android-device` / `ios-device` jobs go only to nodes with a free phone of that kind, one job per phone |
+| CPU load | 1-minute load above `max_load_per_cpu` (2) × cores | no new jobs, busy or idle (the load may be someone else's, e.g. CI); the node runner checks the same before starting one |
+| CPU units | node: `cpu_slots` from `scaleout bench` (M1 2, M4 3, M4 Pro 5); job: 2 for builds, test suites, simulators, emulators (guessed from tags and the task text), else 1, or `--cpu N` | a busy node gets another job only while its units are free, or while its load is below its core count (a heavy job in a quiet phase leaves room) |
 
 Change with `scaleout config KEY VALUE` (e.g. `scaleout config min_free_disk_gb 10`) or per node (`scaleout config --node build-01 max_jobs 1`).
+
+### The orchestrator runs jobs too
+
+`scaleout local on [--max-jobs N]` lets the orchestrator take jobs itself while it has room (same memory, CPU and unit
+rules, and it is tried first); when it is busy, jobs go to nodes, and when nobody has room they wait in the queue.
+It needs no node install and no SSH: its jobs run from `~/.local/state/scaleout/local`, repository jobs from a copy on
+that disk reached by a plain path (the first job copies the repository once, later ones send only what changed).
+`scaleout top` shows it as the `orchestrator` row. `scaleout local off` stops it (running jobs finish).
+
+macOS note: under launchd, a program that is not Apple's (Claude Code, Homebrew or uv Python, node) waits forever for a
+privacy prompt when it touches an external disk, even through a work tree's `.git` link. That is why the daemon runs on
+`/usr/bin/python3` and the orchestrator's own work stays on its internal disk. Keep the work folders of any launchd
+service on the internal disk too.
 Machine-wide cleanup (Docker prune, unavailable simulators) runs only when you ask: `scaleout cleanup NODE --deep`.
 
 ## Screenshots, videos, logs (artifacts)
@@ -269,8 +284,8 @@ Runners live in `~/.scaleout/gh-runners/` on the node and run as the node user (
 scaleout init [--tunnel-host H] [--tunnel-proxy CMD] [--lan IP] [--user U]
 scaleout add NAME user@host | --ssh ALIAS   [--dir D] [--max-jobs N] [--agent A] [--tags a,b] [--no-tunnel] [--no-test]
 scaleout invite NAME [--os unix|windows] [--hours 24] [--dir D] [--max-jobs N] [--agent A] [--tags a,b]
-scaleout remove NAME · nodes · status [NAME…] · doctor NAME · update [NAME…]
-scaleout submit|run [-f FILE] [-w NODE] [-a AGENT] [-d DIR] [--sync DIR] [--tags a,b] [--timeout MIN]
+scaleout remove NAME · nodes · status [NAME…] · doctor NAME · update [NAME…] · local on|off [--max-jobs N]
+scaleout submit|run [-f FILE] [-w NODE] [-a AGENT] [-d DIR] [--sync DIR] [--repo DIR [--apply]] [--tags a,b] [--mem GB] [--cpu N] [--timeout MIN]
 scaleout wait|result|logs|cancel JOB · jobs [-n N] · gc
 scaleout exec NAME -- CMD · cleanup [NAME…] [--aggressive|--deep] · sync-skills [NAME…]
 scaleout config [KEY [VALUE]] [--node NAME] · tick · daemon · install-daemon

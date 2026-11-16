@@ -1,7 +1,8 @@
 # agent-scaleout: offload heavy work to nodes
 
-This machine is an agent-scaleout orchestrator. Other machines (nodes) run work for every session here.
-`scaleout status` shows them. Use them so this machine stays responsive.
+This machine is an agent-scaleout orchestrator. Heavy work goes through the scaleout queue: the orchestrator runs it
+itself while it has room (when `scaleout local on`), hands it to a node when it is busy, and keeps it queued when nobody
+has room. `scaleout status` / `scaleout top` show the machines.
 
 ## Keep here
 - Conversation, planning, reading and editing code, git.
@@ -26,6 +27,12 @@ This machine is an agent-scaleout orchestrator. Other machines (nodes) run work 
 - Screenshots, recordings, logs and reports the node saves come back automatically. The result ends with an `[artifacts]` list of local paths. Show or send those files.
 - Node agents never stop for permission prompts. Commands outside their allow list are refused. Deploys, force pushes, pushes to protected branches and `sudo` are always refused.
 
+## Simulators and emulators
+- When you tested on this machine, shut down the simulators and emulators you started once you are done:
+  `xcrun simctl shutdown <udid>` and `adb -s emulator-<port> emu kill`.
+- Nodes stop what their jobs started when they go idle.
+- The daemon shuts down any simulator or emulator, here and on nodes, after 20 minutes with no test running.
+
 ## When a command is blocked here
-If a hook says this machine is short on memory, do not retry locally. Send the command to a node as above.
+If a hook says this machine is short on memory or overloaded, do not retry locally. Send the command to a node as above.
 Prefix `SCALEOUT_LOCAL=1` only when the work must use this machine, for example a device attached here.

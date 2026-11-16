@@ -43,8 +43,9 @@ mac_plist() {  # mac_plist <label> <extra xml> <args...>
   { printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
     printf '<plist version="1.0"><dict>\n<key>Label</key><string>%s</string>\n<key>ProgramArguments</key><array>' "$label"
     for a in "$@"; do printf '<string>%s</string>' "$a"; done
-    printf '</array>\n%s\n</dict></plist>\n' "$extra"; } > "$f"
-  plutil -lint -s "$f" >/dev/null || { echo "bad plist $f" >&2; exit 1; }
+    printf '</array>\n%s\n</dict></plist>\n' "$extra"; } > "$f.new"
+  plutil -lint -s "$f.new" >/dev/null || { echo "bad plist $f" >&2; rm -f "$f.new"; exit 1; }
+  if cmp -s "$f.new" "$f"; then rm -f "$f.new"; PLIST_CHANGED=0; else mv -f "$f.new" "$f"; PLIST_CHANGED=1; fi
 }
 mac_load() {  # mac_load <label> [later]   — "later" reloads a few seconds from now (the orchestrator may be connected through it)
   local u; u="$(id -u)"
@@ -73,7 +74,15 @@ install_runner_service() {
   if [ "$OS" = Darwin ]; then
     mac_plist dev.scaleout.runner "<key>QueueDirectories</key><array><string>$B/queue</string></array>
 <key>StandardOutPath</key><string>$B/runner.log</string><key>StandardErrorPath</key><string>$B/runner.log</string>" /bin/bash "$B/bin/runner.sh"
-    mac_load dev.scaleout.runner; echo "SCALEOUT_RUNNER launchd"
+    # reload only when the service definition changed or it is not loaded, and never under running jobs:
+    # bootout stops the runner's whole process group, jobs included
+    if [ "$PLIST_CHANGED" = 1 ] || ! launchctl print "gui/$(id -u)/dev.scaleout.runner" >/dev/null 2>&1; then
+      busy=0; for d in "$B"/jobs/*/; do [ -f "$d/started" ] && [ ! -f "$d/rc" ] && busy=1; done
+      if [ "$busy" = 1 ] && launchctl print "gui/$(id -u)/dev.scaleout.runner" >/dev/null 2>&1; then
+        echo "SCALEOUT_NOTE runner service changed; it reloads after the running jobs (next update)"
+      else mac_load dev.scaleout.runner; fi
+    fi
+    echo "SCALEOUT_RUNNER launchd"
   elif has_systemd; then
     mkdir -p "$SU"
     printf '[Unit]\nDescription=agent-scaleout runner\n[Service]\nType=oneshot\nExecStart=/bin/bash %%h/.scaleout/bin/runner.sh\n' > "$SU/scaleout-runner.service"
@@ -94,8 +103,13 @@ fi
 
 [ -n "$NAME" ] || { echo "--name is required" >&2; exit 4; }
 mkdir -p "$B/bin" "$B/queue" "$B/jobs" "$B/work" "$B/settings"; chmod 700 "$B"
-for f in ctl.sh runner.sh setup.sh gh-runner.sh provision.sh; do [ -f "$PKG/$f" ] && cp "$PKG/$f" "$B/bin/$f"; done
-mv -f "$B/bin/ctl.sh" "$B/bin/ctl"; chmod 755 "$B/bin/"*
+# swap files in (new inode) instead of overwriting: a running runner.sh keeps reading its own copy
+for f in ctl.sh runner.sh setup.sh gh-runner.sh provision.sh; do
+  [ -f "$PKG/$f" ] || continue
+  dst="$B/bin/$f"; [ "$f" = ctl.sh ] && dst="$B/bin/ctl"
+  cp "$PKG/$f" "$dst.new.$$" && chmod 755 "$dst.new.$$" && mv -f "$dst.new.$$" "$dst"
+done
+rm -f "$B/bin/ctl.sh"; chmod 755 "$B/bin/"*
 printf '#!/bin/bash\nnohup /bin/bash "$HOME/.scaleout/bin/runner.sh" >> "$HOME/.scaleout/runner.log" 2>&1 &\n' > "$B/bin/kick"; chmod 755 "$B/bin/kick"
 # agent permissions: keep the user's edited copy
 if [ ! -f "$B/settings/claude.json" ]; then
