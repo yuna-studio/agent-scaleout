@@ -24,6 +24,8 @@ has room. `scaleout status` / `scaleout top` show the machines.
   - `xcode`, `mac`, `linux`: what the node is.
 - Memory decides how many jobs a node runs at once (no fixed limit on simulators or emulators). Pass `--mem <GB>` when a job needs more than usual, e.g. several simulators.
 - Write the task so it stands alone: what to do, which folder, how to check it. The node's agent has not seen this conversation.
+- A job waits in the queue while no machine has room (memory, CPU load, a free phone). `scaleout run`/`wait` print why, and
+  `scaleout jobs` shows it as `waits: …`. Waiting is normal: do not cancel and resubmit, it starts as soon as a machine has room.
 - Screenshots, recordings, logs and reports the node saves come back automatically. The result ends with an `[artifacts]` list of local paths. Show or send those files.
 - Node agents never stop for permission prompts. Commands outside their allow list are refused. Deploys, force pushes, pushes to protected branches and `sudo` are always refused.
 

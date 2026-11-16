@@ -997,7 +997,9 @@ def job_mem_gb(j: Dict[str, Any], node: str) -> float:
 
 def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[str, Any]], load: Dict[str, int],
               dev_load: Optional[Dict[Tuple[str, str], int]] = None, planned_gb: Optional[Dict[str, float]] = None,
-              cpu_used: Optional[Dict[str, int]] = None) -> Optional[str]:
+              cpu_used: Optional[Dict[str, int]] = None, why: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """Best node for a job, or None. `why` collects, per node, the reason it was passed over (shown while a job waits)."""
+    why = why if why is not None else {}
     dev_load = dev_load or {}
     planned_gb = planned_gb if planned_gb is not None else {}
     cpu_used = cpu_used if cpu_used is not None else {}
@@ -1006,37 +1008,49 @@ def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[st
         if n.get("pending") or (j.get("want_node") and name != j["want_node"]):
             continue
         st = metrics.get(name, {})
-        if node_health(cfg, name, st) != "ok":
+        h = node_health(cfg, name, st)
+        if h != "ok":
+            why[name] = h
             continue
         if not j.get("want_node") and (j.get("avoid") or {}).get(name, 0) > now():
+            why[name] = "failed this job recently"
             continue
         devs = st.get("devices") or {}
         have = set(n.get("tags") or []) | {st.get("os", "").lower()}
         have |= {f"{k}-device" for k, v in devs.items() if int(v or 0) > 0}
         if not set(j.get("tags") or []) <= have:
+            why[name] = "lacks " + ",".join(sorted(set(j.get("tags") or []) - have))
             continue
         # one job per attached phone: a job tagged android-device / ios-device needs a free device of that kind
         if any(int(devs.get(t[:-7], 0) or 0) <= dev_load.get((name, t), 0) for t in (j.get("tags") or []) if t in DEVICE_TAGS):
+            why[name] = "no free phone"
             continue
         agent = j.get("agent") or "default"
         if (agent == "bench" or j.get("repo")) and st.get("os", "").lower() == "windows":
             continue
         if agent not in ("default", "custom", "bench") and agent not in (st.get("agents") or []):
+            why[name] = f"no {agent}"
             continue
         if agent == "default" and not st.get("agents"):
+            why[name] = "no agent"
             continue
         busy = load.get(name, 0)
         if busy >= int(n.get("max_jobs", 2)):
+            why[name] = f"{busy} job(s) running (max {n.get('max_jobs', 2)})"
             continue
         if st.get("mem_total_gb"):
             free_gb = float(st["mem_total_gb"]) * float(st.get("mem_free_pct", 0)) / 100 - planned_gb.get(name, 0.0)
             if busy and free_gb - cfg["defaults"].get("mem_reserve_gb", 1.5) < job_mem_gb(j, name):
+                why[name] = f"memory {free_gb:.1f} GB free, job needs {job_mem_gb(j, name):.1f}"
                 continue   # an idle node always takes one job: its own memory guard still protects it
-        if float(st.get("load", 0) or 0) > float(cfg["defaults"].get("max_load_per_cpu", 2)) * max(int(st.get("cpus", 1) or 1), 1):
+        limit = float(cfg["defaults"].get("max_load_per_cpu", 2)) * max(int(st.get("cpus", 1) or 1), 1)
+        if float(st.get("load", 0) or 0) > limit:
+            why[name] = f"load {float(st.get('load', 0)):.1f} > {limit:g}"
             continue       # CPU is the limit too (three E2E runs on 8 cores pushed load to 300); also when the load is not ours (CI)
         units = int(n.get("cpu_slots") or 2)
         cores = max(int(st.get("cpus", 1) or 1), 1)
         if busy and cpu_used.get(name, 0) + job_cpu(j) > units and float(st.get("load", 0) or 0) >= cores:
+            why[name] = f"CPU units full ({cpu_used.get(name, 0)}/{units}, load {float(st.get('load', 0)):.1f})"
             continue       # units full and the cores really busy; a heavy job in a quiet phase (load < cores) leaves room
         score = st.get("mem_free_pct", 0) + min(st.get("disk_free_gb", 0), 50) / 5 - 30 * busy - 10 * float(st.get("load", 0)) / max(int(st.get("cpus", 1)), 1)
         if float(st.get("load", 0) or 0) < cores:
@@ -1375,8 +1389,14 @@ def tick(verbose: bool = False) -> None:
         for j in jobs:
             if j.get("status") != "queued":
                 continue
-            name = pick_node(cfg, j, metrics, load, dev_load, planned_gb, cpu_used)
+            why: Dict[str, str] = {}
+            name = pick_node(cfg, j, metrics, load, dev_load, planned_gb, cpu_used, why)
+            wait = "" if name else ("; ".join(f"{k}: {v}" for k, v in sorted(why.items())) or "no nodes")
+            if wait != j.get("wait", ""):
+                j["wait"] = wait
+                save_job(j)
             if name and dispatch(cfg, j, name):
+                j.pop("wait", None)
                 load[name] = load.get(name, 0) + 1
                 cpu_used[name] = cpu_used.get(name, 0) + job_cpu(j)
                 planned_gb[name] = planned_gb.get(name, 0.0) + job_mem_gb(j, name)
@@ -1403,10 +1423,15 @@ def wait_job(jid: str, max_s: int) -> Tuple[int, str]:
     """Wait for a job. When the daemon runs it alone schedules: a long-lived waiting process must never dispatch with
     the code it started with (after an upgrade that would bypass new limits), so it only collects then."""
     start = time.time()
+    told = ""
     while True:
         if not daemon_alive():
             tick()
         j = load_job(jid)
+        if j["status"] == "queued" and j.get("wait") and j["wait"] != told:
+            told = j["wait"]
+            sys.stderr.write(f"scaleout: {jid} waits for room — {told}\n")
+            sys.stderr.flush()
         if j["status"] in ("done", "failed", "cancelled"):
             return job_output(j)
         if time.time() - start >= max_s:
@@ -1536,7 +1561,8 @@ def cmd_jobs(a) -> None:
         say("no jobs")
     for j in jobs:
         age = time.strftime("%m-%d %H:%M", time.localtime(j.get("created", 0)))
-        say(f"{j['id']}  {j['status']:<10} {j.get('node') or '-':<14} tries={j.get('attempts', 0)}  {age}")
+        say(f"{j['id']}  {j['status']:<10} {j.get('node') or '-':<14} tries={j.get('attempts', 0)}  {age}"
+            + (f"  waits: {j['wait']}" if j.get("status") == "queued" and j.get("wait") else ""))
 
 
 def cmd_gc(a) -> None:
@@ -2422,6 +2448,8 @@ def top_lines(cfg: Dict[str, Any], lu: "LocalUsage", interval: int) -> List[str]
         age = int(now() - (j.get("finished_at") or j.get("dispatched_at") or j.get("created", now())))
         L.append(f"  {j['id'][-15:]}  {str(j.get('node') or '-'):<10} {j.get('status', ''):<10} {age // 60:>4}m ago"
                  f"  {fmt_tok(tokens_of(j.get('usage') or {})):>7} tok  {(j.get('tags') and ','.join(j['tags'])) or ''}")
+        if j.get("status") == "queued" and j.get("wait"):
+            L.append(f"      waits for room — {j['wait'][:110]}")
     L.append("")
     L.extend(productivity_lines(jobs))
     L.append("")
