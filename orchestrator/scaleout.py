@@ -797,8 +797,10 @@ def refresh_metrics(cfg: Dict[str, Any], names: Optional[List[str]] = None, max_
             err = res.stderr.decode()
             st.update({"online": False, "ts": now(), "error": err.strip()[-200:]})
             port = cfg["nodes"].get(name, {}).get("port")
-            if port and "banner exchange" in err and socket_busy(int(port)):
-                # the tunnel port is open but nothing behind it answers: give a slow node a minute, then free the port
+            dead = "banner exchange" in err or "timed out" in err or err.strip() == "unreachable"
+            if port and dead and socket_busy(int(port)):
+                # the tunnel port is open but nothing behind it answers (ssh times out, or no route works at all):
+                # give a slow node a minute, then free the port
                 st.setdefault("stale_tunnel_since", now())
                 if now() - int(st["stale_tunnel_since"]) >= 60:
                     pids = free_stale_tunnel(int(port))
