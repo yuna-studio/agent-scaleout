@@ -214,7 +214,8 @@ person are reported, not attempted: Homebrew itself (admin password), Xcode (App
 ## Dashboard and Claude usage
 
 ```bash
-scaleout top          # live: orchestrator + nodes (memory, swap, disk, load, jobs, phones), queue, recent jobs, tokens
+scaleout top          # live: orchestrator + nodes (memory, swap, disk, load, jobs, phones), queue, recent jobs,
+                      #   Claude sessions working now with their running subagents, tokens (subagents included)
 scaleout usage        # Claude tokens: every session on this machine (5 h / today / 7 days) and work done by each node
 ```
 `top` reads only what the daemon already collected (no SSH of its own) and sleeps between refreshes, so it costs almost no

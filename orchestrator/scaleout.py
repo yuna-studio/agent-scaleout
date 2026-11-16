@@ -29,6 +29,7 @@ import sys
 import tarfile
 import threading
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -2128,7 +2129,7 @@ class LocalUsage:
     def refresh(self) -> None:
         root = HOME / ".claude" / "projects"
         cutoff = now() - 7 * 86400
-        for f in root.glob("*/*.jsonl"):
+        for f in list(root.glob("*/*.jsonl")) + list(root.glob("*/*/subagents/*.jsonl")):   # sessions and their subagents
             try:
                 st = f.stat()
             except OSError:
@@ -2182,6 +2183,112 @@ class LocalUsage:
                 for k in tot:
                     tot[k] += v.get(k, 0)
         return tot
+
+
+_TITLES: Dict[str, Tuple[int, str]] = {}
+
+
+def session_title(f: Path) -> str:
+    """A session's name (/rename → the last "customTitle" in its transcript), read incrementally."""
+    key = str(f)
+    try:
+        size = f.stat().st_size
+    except OSError:
+        return ""
+    off, title = _TITLES.get(key, (0, ""))
+    if size < off:
+        off, title = 0, ""
+    if size > off:
+        with open(f, "rb") as fh:
+            fh.seek(off)
+            data = fh.read()
+        end = data.rfind(b"\n") + 1
+        for line in data[:end].splitlines():
+            if b'"customTitle"' in line:
+                try:
+                    title = str(json.loads(line).get("customTitle") or title)
+                except ValueError:
+                    pass
+        _TITLES[key] = (off + end, title)
+    return title
+
+
+def claude_now(active_s: int = 180) -> Dict[str, Any]:
+    """Claude Code on this machine right now: sessions that wrote in the last `active_s` seconds or have subagents
+    running, each with its running subagents (from <session>/subagents/*.meta.json), plus the claude processes' CPU and
+    memory. Subagents run inside their session's process (the model works on Anthropic's servers), so they are not
+    scaleout jobs; heavy commands they run still meet the offload hook."""
+    root, t = HOME / ".claude" / "projects", now()
+    sessions, seen = [], set()
+    for link in root.glob("*/*.jsonl"):
+        try:
+            f = link.resolve()            # the same session may be linked from another project folder
+            mt = f.stat().st_mtime
+        except OSError:
+            continue                      # a link whose session is gone
+        if f in seen:
+            continue
+        seen.add(f)
+        if t - mt > 86400:
+            continue
+        subs = []
+        for m in f.with_suffix("").glob("subagents/*.meta.json"):
+            meta = read_json(m, {})
+            if meta.get("finished"):
+                continue
+            try:
+                smt = (m.parent / (m.name[:-len(".meta.json")] + ".jsonl")).stat().st_mtime
+            except OSError:
+                continue
+            if t - smt > 600:
+                continue                  # stopped without finishing (session closed)
+            subs.append({"desc": str(meta.get("description") or meta.get("agentType") or "subagent"),
+                         "type": str(meta.get("agentType") or ""), "depth": int(meta.get("spawnDepth") or 1)})
+        if t - mt > active_s and not subs:
+            continue
+        sessions.append({"id": f.stem, "name": session_title(f) or f.stem[:8], "idle": int(t - mt), "subs": subs})
+    sessions.sort(key=lambda x: (-len(x["subs"]), x["idle"]))
+    procs = cpu = rss = 0.0
+    r = run(["ps", "-axo", "pcpu=,rss=,comm="])
+    for line in r.stdout.decode(errors="replace").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[2].rsplit("/", 1)[-1] == "claude":
+            procs += 1
+            cpu += float(parts[0])
+            rss += float(parts[1])
+    return {"sessions": sessions, "subagents": sum(len(x["subs"]) for x in sessions),
+            "procs": int(procs), "cpu_pct": round(cpu), "mem_gb": round(rss / 1048576, 1)}
+
+
+def cols(text: str) -> int:
+    """Terminal columns: Korean and other wide characters take two."""
+    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in text)
+
+
+def fit(text: str, width: int) -> str:
+    """Cut to `width` terminal columns and pad with spaces."""
+    out, n = "", 0
+    for c in text:
+        w = cols(c)
+        if n + w > width:
+            break
+        out, n = out + c, n + w
+    return out + " " * (width - n)
+
+
+def claude_now_lines(cn: Dict[str, Any], width: int = 6) -> List[str]:
+    working = sum(1 for x in cn["sessions"] if x["idle"] < 180)
+    L = [f"CLAUDE NOW  sessions {working} working · subagents {cn['subagents']} · {cn['procs']} claude processes"
+         f" · CPU {cn['cpu_pct']}% · mem {cn['mem_gb']}G"]
+    for x in cn["sessions"][:width]:
+        state = "now" if x["idle"] < 60 else f"{x['idle'] // 60}m ago"
+        line = f"  {fit(x['name'], 16)} {state:>7}"
+        if x["subs"]:
+            line += f"  {len(x['subs'])} subagent(s): " + " · ".join(sorted({s['desc'][:28] for s in x['subs']}))[:70]
+        L.append(line)
+    if len(cn["sessions"]) > width:
+        L.append(f"  … {len(cn['sessions']) - width} more")
+    return L
 
 
 def job_usage(seconds: int) -> Dict[str, Dict[str, float]]:
@@ -2451,6 +2558,11 @@ def top_lines(cfg: Dict[str, Any], lu: "LocalUsage", interval: int) -> List[str]
         if j.get("status") == "queued" and j.get("wait"):
             L.append(f"      waits for room — {j['wait'][:110]}")
     L.append("")
+    try:
+        L.extend(claude_now_lines(claude_now()))
+        L.append("")
+    except Exception:   # the dashboard never dies on a transcript it cannot read
+        pass
     L.extend(productivity_lines(jobs))
     L.append("")
     L.extend(usage_lines(lu))
