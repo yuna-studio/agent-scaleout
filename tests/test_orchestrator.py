@@ -494,6 +494,14 @@ class E2E(unittest.TestCase):
             st = so.refresh_metrics(so.load_cfg(), names=["n3"], max_age=0)["n3"]
             self.assertEqual(freed, [22999])
             self.assertNotIn("stale_tunnel_since", st)
+            # no route works at all (ctl answers "unreachable" without trying ssh): the same stale tunnel
+            so.Node.ctl = lambda self, verb, *a, **k: subprocess.CompletedProcess([], 255, b"", b"unreachable")
+            so.refresh_metrics(so.load_cfg(), names=["n3"], max_age=0)
+            st = so.read_json(so.node_state_path("n3"), {})
+            st["stale_tunnel_since"] = so.now() - 61
+            so.write_json(so.node_state_path("n3"), st)
+            so.refresh_metrics(so.load_cfg(), names=["n3"], max_age=0)
+            self.assertEqual(freed, [22999, 22999])
             # an unreachable node with no tunnel listener is just offline: nothing to free
             so.Node.ctl = lambda self, verb, *a, **k: subprocess.CompletedProcess([], 255, b"", b"Connection refused")
             st = so.refresh_metrics(so.load_cfg(), names=["n3"], max_age=0)["n3"]
