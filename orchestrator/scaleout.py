@@ -32,7 +32,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 HOME = Path.home()
 CONF_DIR = Path(os.environ.get("SCALEOUT_CONF", HOME / ".config" / "scaleout"))
 STATE_DIR = Path(os.environ.get("SCALEOUT_STATE", HOME / ".local" / "state" / "scaleout"))
@@ -437,32 +437,51 @@ def selftest(name: str) -> None:
 
 
 INVITE_UNIX = r'''set -e
-N=__N__; ROUTE_LAN=__LAN__; ROUTE_HOST=__HOST__; ROUTE_PROXY=__PROXY__; OU=__OU__; OSP=__OSP__
+N=__N__; ROUTE_LAN=__LAN__; ROUTE_HOST=__HOST__; ROUTE_PROXY=__PROXY__; OU=__OU__; OSP=__OSP__; SO_BREW=__BREW__; SO_CLAUDE=__CLAUDE__
 K="$(mktemp)"; trap 'rm -f "$K"' EXIT
 printf '%s' __KEY__ | base64 --decode > "$K"; chmod 600 "$K"
-echo "[1/4] SSH server (how the orchestrator reaches this machine)"
+echo "[1/5] SSH server (how the orchestrator reaches this machine)"
 if ! (nc -z -w 2 127.0.0.1 22 || nc -z -G 2 127.0.0.1 22) >/dev/null 2>&1; then
   echo "  turning on the SSH server — your password may be asked once"
   if [ "$(uname -s)" = Darwin ]; then sudo launchctl enable system/com.openssh.sshd 2>/dev/null || true; sudo launchctl bootstrap system /System/Library/LaunchDaemons/ssh.plist 2>/dev/null || sudo systemsetup -setremotelogin on
   else (command -v apt-get >/dev/null && sudo apt-get install -y openssh-server >/dev/null) || (command -v dnf >/dev/null && sudo dnf install -y openssh-server >/dev/null) || true; sudo systemctl enable --now ssh 2>/dev/null || sudo systemctl enable --now sshd; fi
 fi
-echo "[2/4] route to the orchestrator"
+echo "[2/5] Homebrew + Claude Code"
+NEW_CLAUDE=0
+if [ "$SO_BREW" = 1 ] && [ "$(uname -s)" = Darwin ] && ! command -v brew >/dev/null && [ ! -x /opt/homebrew/bin/brew ]; then
+  echo "  installing Homebrew (the Xcode command line tools come with it, a few minutes; your password may be asked)"
+  sudo -v && NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/null \
+    || echo "  ! Homebrew did not install — later: /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+fi
+if [ -x /opt/homebrew/bin/brew ]; then
+  eval "$(/opt/homebrew/bin/brew shellenv)"
+  grep -q 'brew shellenv' ~/.zprofile 2>/dev/null || echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zprofile
+  echo "  Homebrew ok"
+fi
+export PATH="$HOME/.local/bin:$PATH"
+if [ "$SO_CLAUDE" = 1 ] && ! command -v claude >/dev/null; then
+  echo "  installing Claude Code"
+  if curl -fsSL https://claude.ai/install.sh | bash >/dev/null 2>&1 && command -v claude >/dev/null; then NEW_CLAUDE=1; echo "  Claude Code ok"
+  else echo "  ! Claude Code did not install — later: curl -fsSL https://claude.ai/install.sh | bash"; fi
+elif command -v claude >/dev/null; then echo "  Claude Code ok"; fi
+echo "[3/5] route to the orchestrator"
 EN=(ssh -i "$K" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=15 -p "$OSP")
 if [ -n "$ROUTE_LAN" ] && (nc -z -w 3 "$ROUTE_LAN" "$OSP" || nc -z -G 3 "$ROUTE_LAN" "$OSP") >/dev/null 2>&1; then T="$OU@$ROUTE_LAN"; echo "  LAN ($ROUTE_LAN)"
 elif [ -n "$ROUTE_HOST" ]; then
   if [ -n "$ROUTE_PROXY" ]; then P="${ROUTE_PROXY%% *}"; command -v "$P" >/dev/null || { command -v brew >/dev/null && brew install "$P" >/dev/null; }; EN+=(-o "ProxyCommand=$(command -v "$P") ${ROUTE_PROXY#* }"); fi
   T="$OU@$ROUTE_HOST"; echo "  $ROUTE_HOST"
 else echo "  cannot reach the orchestrator at $ROUTE_LAN" >&2; exit 3; fi
-echo "[3/4] install"
+echo "[4/5] install"
 mkdir -p ~/.scaleout/pkg
 "${EN[@]}" -n "$T" pkg-unix | tar -xzf - -C ~/.scaleout/pkg
 "${EN[@]}" -n "$T" args > ~/.scaleout/pkg/args
 eval "bash ~/.scaleout/pkg/setup.sh $(cat ~/.scaleout/pkg/args)" > ~/.scaleout/setup.out
-echo "[4/4] register + exchange keys"
+echo "[5/5] register + exchange keys"
 "${EN[@]}" "$T" register < ~/.scaleout/setup.out > ~/.scaleout/orchestrator.pub
 mkdir -p ~/.ssh; chmod 700 ~/.ssh; touch ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys
 grep -qF "$(cut -d' ' -f2 ~/.scaleout/orchestrator.pub)" ~/.ssh/authorized_keys || cat ~/.scaleout/orchestrator.pub >> ~/.ssh/authorized_keys
 grep -q '^SCALEOUT_AGENTS \[\]' ~/.scaleout/setup.out && echo "  ! no coding agent found — install and sign in to one (e.g. Claude Code: curl -fsSL https://claude.ai/install.sh | bash)"
+[ "$NEW_CLAUDE" = 1 ] && echo "  ! one more step on this machine: run  claude  once and sign in (the node runs jobs with that login)"
 echo "done — check it on the orchestrator: scaleout status"
 '''
 
@@ -478,6 +497,9 @@ if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) {
 }
 Set-Service sshd -StartupType Automatic; Start-Service sshd
 New-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -Value "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -PropertyType String -Force -ErrorAction SilentlyContinue | Out-Null
+if ("__CLAUDE__" -eq "1" -and -not (Get-Command claude -ErrorAction SilentlyContinue)) {
+  Write-Host "  installing Claude Code"; try { Invoke-RestMethod https://claude.ai/install.ps1 | Invoke-Expression; Write-Host "  ! run  claude  once here and sign in" } catch { Write-Host "  ! Claude Code did not install: irm https://claude.ai/install.ps1 | iex" }
+}
 Write-Host "[2/4] route to the orchestrator ($LanHost)"
 $EN = @("-i", $K, "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes", "-p", $OSP, "$OU@$LanHost")
 Write-Host "[3/4] install"
@@ -531,14 +553,14 @@ def cmd_invite(a) -> None:
     q = shlex.quote
     if win:
         script = (INVITE_WIN.replace("__N__", name).replace("__LAN__", o.get("lan", "")).replace("__OU__", o["user"])
-                  .replace("__OSP__", str(o.get("ssh_port", 22))).replace("__KEY__", key))
+                  .replace("__OSP__", str(o.get("ssh_port", 22))).replace("__KEY__", key).replace("__CLAUDE__", "0" if a.no_claude else "1"))
         b64 = base64.b64encode(script.encode()).decode()
         line = f"iex ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{b64}')))"
         where = "Paste this into PowerShell on the Windows node (run as Administrator the first time):"
     else:
         script = (INVITE_UNIX.replace("__N__", q(name)).replace("__LAN__", q(o.get("lan", ""))).replace("__HOST__", q(t.get("host", "")))
                   .replace("__PROXY__", q(t.get("proxy", ""))).replace("__OU__", q(o["user"])).replace("__OSP__", q(str(o.get("ssh_port", 22))))
-                  .replace("__KEY__", q(key)))
+                  .replace("__KEY__", q(key)).replace("__BREW__", "0" if a.no_brew else "1").replace("__CLAUDE__", "0" if a.no_claude else "1"))
         b64 = base64.b64encode(script.encode()).decode()
         line = f'bash -c "$(echo {b64} | base64 --decode)"'
         where = "Paste this into a terminal on the node (macOS / Linux):"
@@ -939,6 +961,17 @@ def collect(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[str,
         (STATE_DIR / "results").mkdir(parents=True, exist_ok=True)
         (STATE_DIR / "results" / f"{j['id']}.out").write_bytes(out)
         rc = int(s.get("rc", 1))
+        try:   # Claude Code reports tokens, cost and turns in its JSON answer
+            rep = json.loads(out.decode(errors="replace").strip().splitlines()[-1])
+            u = rep.get("usage") or {}
+            if u:
+                j["usage"] = {"in": int(u.get("input_tokens", 0)), "out": int(u.get("output_tokens", 0)),
+                              "cache_read": int(u.get("cache_read_input_tokens", 0)),
+                              "cache_write": int(u.get("cache_creation_input_tokens", 0))}
+                j["cost_usd"] = float(rep.get("total_cost_usd") or 0)
+                j["turns"] = int(rep.get("num_turns") or 0)
+        except (ValueError, IndexError, AttributeError, TypeError):
+            pass
         if s.get("mem_mb") is not None:
             j["mem_mb"] = int(s.get("mem_mb") or 0)
         if rc != 0:
@@ -1769,6 +1802,229 @@ def cmd_claude_setup(a) -> None:
         say("scaleout subagent: ~/.claude/agents/scaleout.md")
 
 
+# ── commands: usage + top ────────────────────────────────────────────────────
+def tokens_of(u: Dict[str, int]) -> int:
+    return int(u.get("in", 0)) + int(u.get("out", 0)) + int(u.get("cache_write", 0)) + int(u.get("cache_read", 0))
+
+
+def fmt_tok(n: float) -> str:
+    return f"{n / 1e9:.1f}B" if n >= 1e9 else f"{n / 1e6:.1f}M" if n >= 1e6 else f"{n / 1e3:.0f}k" if n >= 1e3 else f"{int(n)}"
+
+
+class LocalUsage:
+    """Claude Code tokens of every session on this machine, read incrementally from ~/.claude/projects/*/*.jsonl
+    (only appended bytes are read; hourly buckets for 7 days are cached in the state folder)."""
+    CACHE = STATE_DIR / "usage-cache.json"
+
+    def __init__(self) -> None:
+        c = read_json(self.CACHE, {})
+        self.offsets: Dict[str, int] = c.get("offsets", {})
+        self.hours: Dict[str, Dict[str, int]] = c.get("hours", {})
+        self.seen: Dict[str, List[str]] = {}
+        self.last_save = 0.0
+
+    def refresh(self) -> None:
+        root = HOME / ".claude" / "projects"
+        cutoff = now() - 7 * 86400
+        for f in root.glob("*/*.jsonl"):
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            if st.st_mtime < cutoff:
+                continue
+            key = str(f.resolve())
+            off = self.offsets.get(key, 0)
+            if st.st_size < off:
+                off = 0
+            if st.st_size == off:
+                continue
+            seen = set(self.seen.get(key, []))
+            with open(f, "rb") as fh:
+                fh.seek(off)
+                data = fh.read()
+            end = data.rfind(b"\n") + 1      # keep a half-written last line for next time
+            for line in data[:end].splitlines():
+                if b'"usage"' not in line:
+                    continue
+                try:
+                    r = json.loads(line)
+                    m = r.get("message") or {}
+                    u = m.get("usage") or {}
+                    mid = m.get("id") or r.get("requestId") or ""
+                    if not u or (mid and mid in seen):
+                        continue
+                    seen.add(mid)
+                    ts = r.get("timestamp", "")
+                    t = time.mktime(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")) - time.timezone if ts else now()
+                except (ValueError, TypeError, OverflowError):
+                    continue
+                h = str(int(t // 3600 * 3600))
+                b = self.hours.setdefault(h, {"in": 0, "out": 0, "cache_read": 0, "cache_write": 0, "msgs": 0})
+                b["in"] += int(u.get("input_tokens", 0)); b["out"] += int(u.get("output_tokens", 0))
+                b["cache_read"] += int(u.get("cache_read_input_tokens", 0)); b["cache_write"] += int(u.get("cache_creation_input_tokens", 0))
+                b["msgs"] += 1
+            self.offsets[key] = off + end
+            self.seen[key] = list(seen)[-2000:]
+        old = str(int(cutoff // 3600 * 3600))
+        self.hours = {h: v for h, v in self.hours.items() if h >= old}
+        if now() - self.last_save > 60:
+            write_json(self.CACHE, {"offsets": self.offsets, "hours": self.hours})
+            self.last_save = now()
+
+    def window(self, seconds: int) -> Dict[str, int]:
+        since = now() - seconds
+        tot = {"in": 0, "out": 0, "cache_read": 0, "cache_write": 0, "msgs": 0}
+        for h, v in self.hours.items():
+            if int(h) + 3600 > since:
+                for k in tot:
+                    tot[k] += v.get(k, 0)
+        return tot
+
+
+def job_usage(seconds: int) -> Dict[str, Dict[str, float]]:
+    """Tokens / cost / jobs / busy time per node, from finished jobs."""
+    since = now() - seconds
+    per: Dict[str, Dict[str, float]] = {}
+    for j in all_jobs():
+        if j.get("bench") or not j.get("node") or j.get("finished_at", 0) < since:
+            continue
+        p = per.setdefault(j["node"], {"jobs": 0, "tokens": 0, "cost": 0.0, "busy_s": 0, "failed": 0})
+        p["jobs"] += 1
+        p["failed"] += j.get("status") == "failed"
+        p["tokens"] += tokens_of(j.get("usage") or {})
+        p["cost"] += float(j.get("cost_usd") or 0)
+        if j.get("dispatched_at"):
+            p["busy_s"] += max(0, j["finished_at"] - j["dispatched_at"])
+    return per
+
+
+def local_metrics() -> Dict[str, Any]:
+    m: Dict[str, Any] = {"cpus": os.cpu_count() or 1, "load": os.getloadavg()[0]}
+    try:
+        du = shutil.disk_usage(str(HOME))
+        m["disk_free_gb"] = du.free // (1 << 30)
+    except OSError:
+        pass
+    if platform.system() == "Darwin":
+        r = run(["sysctl", "-n", "kern.memorystatus_level", "hw.memsize", "vm.swapusage"], timeout=5).stdout.decode().split("\n")
+        try:
+            m["mem_free_pct"] = int(r[0]); m["mem_total_gb"] = int(r[1]) // (1 << 30)
+            sw = re.search(r"used = ([\d.]+)M", r[2])
+            m["swap_gb"] = round(float(sw.group(1)) / 1024, 1) if sw else 0
+        except (ValueError, IndexError):
+            pass
+    else:
+        try:
+            mi = dict(l.split(":", 1) for l in open("/proc/meminfo").read().splitlines() if ":" in l)
+            kb = lambda k: int(mi[k].split()[0])
+            m["mem_total_gb"] = kb("MemTotal") // (1 << 20)
+            m["mem_free_pct"] = kb("MemAvailable") * 100 // kb("MemTotal")
+            m["swap_gb"] = round((kb("SwapTotal") - kb("SwapFree")) / (1 << 20), 1)
+        except (OSError, KeyError, ValueError):
+            pass
+    return m
+
+
+def bar(pct: float, width: int = 10) -> str:
+    pct = max(0.0, min(100.0, pct))
+    full = int(pct / 100 * width)
+    return "█" * full + "░" * (width - full)
+
+
+def usage_lines(lu: "LocalUsage") -> List[str]:
+    lines = [f"{'CLAUDE TOKENS':<30}{'5 h':>10}{'today':>10}{'7 days':>10}"]
+    w = [lu.window(5 * 3600), lu.window(int(now() - time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1)))), lu.window(7 * 86400)]
+    lines.append(f"{'this machine, all sessions':<30}" + "".join(f"{fmt_tok(tokens_of(x)):>10}" for x in w))
+    lines.append(f"{'  output tokens':<30}" + "".join(f"{fmt_tok(x['out']):>10}" for x in w))
+    per = [job_usage(5 * 3600), job_usage(86400), job_usage(7 * 86400)]
+    nodes = sorted(set().union(*[p.keys() for p in per]))
+    if nodes:
+        lines.append("")
+        lines.append(f"{'WORK DONE BY NODES (jobs)':<30}{'5 h':>10}{'today':>10}{'7 days':>10}{'jobs 7d':>9}{'busy 7d':>9}{'$ 7d':>8}")
+        for n in nodes:
+            t = [p.get(n, {}) for p in per]
+            lines.append(f"{n:<30}" + "".join(f"{fmt_tok(x.get('tokens', 0)):>10}" for x in t)
+                         + f"{int(t[2].get('jobs', 0)):>9}{t[2].get('busy_s', 0) / 3600:>8.1f}h{t[2].get('cost', 0):>8.2f}")
+    return lines
+
+
+def cmd_usage(a) -> None:
+    lu = LocalUsage()
+    lu.refresh()
+    lu.last_save = 0
+    lu.refresh()
+    print("\n".join(usage_lines(lu)))
+
+
+def top_lines(cfg: Dict[str, Any], lu: "LocalUsage", interval: int) -> List[str]:
+    L: List[str] = []
+    L.append(f"agent-scaleout {VERSION} · {time.strftime('%H:%M:%S')} · every {interval}s · q quit")
+    L.append("")
+    L.append(f"{'MACHINE':<14}{'STATE':<11}{'MEM free':<17}{'SWAP':>6}{'DISK free':>11}{'LOAD/CPU':>10}{'JOBS':>6}  DEVICES")
+    me = local_metrics()
+    L.append(f"{'orchestrator':<14}{'ok':<11}{bar(me.get('mem_free_pct', 0))} {str(me.get('mem_free_pct', '?')) + '%':>5}"
+             f"{str(me.get('swap_gb', '-')) + 'G':>6}{str(me.get('disk_free_gb', '?')) + 'G':>11}"
+             f"{me['load']:>6.1f}/{me['cpus']:<3}{'-':>6}")
+    for name in sorted(cfg["nodes"]):
+        st = read_json(node_state_path(name), {})
+        h = node_health(cfg, name, st) if cfg["nodes"][name].get("pending") is not True else "pending"
+        age = int(now() - st.get("ts", 0)) if st.get("ts") else None
+        stale = "" if age is None or age < 90 else f" ({age // 60}m old)"
+        L.append(f"{name:<14}{(h + stale)[:10]:<11}{bar(st.get('mem_free_pct', 0))} {str(st.get('mem_free_pct', '?')) + '%':>5}"
+                 f"{'-':>6}{str(st.get('disk_free_gb', '?')) + 'G':>11}"
+                 f"{float(st.get('load', 0) or 0):>6.1f}/{str(st.get('cpus', '?')):<3}"
+                 f"{str(st.get('running', 0)) + '+' + str(st.get('queued', 0)):>6}  {fmt_devices(st)}")
+    jobs = all_jobs()
+    active = [j for j in jobs if j.get("status") in ("queued", "dispatched", "running")]
+    today = time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1))
+    done_today = [j for j in jobs if j.get("finished_at", 0) >= today and not j.get("bench")]
+    L.append("")
+    L.append(f"QUEUE  waiting {sum(1 for j in active if j['status'] == 'queued')} · running {sum(1 for j in active if j['status'] != 'queued')}"
+             f" · finished today {sum(1 for j in done_today if j['status'] == 'done')} · failed today {sum(1 for j in done_today if j['status'] == 'failed')}")
+    recent = [j for j in jobs if not j.get("bench")][-6:]
+    for j in reversed(recent):
+        age = int(now() - (j.get("finished_at") or j.get("dispatched_at") or j.get("created", now())))
+        L.append(f"  {j['id'][-15:]}  {str(j.get('node') or '-'):<10} {j.get('status', ''):<10} {age // 60:>4}m ago"
+                 f"  {fmt_tok(tokens_of(j.get('usage') or {})):>7} tok  {(j.get('tags') and ','.join(j['tags'])) or ''}")
+    L.append("")
+    L.extend(usage_lines(lu))
+    return L
+
+
+def cmd_top(a) -> None:
+    import curses
+    cfg_t = 0.0
+    cfg = load_cfg()
+    lu = LocalUsage()
+
+    def loop(scr: Any) -> None:
+        nonlocal cfg, cfg_t
+        curses.curs_set(0)
+        scr.timeout(a.interval * 1000)   # sleep in getch between refreshes: no busy loop
+        while True:
+            if now() - cfg_t > 30:
+                cfg, cfg_t = load_cfg(), now()
+            lu.refresh()
+            lines = top_lines(cfg, lu, a.interval)
+            scr.erase()
+            hh, ww = scr.getmaxyx()
+            for i, line in enumerate(lines[:hh - 1]):
+                try:
+                    scr.addstr(i, 0, line[:ww - 1], curses.A_BOLD if line[:1].isupper() and line.split()[0].isupper() else 0)
+                except curses.error:
+                    pass
+            scr.refresh()
+            ch = scr.getch()
+            if ch in (ord("q"), ord("Q"), 27):
+                break
+    if a.once or not sys.stdout.isatty():
+        lu.refresh()
+        print("\n".join(top_lines(cfg, lu, a.interval)))
+        return
+    curses.wrapper(loop)
+
+
 # ── cli ──────────────────────────────────────────────────────────────────────
 def main(argv: Optional[List[str]] = None) -> None:
     p = argparse.ArgumentParser(prog="scaleout", description="Spread coding-agent jobs across the machines on your network.")
@@ -1797,6 +2053,8 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     s = sp.add_parser("invite", help="print a one-line installer to paste on a new node")
     s.add_argument("name"); s.add_argument("--os", choices=["unix", "windows"], default="unix"); s.add_argument("--hours", type=int, default=24)
+    s.add_argument("--no-brew", action="store_true", help="do not install Homebrew on a macOS node")
+    s.add_argument("--no-claude", action="store_true", help="do not install Claude Code on the node")
     node_opts(s); s.set_defaults(fn=cmd_invite)
 
     s = sp.add_parser("_enroll", help=argparse.SUPPRESS); s.add_argument("name"); s.set_defaults(fn=cmd_enroll)
@@ -1851,6 +2109,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     s.add_argument("--dry-run", action="store_true"); s.set_defaults(fn=cmd_provision)
     s = sp.add_parser("claude-setup", help="make every Claude Code session here offload heavy work (rules + low-memory hook)")
     s.add_argument("--remove", action="store_true"); s.set_defaults(fn=cmd_claude_setup)
+    s = sp.add_parser("top", help="live dashboard: orchestrator + nodes (memory, disk, load, jobs) and Claude tokens; low CPU")
+    s.add_argument("-i", "--interval", type=int, default=5); s.add_argument("--once", action="store_true"); s.set_defaults(fn=cmd_top)
+    s = sp.add_parser("usage", help="Claude tokens: all sessions on this machine, and work done by each node")
+    s.set_defaults(fn=cmd_usage)
     s = sp.add_parser("tick", help="run one scheduling round"); s.set_defaults(fn=cmd_tick)
     s = sp.add_parser("daemon", help="schedule forever (installed by install-daemon)"); s.add_argument("--interval", type=int, default=15); s.set_defaults(fn=cmd_daemon)
     s = sp.add_parser("install-daemon", help="run the scheduler in the background (launchd / systemd --user)"); s.set_defaults(fn=cmd_install_daemon)

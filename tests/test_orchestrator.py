@@ -83,7 +83,8 @@ class E2E(unittest.TestCase):
     def setUpClass(cls):
         cfg = so.load_cfg()
         cfg["orchestrator"] = {"user": "me", "lan": "127.0.0.1", "tunnel": {}}
-        cfg["defaults"].update({"metrics_ttl_s": 0, "min_free_disk_gb": 0, "min_free_mem_pct": 0, "cleanup_below_disk_gb": 0, "stall_min": 1, "offline_grace_min": 0, "auto_tune": False})
+        cfg["defaults"].update({"metrics_ttl_s": 0, "min_free_disk_gb": 0, "min_free_mem_pct": 0, "cleanup_below_disk_gb": 0, "stall_min": 1, "offline_grace_min": 0, "auto_tune": False,
+                                "mem_reserve_gb": -1000})   # the host's real memory must not decide these tests (test_97 checks it)
         cfg["skills"]["auto"] = False
         for n in ("n1", "n2"):
             HOMES[n] = make_node(n)
@@ -320,6 +321,7 @@ class E2E(unittest.TestCase):
     def test_97_memory_admission(self):
         cfg = so.load_cfg()
         cfg["nodes"] = {"big": {"max_jobs": 8, "tags": ["emulator"], "agent": "claude"}}
+        cfg["defaults"]["mem_reserve_gb"] = 1.5
         st = {"online": True, "mem_total_gb": 16, "mem_free_pct": 30, "disk_free_gb": 50, "runner": True,
               "agents": ["claude"], "os": "Darwin", "cpus": 8, "load": 0}
         emu, plain = {"tags": ["emulator"], "agent": "default"}, {"tags": [], "agent": "default"}
@@ -335,6 +337,22 @@ class E2E(unittest.TestCase):
         self.assertIsNone(so.pick_node(cfg, emu, {"big": st2}, {"big": 1}, planned_gb={"big": 7.5}))
         # an explicit --mem wins
         self.assertEqual(so.job_mem_gb({"tags": ["emulator"], "mem_gb": 2}, "big"), 2.0)
+
+    def test_98_usage(self):
+        self.assertEqual((so.fmt_tok(950), so.fmt_tok(33_000), so.fmt_tok(2_500_000), so.fmt_tok(6.7e9)), ("950", "33k", "2.5M", "6.7B"))
+        cfg = so.load_cfg()
+        jid = so.submit_job(cfg, "usage", node="n1")
+        j = so.load_job(jid)
+        j.update({"status": "done", "node": "n1", "dispatched_at": so.now() - 120, "finished_at": so.now(),
+                  "usage": {"in": 10, "out": 20, "cache_read": 300, "cache_write": 4000}, "cost_usd": 0.25})
+        so.save_job(j)
+        per = so.job_usage(3600)["n1"]
+        self.assertGreaterEqual(per["tokens"], 4330)
+        self.assertGreaterEqual(per["cost"], 0.25)
+        self.assertGreaterEqual(per["busy_s"], 119)
+        lines = "\n".join(so.top_lines(so.load_cfg(), type("U", (), {"window": lambda self, s: {"in": 0, "out": 0, "cache_read": 0, "cache_write": 0, "msgs": 0}})(), 5))
+        self.assertIn("WORK DONE BY NODES", lines)
+        self.assertIn("orchestrator", lines)
 
     def test_99_helpers(self):
         self.assertEqual(so.parse_setup("x\nSCALEOUT_USER bob\nSCALEOUT_AGENTS [\"claude\"]\n")["user"], "bob")

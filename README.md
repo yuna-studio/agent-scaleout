@@ -58,6 +58,8 @@ scaleout invite build-02                 # macOS / Linux node
 scaleout invite build-win --os windows   # Windows 10/11 node
 ```
 It prints one line. Paste it into a terminal (or an Administrator PowerShell) on the node — in person or through any remote desktop.
+On macOS it also installs Homebrew (with the Xcode command line tools) and Claude Code when they are missing
+(`--no-brew`, `--no-claude` to skip); you then run `claude` once there to sign in.
 The line turns the SSH server on (asking for that machine's password once), downloads the node package *from the orchestrator*,
 installs it, registers the node and exchanges keys. Invite keys are single-use, expire after 24 h and can do nothing but enroll.
 
@@ -193,6 +195,16 @@ scaleout provision NODE [--dry-run] [--flutter 3.35.6,3.41.9] [--android android
 Installs, without sudo and at this machine's versions: fvm and its Flutter versions, CocoaPods, Node.js, Firebase CLI,
 Android SDK platforms (into an SDK whose licenses were accepted on the node), Java for Android builds. Things that need a
 person are reported, not attempted: Homebrew itself (admin password), Xcode (Apple ID), Android license acceptance.
+
+## Dashboard and Claude usage
+
+```bash
+scaleout top          # live: orchestrator + nodes (memory, swap, disk, load, jobs, phones), queue, recent jobs, tokens
+scaleout usage        # Claude tokens: every session on this machine (5 h / today / 7 days) and work done by each node
+```
+`top` reads only what the daemon already collected (no SSH of its own) and sleeps between refreshes, so it costs almost no
+CPU. Tokens of this machine come from `~/.claude/projects/*/*.jsonl`, read incrementally (only new lines). Work done by a
+node comes from each finished job's own report (tokens, cost, turns, busy time).
 
 ## Benchmark, load test, memory tuning
 
