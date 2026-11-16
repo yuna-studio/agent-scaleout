@@ -5,6 +5,7 @@ Two fake nodes are real node/unix scripts living in temp HOME folders; the orche
 patched to call those scripts locally. A stub `claude` echoes the prompt (or sleeps, to simulate a hang).
 Run: python3 tests/test_orchestrator.py
 """
+import argparse
 import importlib.util
 import json
 import os
@@ -43,7 +44,7 @@ def make_node(name: str) -> Path:
         (b / d).mkdir()
     shutil.copy(ROOT / "node/unix/ctl.sh", b / "bin/ctl")
     shutil.copy(ROOT / "node/unix/runner.sh", b / "bin/runner.sh")
-    (b / "node.conf").write_text(f"NAME={name}\nWORK_ROOT=~/work\nMAX_JOBS=1\nAGENT=claude\nMIN_FREE_GB=0\nMIN_FREE_MEM_PCT=0\nRUNNER=manual\nDEVICE_SCAN=off\nLINGER_S=0\n")
+    (b / "node.conf").write_text(f"NAME={name}\nWORK_ROOT=~/work\nMAX_JOBS=1\nAGENT=claude\nMIN_FREE_GB=0\nMIN_FREE_MEM_PCT=0\nRUNNER=manual\nDEVICE_SCAN=off\nLINGER_S=0\nKEEP_DEVICES=1\n")
     (b / "devices.cache").write_text('{"android":0,"ios":0}')
     (h / ".local/bin").mkdir(parents=True)
     (h / ".local/bin/claude").write_text(STUB)
@@ -57,7 +58,12 @@ OFFLINE = set()
 RUNNERS = []
 
 
+ORIG_CTL = so.Node.ctl
+
+
 def fake_ctl(self, verb, *args, input=None, timeout=60):
+    if self.local:   # the orchestrator's own executor runs for real (in the test state folder)
+        return ORIG_CTL(self, verb, *args, input=input, timeout=timeout)
     if self.name in OFFLINE:
         return subprocess.CompletedProcess([], 255, b"", b"unreachable")
     h = HOMES[self.name]
@@ -84,7 +90,8 @@ class E2E(unittest.TestCase):
         cfg = so.load_cfg()
         cfg["orchestrator"] = {"user": "me", "lan": "127.0.0.1", "tunnel": {}}
         cfg["defaults"].update({"metrics_ttl_s": 0, "min_free_disk_gb": 0, "min_free_mem_pct": 0, "cleanup_below_disk_gb": 0, "stall_min": 1, "offline_grace_min": 0, "auto_tune": False,
-                                "mem_reserve_gb": -1000})   # the host's real memory must not decide these tests (test_97 checks it)
+                                "mem_reserve_gb": -1000, "reap_idle_min": 0, "max_load_per_cpu": 1000})
+        # reap 0: never touch this host's real simulators; reserve and load: this host's real memory and CPU must not decide these tests (test_97 checks them)
         cfg["skills"]["auto"] = False
         for n in ("n1", "n2"):
             HOMES[n] = make_node(n)
@@ -318,6 +325,46 @@ class E2E(unittest.TestCase):
         # the work tree on the node is unlocked and keeps ignored files between jobs
         self.assertEqual(list((HOMES["n2"] / ".scaleout/repos").glob("*.lock")), [])
 
+    def test_96b_orchestrator_runs_jobs_itself(self):
+        """`scaleout local on`: this machine runs jobs itself from a local copy on its own disk (no SSH, no node install)."""
+        repo = TMP / "repo-local"
+        repo.mkdir()
+        g = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        g("init", "-q"); g("config", "user.email", "t@t"); g("config", "user.name", "t")
+        (repo / "a.txt").write_text("one\n"); g("add", "a.txt"); g("commit", "-qm", "init")
+        (repo / "b.txt").write_text("uncommitted\n")
+        agent = TMP / "local-agent.sh"
+        agent.write_text('#!/bin/bash\ncat >/dev/null; test -f b.txt || exit 7; test -n "$SCALEOUT_JOB_ID" || exit 8; echo two >> a.txt; echo \'{"result":"edited here"}\'\n')
+        so.cmd_local(argparse.Namespace(action="on", max_jobs=1))
+        lh = so.local_home()
+        (lh / "node.conf").write_text(f"NAME=orchestrator\nRUNNER=manual\nKEEP_DEVICES=1\nMAX_JOBS=1\nAGENT=custom\nAGENT_CMD='bash {agent}'\n"
+                                      "MIN_FREE_GB=0\nMIN_FREE_MEM_PCT=0\nMAX_LOAD_PER_CPU=1000\nDEVICE_SCAN=off\nLINGER_S=0\n")
+        (lh / "devices.cache").write_text('{"android":0,"ios":0}')
+        cfg = so.load_cfg()
+        try:
+            self.assertTrue(json.loads((lh / "settings/claude.json").read_text())["permissions"]["deny"][-1].startswith("Edit("))
+            jid = so.submit_job(cfg, "edit here", node=so.LOCAL, repo=str(repo))
+            for _ in range(30):
+                so.tick(); time.sleep(1)
+                if so.load_job(jid)["status"] in ("done", "failed"):
+                    break
+            so.tick()
+            j = so.load_job(jid)
+            self.assertEqual(j["status"], "done", j)
+            self.assertEqual(j.get("repo_branch"), f"scaleout/{jid}", j)
+            self.assertEqual(g("diff", "--name-only", j["repo_base"], j["repo_branch"]).stdout.decode().split(), ["a.txt"])
+            self.assertEqual((repo / "a.txt").read_text(), "one\n", "without --apply the user's files stay as they were")
+            self.assertTrue(list(lh.glob("repos/*.git")), "a copy on this machine's disk, reached by path")
+            self.assertEqual(list(lh.glob("repos/*.lock")), [])
+            self.assertEqual(g("worktree", "list").stdout.decode().count("\n"), 1, "the user's repository gets no work trees")
+            # off: it takes no more jobs
+            so.cmd_local(argparse.Namespace(action="off", dir=None, max_jobs=0))
+            self.assertNotIn(so.LOCAL, so.load_cfg()["nodes"])
+        finally:
+            cfg = so.load_cfg()
+            cfg["nodes"].pop(so.LOCAL, None)
+            so.save_cfg(cfg)
+
     def test_97_memory_admission(self):
         cfg = so.load_cfg()
         cfg["nodes"] = {"big": {"max_jobs": 8, "tags": ["emulator"], "agent": "claude"}}
@@ -335,6 +382,24 @@ class E2E(unittest.TestCase):
         st2 = dict(st, mem_free_pct=80)   # 12.8 GB free
         self.assertEqual(so.pick_node(cfg, emu, {"big": st2}, {"big": 1}), "big")
         self.assertIsNone(so.pick_node(cfg, emu, {"big": st2}, {"big": 1}, planned_gb={"big": 7.5}))
+        # CPU: a node with load above 2 × cores gets nothing more, idle or not (the load may be other work, e.g. CI)
+        cfg["defaults"].pop("max_load_per_cpu", None)   # the shipped default (2)
+        hot = dict(st2, load=17)   # above 2 × 8
+        self.assertIsNone(so.pick_node(cfg, plain, {"big": hot}, {"big": 1}))
+        self.assertIsNone(so.pick_node(cfg, plain, {"big": hot}, {"big": 0}))
+        cfg["defaults"]["max_load_per_cpu"] = "2.5"   # a value saved as text still works
+        self.assertEqual(so.pick_node(cfg, plain, {"big": hot}, {"big": 0}), "big")
+        cfg["defaults"]["max_load_per_cpu"] = 1000
+        # CPU units: a heavy job fills a 2-unit node alone, two light jobs share it
+        cfg["nodes"]["big"]["cpu_slots"] = 2
+        heavy = {"id": "x-heavy", "tags": ["emulator"], "agent": "default"}
+        light = {"id": "x-light", "tags": [], "agent": "default"}
+        self.assertEqual((so.job_cpu(heavy), so.job_cpu(light)), (2, 1))
+        busy_cpu = dict(st2, load=9)   # cores really busy
+        self.assertIsNone(so.pick_node(cfg, light, {"big": busy_cpu}, {"big": 1}, cpu_used={"big": 2}))
+        self.assertEqual(so.pick_node(cfg, light, {"big": st2}, {"big": 1}, cpu_used={"big": 2}), "big")   # quiet phase: room
+        self.assertEqual(so.pick_node(cfg, light, {"big": st2}, {"big": 1}, cpu_used={"big": 1}), "big")
+        self.assertEqual(so.job_cpu({"id": "x", "tags": [], "cpu": 1}), 1)
         # an explicit --mem wins
         self.assertEqual(so.job_mem_gb({"tags": ["emulator"], "mem_gb": 2}, "big"), 2.0)
 

@@ -4,7 +4,7 @@
 # Every verb prints plain text or one JSON line, so the orchestrator never needs to know the node's OS.
 # Works with bash 3.2 (stock macOS): no `wait -n`, no associative arrays, and ${var} before non-ASCII text.
 set -u
-B="$HOME/.scaleout"
+B="${SCALEOUT_NODE_HOME:-$HOME/.scaleout}"   # the orchestrator runs its own jobs from another folder
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$HOME/Library/Android/sdk/platform-tools:${ANDROID_HOME:-$HOME/Android/Sdk}/platform-tools:$PATH"
 [ -f "$B/node.conf" ] && . "$B/node.conf"
 OS="$(uname -s)"
@@ -43,7 +43,7 @@ runner_ok() {
 }
 devices_scan() {  # slow (xcrun devicectl can hang) — run in the background only
   local a=0 i=0
-  command -v adb >/dev/null 2>&1 && a="$(adb devices 2>/dev/null | awk 'NR>1 && $2=="device"' | wc -l | tr -d ' ')"
+  command -v adb >/dev/null 2>&1 && a="$(adb devices 2>/dev/null | awk 'NR>1 && $2=="device" && $1 !~ /^emulator-/' | wc -l | tr -d ' ')"   # phones only
   if [ "$OS" = Darwin ] && [ -x /usr/bin/xcrun ] && xcode-select -p >/dev/null 2>&1; then
     i="$(xcrun devicectl list devices 2>/dev/null | grep -E 'connected|available \(paired\)' | grep -E -c 'iPhone|iPad' || true)"   # not watches
   elif command -v idevice_id >/dev/null 2>&1; then i="$(idevice_id -l 2>/dev/null | wc -l | tr -d ' ')"; fi
@@ -60,6 +60,14 @@ devices() {  # USB-attached real devices {"android":N,"ios":N} — never blocks:
   fi
   cat "$c" 2>/dev/null || printf '{"android":0,"ios":0}'
 }
+# ── simulators / emulators / build daemons: what is running now, and stopping them ──
+booted_sims() { command -v xcrun >/dev/null 2>&1 && xcrun simctl list devices booted 2>/dev/null | sed -n 's/.*(\([0-9A-F-]\{36\}\)) (Booted).*/\1/p'; }
+running_emus() { command -v adb >/dev/null 2>&1 && adb devices 2>/dev/null | awk '/^emulator-[0-9]+/ {print $1}'; }
+build_daemons() { pgrep -f 'GradleDaemon|KotlinCompileDaemon' 2>/dev/null; }
+stop_sim() { xcrun simctl shutdown "$1" >/dev/null 2>&1; }
+stop_emu() { adb -s "$1" emu kill >/dev/null 2>&1; }
+quit_simulator_app() { [ -z "$(booted_sims)" ] && pgrep -x Simulator >/dev/null 2>&1 && osascript -e 'quit app "Simulator"' >/dev/null 2>&1; true; }
+TEST_RE='maestro|xcodebuild .*test|flutter (test|drive)|flutter_tester|gradlew.*(connected|AndroidTest)|instrument|playwright|simctl (launch|install|io|spawn)|detox|appium'
 skills_hash() { cat "$B/skills.hash" 2>/dev/null || echo none; }
 agents() {
   local out="" a
@@ -194,6 +202,18 @@ case "$verb" in
     else git -c user.name=agent-scaleout -c user.email=scaleout@localhost commit -q --no-verify -m "scaleout $3" && c="$(git rev-parse HEAD)"; fi
     git update-ref "refs/scaleout/result/$3" "$c" && echo "$c" ;;
   repo-unlock) rm -rf "$1.lock"; echo ok ;;
+
+  reap)  # reap <idle_min>: stop simulators/emulators when no test has run for that long
+    m="${1:-20}"; st="$B/reap.active"
+    s="$(booted_sims)"; e="$(running_emus)"
+    if [ -z "$s$e" ]; then rm -f "$st"; echo "nothing running"; exit 0; fi
+    # pgrep patterns are extended regexes already (macOS pgrep has no -E)
+    if pgrep -f "$TEST_RE" >/dev/null 2>&1 || [ "$(running_jobs)" -gt 0 ]; then touch "$st"; echo "in use"; exit 0; fi
+    [ -f "$st" ] || { touch "$st"; echo "idle clock started"; exit 0; }
+    if [ -n "$(find "$st" -mmin +"$m" 2>/dev/null)" ]; then
+      n=0; for x in $s; do stop_sim "$x"; n=$((n + 1)); done; for x in $e; do stop_emu "$x"; n=$((n + 1)); done
+      quit_simulator_app; rm -f "$st"; echo "stopped $n idle simulator/emulator(s)"
+    else echo "idle, not long enough"; fi ;;
 
   conf)  # conf KEY VALUE  — set one node.conf value
     f="$B/node.conf"; touch "$f"; grep -v "^$1=" "$f" > "$f.tmp"; echo "$1=$2" >> "$f.tmp"; mv "$f.tmp" "$f"; echo ok ;;

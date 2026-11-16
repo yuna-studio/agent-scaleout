@@ -5,9 +5,9 @@
 # Why a login-session service and not plain SSH: on macOS an SSH session cannot read the login keychain,
 # so agents such as Claude Code look "not logged in" when started over SSH.
 set -u
-B="$HOME/.scaleout"; Q="$B/queue"; J="$B/jobs"
+B="${SCALEOUT_NODE_HOME:-$HOME/.scaleout}"; Q="$B/queue"; J="$B/jobs"
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
-MAX_JOBS=2; AGENT=claude; AGENT_CMD=""; MIN_FREE_GB=2; MIN_FREE_MEM_PCT=12
+MAX_JOBS=2; AGENT=claude; AGENT_CMD=""; MIN_FREE_GB=2; MIN_FREE_MEM_PCT=12; MAX_LOAD_PER_CPU=2
 [ -f "$B/node.conf" ] && . "$B/node.conf"
 mkdir -p "$Q" "$J" "$B/work"
 
@@ -25,9 +25,39 @@ used_mb() {  # memory in use on this machine, MB
   if [ "$(uname -s)" = Darwin ]; then echo $(( $(sysctl -n hw.memsize) / 1048576 * (100 - $(sysctl -n kern.memorystatus_level 2>/dev/null || echo 50)) / 100 ))
   else awk '/MemTotal/ {t=$2} /MemAvailable/ {a=$2} END {printf "%d", (t-a)/1024}' /proc/meminfo; fi
 }
+overloaded() {  # 1-minute load above MAX_LOAD_PER_CPU × cores
+  local l c
+  if [ "$(uname -s)" = Darwin ]; then l="$(sysctl -n vm.loadavg | awk '{print $2}')"; c="$(sysctl -n hw.ncpu)"
+  else l="$(cut -d' ' -f1 /proc/loadavg)"; c="$(nproc)"; fi
+  awk -v l="$l" -v c="$c" -v m="$MAX_LOAD_PER_CPU" 'BEGIN {exit !(l > m * c)}'
+}
 mem_free_pct() {
   if [ "$(uname -s)" = Darwin ]; then sysctl -n kern.memorystatus_level 2>/dev/null || echo 100
   else awk '/MemTotal/ {t=$2} /MemAvailable/ {a=$2} END {if (t) printf "%d", a*100/t; else print 100}' /proc/meminfo; fi
+}
+
+# ── simulators / emulators / build daemons: what is running now, and stopping them ──
+booted_sims() { command -v xcrun >/dev/null 2>&1 && xcrun simctl list devices booted 2>/dev/null | sed -n 's/.*(\([0-9A-F-]\{36\}\)) (Booted).*/\1/p'; }
+running_emus() { command -v adb >/dev/null 2>&1 && adb devices 2>/dev/null | awk '/^emulator-[0-9]+/ {print $1}'; }
+build_daemons() { pgrep -f 'GradleDaemon|KotlinCompileDaemon' 2>/dev/null; }
+stop_sim() { xcrun simctl shutdown "$1" >/dev/null 2>&1; }
+stop_emu() { adb -s "$1" emu kill >/dev/null 2>&1; }
+quit_simulator_app() { [ -z "$(booted_sims)" ] && pgrep -x Simulator >/dev/null 2>&1 && osascript -e 'quit app "Simulator"' >/dev/null 2>&1; true; }
+
+baseline() {  # remember what was already running when the node got busy
+  { booted_sims | sed 's/^/sim /'; running_emus | sed 's/^/emu /'; build_daemons | sed 's/^/pid /'; } > "$B/devices.baseline" 2>/dev/null
+}
+release() {  # node is idle again: stop simulators, emulators and build daemons the jobs started (never the ones from before)
+  [ -f "$B/devices.baseline" ] || return 0
+  [ "${KEEP_DEVICES:-0}" = 1 ] && { rm -f "$B/devices.baseline"; return 0; }
+  local x n=0
+  for x in $(booted_sims); do grep -qx "sim $x" "$B/devices.baseline" || { stop_sim "$x"; n=$((n + 1)); }; done
+  for x in $(running_emus); do grep -qx "emu $x" "$B/devices.baseline" || { stop_emu "$x"; n=$((n + 1)); }; done
+  for x in $(build_daemons); do grep -qx "pid $x" "$B/devices.baseline" || { kill "$x" 2>/dev/null; n=$((n + 1)); }; done
+  quit_simulator_app
+  rm -f "$B/devices.baseline"
+  [ "$n" -gt 0 ] && echo "$(date '+%F %T') idle: stopped $n simulator/emulator/daemon(s) started by jobs" >> "$B/runner.log"
+  return 0
 }
 
 agent_cmd() {  # agent_cmd <agent> -> command line that reads the prompt on stdin and writes the answer to stdout
@@ -81,7 +111,7 @@ while :; do
   set -- "$Q"/*
   if [ ! -e "$1" ]; then
     # linger a little before exiting: launchd will not start us again for ~10 s after we quit
-    if [ "$(running)" -eq 0 ]; then idle=$((idle + 2)); [ "$idle" -ge "${LINGER_S:-30}" ] && break; else idle=0; fi
+    if [ "$(running)" -eq 0 ]; then release; idle=$((idle + 2)); [ "$idle" -ge "${LINGER_S:-30}" ] && break; else idle=0; fi
     sleep 2; continue
   fi
   idle=0
@@ -89,8 +119,9 @@ while :; do
     while [ "$(running)" -ge "$MAX_JOBS" ]; do sleep 2; done
     # do not start another agent while this machine is short on memory (other apps, other agents);
     # the job waits here and the orchestrator moves it elsewhere if it waits too long
-    while [ "$(running)" -gt 0 ] && [ "$(mem_free_pct)" -lt "$MIN_FREE_MEM_PCT" ]; do sleep 5; done
+    while [ "$(running)" -gt 0 ] && { [ "$(mem_free_pct)" -lt "$MIN_FREE_MEM_PCT" ] || overloaded; }; do sleep 5; done
     if [ "$(mem_free_pct)" -lt "$MIN_FREE_MEM_PCT" ]; then sleep 15; continue 2; fi
+    [ "$(running)" -eq 0 ] && [ ! -f "$B/devices.baseline" ] && baseline
     id="$(basename "$f")"; rm -f "$f"
     [ -d "$J/$id" ] || continue
     run_job "$J/$id" &
