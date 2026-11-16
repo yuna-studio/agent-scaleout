@@ -420,6 +420,47 @@ class E2E(unittest.TestCase):
         self.assertIn("WORK DONE BY NODES", lines)
         self.assertIn("orchestrator", lines)
 
+    def test_98b_claude_now(self):
+        """Sessions working now, their running subagents (finished or stale ones left out), names from /rename."""
+        home = TMP / "claude-home"
+        proj = home / ".claude" / "projects" / "-repo"
+        (proj / "s1" / "subagents").mkdir(parents=True)
+        (proj / "s1.jsonl").write_text('{"type":"user"}\n{"type":"custom-title","customTitle":"아이디어"}\n')
+        (proj / "s2.jsonl").write_text('{"type":"user"}\n')
+        old = time.time() - 4000
+        os.utime(proj / "s2.jsonl", (old, old))                      # idle an hour, no subagents: not listed
+        sub = proj / "s1" / "subagents"
+        for aid, finished, age in (("a1", False, 0), ("a2", True, 0), ("a3", False, 1200)):
+            (sub / f"agent-{aid}.meta.json").write_text(json.dumps({"agentType": "general-purpose", "description": f"job {aid}", "finished": finished}))
+            (sub / f"agent-{aid}.jsonl").write_text('{"message":{"id":"m-' + aid + '","usage":{"input_tokens":5,"output_tokens":7}},"timestamp":"2026-11-16T08:00:00Z"}\n')
+            if age:
+                os.utime(sub / f"agent-{aid}.jsonl", (time.time() - age, time.time() - age))
+        saved = so.HOME
+        so.HOME = home
+        try:
+            cn = so.claude_now()
+            self.assertEqual([x["name"] for x in cn["sessions"]], ["아이디어"])
+            self.assertEqual([s["desc"] for s in cn["sessions"][0]["subs"]], ["job a1"], "finished and stale subagents are not running")
+            self.assertIn("1 subagent(s): job a1", "\n".join(so.claude_now_lines(cn)))
+            self.assertEqual((so.cols("아이디어"), so.fit("아이디어", 10), so.fit("아이디어", 5)), (8, "아이디어  ", "아이 "), "Korean takes two columns")
+            cn["nodes"] = {"m1": {"running": 1, "claude": {"subagents": 2, "descs": ["build", "test"]}}, "m2": {"running": 0, "claude": {"subagents": 0}}}
+            text = "\n".join(so.claude_now_lines(cn))
+            self.assertIn("m1 (node)", text)
+            self.assertIn("2 subagent(s): build · test", text)
+            self.assertNotIn("m2 (node)", text, "an idle node is not listed")
+            # node jobs: the whole run counts (modelUsage), not the last turn (usage)
+            rep = {"usage": {"output_tokens": 9}, "modelUsage": {"a": {"outputTokens": 50, "inputTokens": 1}, "b": {"outputTokens": 2}},
+                   "total_cost_usd": 1.5, "num_turns": 3, "subagent_stats": {"spawned": 4}}
+            self.assertEqual(so.report_usage(rep)["usage"]["out"], 52)
+            self.assertEqual((so.report_usage(rep)["subagents"], so.report_usage({"usage": {"output_tokens": 9}})["usage"]["out"]), (4, 9))
+            lu = so.LocalUsage()
+            lu.CACHE = TMP / "usage-cache-test.json"
+            lu.offsets, lu.hours = {}, {}
+            lu.refresh()
+            self.assertEqual(lu.window(10 ** 9)["out"], 21, "subagent transcripts count toward tokens")
+        finally:
+            so.HOME = saved
+
     def test_99_helpers(self):
         self.assertEqual(so.parse_setup("x\nSCALEOUT_USER bob\nSCALEOUT_AGENTS [\"claude\"]\n")["user"], "bob")
         so.ssh_block_put("scaleout t", "Host scaleout-t\n  Port 1")
