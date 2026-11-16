@@ -32,7 +32,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 HOME = Path.home()
 CONF_DIR = Path(os.environ.get("SCALEOUT_CONF", HOME / ".config" / "scaleout"))
 STATE_DIR = Path(os.environ.get("SCALEOUT_STATE", HOME / ".local" / "state" / "scaleout"))
@@ -52,6 +52,7 @@ DEFAULTS: Dict[str, Any] = {
     "job_timeout_min": 180,
     "stall_min": 5,              # running job whose heartbeat is older than this is considered dead
     "node_wait_min": 10,
+    "mem_reserve_gb": 1.5,       # memory a node always keeps free when the scheduler fits jobs into it
     "max_artifacts_mb": 1024,    # a job's screenshots/videos/logs larger than this stay on the node
     "auto_tune": True,           # daily: set each node's max_jobs from the memory its real jobs used (not for --max-jobs nodes)         # job handed to a node but not started there (node short on memory) -> move it
     "offline_grace_min": 10,     # node unreachable this long -> its jobs are retried elsewhere
@@ -684,9 +685,51 @@ def session_file(sid: str) -> Optional[Path]:
     return hits[0] if hits else None
 
 
+GIT_SSH = " ".join(shlex.quote(x) for x in SSH_BASE)
+
+
+def git(root: str, *args: str, env: Optional[Dict[str, str]] = None, input: Optional[bytes] = None,
+        timeout: float = 600) -> subprocess.CompletedProcess:
+    e = dict(os.environ, GIT_SSH_COMMAND=GIT_SSH, **(env or {}))
+    return subprocess.run(["git", "-C", root, *args], input=input, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=e, timeout=timeout)
+
+
+def repo_snapshot(root: str, jid: str) -> str:
+    """Commit the working tree as it is now (uncommitted and untracked files included) without touching the
+    user's index, branch or files. Kept alive by refs/scaleout/base/<job>."""
+    tmp = STATE_DIR / "tmp"; tmp.mkdir(parents=True, exist_ok=True)
+    idx = tmp / f"{jid}.index"
+    real = git(root, "rev-parse", "--git-path", "index").stdout.decode().strip()
+    real_p = Path(real) if Path(real).is_absolute() else Path(root) / real
+    if real_p.exists():
+        shutil.copy(real_p, idx)   # reuse the stat cache: only changed files are hashed
+    env = {"GIT_INDEX_FILE": str(idx), "GIT_AUTHOR_NAME": "agent-scaleout", "GIT_AUTHOR_EMAIL": "scaleout@localhost",
+           "GIT_COMMITTER_NAME": "agent-scaleout", "GIT_COMMITTER_EMAIL": "scaleout@localhost"}
+    try:
+        head = git(root, "rev-parse", "HEAD").stdout.decode().strip()
+        if git(root, "add", "-A", env=env, timeout=1800).returncode != 0:
+            die(E_USAGE, f"git add failed in {root}")
+        tree = git(root, "write-tree", env=env).stdout.decode().strip()
+        commit = git(root, "commit-tree", tree, *(["-p", head] if head else []), "-m", f"scaleout snapshot {jid}", env=env).stdout.decode().strip()
+    finally:
+        idx.unlink(missing_ok=True)
+    if not commit:
+        die(E_USAGE, f"could not snapshot {root}")
+    git(root, "update-ref", f"refs/scaleout/base/{jid}", commit)
+    return commit
+
+
+def node_git_url(alias: str, path: str) -> str:
+    return path if alias == "local" else f"ssh://{alias}{path}"   # "local" = test harness
+
+
+def repo_name(root: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "_", Path(root).name) + "-" + hashlib.sha1(root.encode()).hexdigest()[:8]
+
+
 def submit_job(cfg: Dict[str, Any], prompt: str, node: Optional[str] = None, agent: str = "default", workdir: str = "",
                sync: str = "", tags: Optional[List[str]] = None, timeout: Optional[int] = None, pull: bool = True,
-               resume: str = "", force: bool = False) -> str:
+               resume: str = "", force: bool = False, repo: str = "", apply: bool = False, mem_gb: float = 0) -> str:
     if resume:
         resume = re.sub(r"[^A-Za-z0-9-]", "", resume)
         f = session_file(resume)
@@ -702,18 +745,61 @@ def submit_job(cfg: Dict[str, Any], prompt: str, node: Optional[str] = None, age
         sync = str(Path(sync).expanduser().resolve())
         if not Path(sync).is_dir():
             die(E_USAGE, f"--sync folder not found: {sync}")
-    save_job({"id": jid, "status": "queued", "created": now(), "node": None, "want_node": node, "agent": agent,
-              "workdir": workdir, "sync": sync, "pull": pull, "tags": tags or [], "attempts": 0, "resume": resume,
+    repo_fields: Dict[str, Any] = {}
+    if repo:
+        here = Path(repo).expanduser().resolve()
+        top = run(["git", "-C", str(here), "rev-parse", "--show-toplevel"]).stdout.decode().strip()
+        if not top:
+            die(E_USAGE, f"--repo: not inside a git repository: {here}")
+        sub = os.path.relpath(str(here), top)
+        repo_fields = {"repo": top, "repo_sub": "" if sub == "." else sub, "repo_name": repo_name(top),
+                       "repo_base": repo_snapshot(top, jid), "apply": apply}
+    save_job({**repo_fields, "id": jid, "status": "queued", "created": now(), "node": None, "want_node": node, "agent": agent,
+              "workdir": workdir, "sync": sync, "pull": pull, "tags": tags or [], "attempts": 0, "resume": resume, "mem_gb": mem_gb,
               "timeout": timeout or cfg["defaults"]["job_timeout_min"], "history": []})
     return jid
 
 
 DEVICE_TAGS = ("android-device", "ios-device")
+# what one job needs when nothing better is known (agent + build + test target)
+DEFAULT_JOB_GB = {"emulator": 7.5, "simulator": 4.5, "ios-simulator": 4.5, "android-device": 3.5, "ios-device": 3.5}
+DEFAULT_GB = 3.0
+
+
+def job_kind(j: Dict[str, Any]) -> str:
+    return ",".join(sorted(t for t in (j.get("tags") or []) if t in DEFAULT_JOB_GB)) or "default"
+
+
+_LEARNED: Dict[str, Any] = {"t": 0, "v": {}}
+
+
+def learned_mem(node: str, kind: str) -> Optional[float]:
+    """p90 of the memory recent finished jobs of this kind added on this node (needs 3 samples)."""
+    if now() - _LEARNED["t"] > 60:
+        v: Dict[Tuple[str, str], List[float]] = {}
+        since = now() - 14 * 86400
+        for x in all_jobs():
+            if x.get("status") == "done" and x.get("mem_mb") and x.get("node") and x.get("created", 0) >= since and not x.get("bench"):
+                v.setdefault((x["node"], job_kind(x)), []).append(x["mem_mb"] / 1024)
+        _LEARNED.update(t=now(), v=v)
+    xs = sorted(_LEARNED["v"].get((node, kind), []))
+    return xs[min(len(xs) - 1, int(round(0.9 * (len(xs) - 1))))] if len(xs) >= 3 else None
+
+
+def job_mem_gb(j: Dict[str, Any], node: str) -> float:
+    if j.get("mem_gb"):
+        return float(j["mem_gb"])
+    kind = job_kind(j)
+    got = learned_mem(node, kind)
+    if got:
+        return max(1.0, got)
+    return max([DEFAULT_JOB_GB[t] for t in kind.split(",") if t in DEFAULT_JOB_GB] or [DEFAULT_GB])
 
 
 def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[str, Any]], load: Dict[str, int],
-              dev_load: Optional[Dict[Tuple[str, str], int]] = None) -> Optional[str]:
+              dev_load: Optional[Dict[Tuple[str, str], int]] = None, planned_gb: Optional[Dict[str, float]] = None) -> Optional[str]:
     dev_load = dev_load or {}
+    planned_gb = planned_gb if planned_gb is not None else {}
     best, best_score = None, -1e9
     for name, n in cfg["nodes"].items():
         if n.get("pending") or (j.get("want_node") and name != j["want_node"]):
@@ -732,7 +818,7 @@ def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[st
         if any(int(devs.get(t[:-7], 0) or 0) <= dev_load.get((name, t), 0) for t in (j.get("tags") or []) if t in DEVICE_TAGS):
             continue
         agent = j.get("agent") or "default"
-        if agent == "bench" and st.get("os", "").lower() == "windows":
+        if (agent == "bench" or j.get("repo")) and st.get("os", "").lower() == "windows":
             continue
         if agent not in ("default", "custom", "bench") and agent not in (st.get("agents") or []):
             continue
@@ -741,6 +827,10 @@ def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[st
         busy = load.get(name, 0)
         if busy >= int(n.get("max_jobs", 2)):
             continue
+        if st.get("mem_total_gb"):
+            free_gb = float(st["mem_total_gb"]) * float(st.get("mem_free_pct", 0)) / 100 - planned_gb.get(name, 0.0)
+            if busy and free_gb - cfg["defaults"].get("mem_reserve_gb", 1.5) < job_mem_gb(j, name):
+                continue   # an idle node always takes one job: its own memory guard still protects it
         score = st.get("mem_free_pct", 0) + min(st.get("disk_free_gb", 0), 50) / 5 - 30 * busy - 10 * float(st.get("load", 0)) / max(int(st.get("cpus", 1)), 1)
         if score > best_score:
             best, best_score = name, score
@@ -780,12 +870,31 @@ def dispatch(cfg: Dict[str, Any], j: Dict[str, Any], name: str) -> bool:
         except Exception:  # skills are best effort
             pass
     wd = j.get("workdir") or node.get("dir") or "~/scaleout-work"
+    if j.get("repo"):
+        alias = n.route()
+        bare = n.ctl("repo-init", j["repo_name"]).stdout.decode().strip().splitlines()[-1:]
+        if not alias or not bare:
+            return False
+        push = git(j["repo"], "push", "-q", "--no-verify", node_git_url(alias, bare[0]), f"{j['repo_base']}:refs/scaleout/base/{j['id']}", timeout=3600)
+        if push.returncode != 0:
+            j["history"].append({"t": now(), "event": "push-failed", "node": name, "why": push.stderr.decode()[-300:]})
+            return False
+        co = n.ctl("repo-checkout", j["repo_name"], j["repo_base"], timeout=1800)
+        wt = co.stdout.decode().strip().splitlines()[-1:] if co.returncode == 0 else []
+        if not wt:
+            return False
+        j["repo_wt"] = wt[0]
+        wd = wt[0] + ("/" + j["repo_sub"] if j.get("repo_sub") else "")
     if j.get("sync"):
         wd = ("~/.scaleout/work/" if not n.windows else "~\\.scaleout\\work\\") + j["id"]
         tar = run(["tar", "-cf", "-", "-C", j["sync"], "--exclude", "node_modules", "--exclude", ".gradle", "--exclude", "build", "--exclude", ".dart_tool", "."]).stdout
         if n.ctl("recv", wd, input=tar, timeout=900).returncode != 0:
             return False
     prompt = (STATE_DIR / "prompts" / f"{j['id']}.md").read_bytes()
+    if j.get("repo"):
+        prompt += ("\n\n---\n(agent-scaleout) Your working folder is a disposable copy of the requester's repository at their "
+                   "current working tree. Leave your changes in the files: do not commit, push or switch branches; "
+                   "they are sent back automatically.\n").encode()
     if j.get("agent") != "bench":
         prompt += ("\n\n---\n(agent-scaleout) Save every screenshot, screen recording, log or report you produce into the folder "
                    "given by the SCALEOUT_ARTIFACTS environment variable; it is sent back to the requester automatically. "
@@ -845,6 +954,28 @@ def collect(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[str,
                     subprocess.run(["tar", "-xf", "-", "-C", str(adir)], input=data)
                     j["artifacts"] = sorted(str(p.relative_to(adir)) for p in adir.rglob("*") if p.is_file())
                     j["artifacts_dir"] = str(adir)
+        if j.get("repo") and j.get("repo_wt"):
+            res = n.ctl("repo-result", j["repo_wt"], j["repo_base"], j["id"], timeout=900)
+            head = (res.stdout.decode().strip().splitlines() or [""])[-1]
+            alias = n.route()
+            if head and head != j["repo_base"] and alias:
+                bare = f"{j['repo_wt'].rsplit('-wt', 1)[0]}.git"
+                br = f"scaleout/{j['id']}"
+                f = git(j["repo"], "fetch", "-q", node_git_url(alias, bare), f"refs/scaleout/result/{j['id']}:refs/heads/{br}", timeout=1800)
+                if f.returncode == 0:
+                    j["repo_branch"] = br
+                    j["repo_stat"] = git(j["repo"], "diff", "--stat", j["repo_base"], br).stdout.decode()[-3000:]
+                    if j.get("apply"):
+                        patch_ = git(j["repo"], "diff", "--binary", j["repo_base"], br).stdout
+                        ap = git(j["repo"], "apply", "--whitespace=nowarn", input=patch_)
+                        j["repo_applied"] = ap.returncode == 0
+                        if ap.returncode != 0:
+                            j["repo_apply_error"] = ap.stderr.decode()[-1500:]
+                else:
+                    j["repo_error"] = f.stderr.decode()[-500:]
+            elif head == j["repo_base"]:
+                j["repo_stat"] = "(no file changes)"
+            n.ctl("repo-unlock", j["repo_wt"])
         if j.get("sync") and j.get("pull", True):
             data = n.ctl("send", j["node_workdir"], timeout=900).stdout
             if data:
@@ -863,6 +994,12 @@ def collect(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[str,
 
 
 def requeue(cfg: Dict[str, Any], j: Dict[str, Any], why: str) -> None:
+    if j.get("repo_wt") and j.get("node") in cfg["nodes"]:
+        try:
+            Node(j["node"], cfg).ctl("repo-unlock", j["repo_wt"], timeout=20)
+        except Exception:
+            pass
+        j.pop("repo_wt", None)
     j["attempts"] = j.get("attempts", 0) + 1
     j["history"].append({"t": now(), "event": "retry", "node": j.get("node"), "why": why})
     if j.get("node"):
@@ -947,6 +1084,10 @@ def tick(verbose: bool = False) -> None:
                 save_job(j)
         load: Dict[str, int] = {}
         dev_load: Dict[Tuple[str, str], int] = {}
+        planned_gb: Dict[str, float] = {}
+        for j in jobs:   # jobs handed out in the last 3 minutes may not have grown to their size yet
+            if j.get("status") in ("dispatched", "running") and j.get("node") and now() - j.get("dispatched_at", 0) < 180:
+                planned_gb[j["node"]] = planned_gb.get(j["node"], 0.0) + job_mem_gb(j, j["node"])
         for j in jobs:
             if j.get("status") in ("dispatched", "running") and j.get("node"):
                 load[j["node"]] = load.get(j["node"], 0) + 1
@@ -960,9 +1101,10 @@ def tick(verbose: bool = False) -> None:
         for j in jobs:
             if j.get("status") != "queued":
                 continue
-            name = pick_node(cfg, j, metrics, load, dev_load)
+            name = pick_node(cfg, j, metrics, load, dev_load, planned_gb)
             if name and dispatch(cfg, j, name):
                 load[name] = load.get(name, 0) + 1
+                planned_gb[name] = planned_gb.get(name, 0.0) + job_mem_gb(j, name)
                 for t in j.get("tags") or []:
                     if t in DEVICE_TAGS:
                         dev_load[(name, t)] = dev_load.get((name, t), 0) + 1
@@ -1014,7 +1156,7 @@ def read_prompt(a) -> str:
 def cmd_submit(a) -> None:
     cfg = load_cfg()
     jid = submit_job(cfg, read_prompt(a), node=None if a.node in (None, "auto") else a.node, agent=a.agent,
-                     workdir=a.dir or "", sync=a.sync or "", tags=a.tags.split(",") if a.tags else [], timeout=a.timeout, pull=not a.no_pull, resume=a.resume, force=a.force)
+                     workdir=a.dir or "", sync=a.sync or "", tags=a.tags.split(",") if a.tags else [], timeout=a.timeout, pull=not a.no_pull, resume=a.resume, force=a.force, repo=a.repo, apply=a.apply, mem_gb=a.mem)
     tick()
     print(jid)
 
@@ -1022,17 +1164,31 @@ def cmd_submit(a) -> None:
 def cmd_run(a) -> None:
     cfg = load_cfg()
     jid = submit_job(cfg, read_prompt(a), node=None if a.node in (None, "auto") else a.node, agent=a.agent,
-                     workdir=a.dir or "", sync=a.sync or "", tags=a.tags.split(",") if a.tags else [], timeout=a.timeout, pull=not a.no_pull, resume=a.resume, force=a.force)
+                     workdir=a.dir or "", sync=a.sync or "", tags=a.tags.split(",") if a.tags else [], timeout=a.timeout, pull=not a.no_pull, resume=a.resume, force=a.force, repo=a.repo, apply=a.apply, mem_gb=a.mem)
     print(jid, file=sys.stderr)
     rc, text = wait_job(jid, a.max)
-    print(text + artifacts_text(load_job(jid)))
+    print(text + repo_text(load_job(jid)) + artifacts_text(load_job(jid)))
     sys.exit(rc)
 
 
 def cmd_wait(a) -> None:
     rc, text = wait_job(a.job, a.max)
-    print(text + artifacts_text(load_job(a.job)))
+    print(text + repo_text(load_job(a.job)) + artifacts_text(load_job(a.job)))
     sys.exit(rc)
+
+
+def repo_text(j: Dict[str, Any]) -> str:
+    if not j.get("repo"):
+        return ""
+    if j.get("repo_error"):
+        return f"\n\n[repo] could not fetch the result: {j['repo_error']}"
+    if not j.get("repo_branch"):
+        return f"\n\n[repo] {j.get('repo_stat') or 'no result'}"
+    t = f"\n\n[repo] result branch {j['repo_branch']} in {j['repo']}\n{j.get('repo_stat', '').rstrip()}"
+    if j.get("apply"):
+        t += ("\n  applied to the working tree" if j.get("repo_applied") else
+              f"\n  NOT applied (conflicts with local changes) — merge {j['repo_branch']} by hand:\n{j.get('repo_apply_error', '')}")
+    return t
 
 
 def artifacts_text(j: Dict[str, Any]) -> str:
@@ -1059,7 +1215,7 @@ def cmd_artifacts(a) -> None:
 def cmd_result(a) -> None:
     j = load_job(a.job)
     rc, text = job_output(j) if j["status"] in ("done", "failed", "cancelled") else (E_RUNNING, f"still {j['status']}")
-    print(text + artifacts_text(j))
+    print(text + repo_text(j) + artifacts_text(j))
     sys.exit(rc)
 
 
@@ -1350,11 +1506,12 @@ def run_bench(names: List[str], apply: bool = False, quiet_table: bool = False) 
         sc = bench_score(b)
         cur[name] = {**sc, "model": b.get("model", ""), "mem_gb": b.get("mem_total_gb"), "cpus": b.get("cpus"),
                      "disk_mbps": b.get("disk_write_mbps"), "price": cfg["nodes"][name].get("price")}
-        if apply and sc["slots"] >= 1 and cfg["nodes"][name].get("max_jobs") != sc["slots"] and not cfg["nodes"][name].get("max_jobs_fixed"):
-            cfg["nodes"][name]["max_jobs"] = sc["slots"]
-            Node(name, cfg).ctl("conf", "MAX_JOBS", str(sc["slots"]))
+        cap = max(2, sc["cpu_slots"] * 2)   # upper bound only: memory decides each dispatch
+        if apply and cfg["nodes"][name].get("max_jobs") != cap and not cfg["nodes"][name].get("max_jobs_fixed"):
+            cfg["nodes"][name]["max_jobs"] = cap
+            Node(name, cfg).ctl("conf", "MAX_JOBS", str(cap))
             save_cfg(cfg)
-            say(f"  {name}: max_jobs set to {sc['slots']} (measured)")
+            say(f"  {name}: max_jobs {cap} (CPU bound; memory is checked on every dispatch)")
     total = sum(v["score"] for v in cur.values())
     before = sum(v["score"] for k, v in prev.items() if k in cfg["nodes"])
     full = bench_history()
@@ -1519,6 +1676,99 @@ def cmd_stats(a) -> None:
     say(f"pool: {sum(len(r['done']) for r in rows.values())} done · average wait before a node took a job: {avg(allw)}" if allw else "pool: no finished jobs yet")
 
 
+# ── commands: provision ──────────────────────────────────────────────────────
+def local_toolchain() -> Dict[str, str]:
+    """What this machine uses, so nodes can match it."""
+    def out(cmd: List[str]) -> str:
+        try:
+            return run(cmd, timeout=60).stdout.decode().strip()
+        except Exception:
+            return ""
+    fv = HOME / "fvm" / "versions"
+    flutter = " ".join(sorted(p.name for p in fv.iterdir() if re.fullmatch(r"\d+\.\d+\.\d+", p.name))) if fv.is_dir() else ""
+    plat = HOME / "Library" / "Android" / "sdk" / "platforms"
+    return {
+        "FLUTTER": flutter,
+        "POD": out(["pod", "--version"]),
+        "FIREBASE": out(["firebase", "--version"]),
+        "NODE_MAJOR": re.sub(r"^v(\d+).*", r"\1", out(["node", "--version"])),
+        "XCODE": re.sub(r"^Xcode ", "", out(["xcodebuild", "-version"]).splitlines()[0] if out(["xcodebuild", "-version"]) else ""),
+        "ANDROID": " ".join(sorted(p.name for p in plat.iterdir())) if plat.is_dir() else "",
+    }
+
+
+def cmd_provision(a) -> None:
+    cfg = load_cfg()
+    want = local_toolchain()
+    if a.flutter:
+        want["FLUTTER"] = a.flutter.replace(",", " ")
+    if a.android:
+        want["ANDROID"] = a.android.replace(",", " ")
+    for k in (a.skip or "").split(","):
+        if k:
+            want[k.upper()] = ""
+    say("target (from this machine): " + " · ".join(f"{k.lower()} {v}" for k, v in want.items() if v))
+    for name in a.names or [n for n, v in cfg["nodes"].items() if not v.get("pending")]:
+        n = Node(name, cfg)
+        if n.windows:
+            say(f"{name}: provisioning Windows nodes is not supported yet")
+            continue
+        args = [f"{k}={v}" for k, v in want.items() if v] + (["DRY_RUN=1"] if a.dry_run else [])
+        r = n.ctl("provision", *args, timeout=7200)
+        say(f"== {name}")
+        todo = 0
+        for line in r.stdout.decode().splitlines():
+            st, _, rest = line.partition(" ")
+            item, _, detail = rest.partition(" ")
+            todo += st in ("TODO", "FAIL")
+            say(f"  {st:<5} {item:<16} {detail}")
+        if r.returncode != 0 and not r.stdout:
+            say(f"  ! {r.stderr.decode().strip()[-300:]}")
+        say(f"  {'everything matches' if not todo else f'{todo} item(s) need attention'}")
+
+
+# ── commands: Claude Code integration ────────────────────────────────────────
+SHARE = HOME / ".local" / "share" / "agent-scaleout"
+RULES_BEGIN, RULES_END = "<!-- agent-scaleout: offload rules (scaleout claude-setup) -->", "<!-- /agent-scaleout -->"
+
+
+def cmd_claude_setup(a) -> None:
+    """Every Claude Code session on this machine: the scaleout subagent, the offload rules (imported into
+    ~/.claude/CLAUDE.md from the installed copy, so updates follow) and the low-memory offload hook."""
+    claude = HOME / ".claude"
+    claude.mkdir(exist_ok=True)
+    rules = SHARE / "agents" / "claude" / "scaleout-rules.md"
+    hook = SHARE / "agents" / "claude" / "offload-hook.sh"
+    md = claude / "CLAUDE.md"
+    text = md.read_text() if md.exists() else ""
+    text = re.sub(re.escape(RULES_BEGIN) + r".*?" + re.escape(RULES_END) + r"\n?", "", text, flags=re.S).rstrip("\n")
+    if not a.remove:
+        text += f"\n\n{RULES_BEGIN}\n@{str(rules).replace(str(HOME), '~', 1)}\n{RULES_END}\n"
+    md.write_text(text.lstrip("\n") if text.strip() else "")
+    say(f"{'removed' if a.remove else 'imported'} offload rules {'from' if a.remove else 'in'} {md}")
+
+    sp = claude / "settings.json"
+    cfg = json.loads(sp.read_text()) if sp.exists() else {}
+    if sp.exists():
+        shutil.copy(sp, sp.with_suffix(".json.scaleout-bak"))
+    pre = cfg.setdefault("hooks", {}).setdefault("PreToolUse", [])
+    pre[:] = [e for e in pre if not any("offload-hook.sh" in h.get("command", "") for h in e.get("hooks", []))]
+    if not a.remove:
+        pre.append({"matcher": "Bash", "hooks": [{"type": "command", "timeout": 10,
+                                                  "command": f'[ ! -x "{hook}" ] || "{hook}"'}]})
+    if not pre:
+        cfg["hooks"].pop("PreToolUse")
+    if not cfg["hooks"]:
+        cfg.pop("hooks")
+    sp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+    say(f"{'removed' if a.remove else 'installed'} the low-memory offload hook {'from' if a.remove else 'in'} {sp}"
+        + ("" if a.remove else "  (threshold: MIN_FREE in ~/.config/scaleout/hook.conf, default 25 %)"))
+    if not a.remove:
+        (claude / "agents").mkdir(exist_ok=True)
+        shutil.copy(PKG_ROOT / "agents" / "claude" / "scaleout.md", claude / "agents" / "scaleout.md")
+        say("scaleout subagent: ~/.claude/agents/scaleout.md")
+
+
 # ── cli ──────────────────────────────────────────────────────────────────────
 def main(argv: Optional[List[str]] = None) -> None:
     p = argparse.ArgumentParser(prog="scaleout", description="Spread coding-agent jobs across the machines on your network.")
@@ -1562,6 +1812,9 @@ def main(argv: Optional[List[str]] = None) -> None:
         s.add_argument("--no-pull", action="store_true", help="with --sync: do not copy results back")
         s.add_argument("--tags", default=""); s.add_argument("--timeout", type=int, help="minutes")
         s.add_argument("--resume", default="", help="continue this Claude Code session on the node (needs shared folders, see README)")
+        s.add_argument("--repo", default="", help="git repo on this machine: the node works on a copy of its current working tree, result comes back as branch scaleout/JOB")
+        s.add_argument("--apply", action="store_true", help="with --repo: also apply the result to this working tree (never forced)")
+        s.add_argument("--mem", type=float, default=0, help="GB of memory the job needs (default: learned per node and job kind, else by tags)")
         s.add_argument("--force", action="store_true", help="with --resume: even if the session was just written here")
 
     s = sp.add_parser("submit", help="queue a job and print its id"); job_opts(s); s.set_defaults(fn=cmd_submit)
@@ -1592,6 +1845,12 @@ def main(argv: Optional[List[str]] = None) -> None:
     s.add_argument("--apply", action="store_true"); s.add_argument("--days", type=int, default=14); s.set_defaults(fn=cmd_tune)
     s = sp.add_parser("stats", help="real work done per node: jobs, failures, run and wait times, memory per job")
     s.add_argument("--days", type=int, default=7); s.set_defaults(fn=cmd_stats)
+    s = sp.add_parser("provision", help="install this machine's toolchain (Flutter/fvm, CocoaPods, Node, Firebase CLI, Android platforms) on nodes")
+    s.add_argument("names", nargs="*"); s.add_argument("--flutter", help="versions, comma separated (default: this machine's fvm versions)")
+    s.add_argument("--android", help="platforms, e.g. android-35,android-36"); s.add_argument("--skip", help="e.g. firebase,android,xcode")
+    s.add_argument("--dry-run", action="store_true"); s.set_defaults(fn=cmd_provision)
+    s = sp.add_parser("claude-setup", help="make every Claude Code session here offload heavy work (rules + low-memory hook)")
+    s.add_argument("--remove", action="store_true"); s.set_defaults(fn=cmd_claude_setup)
     s = sp.add_parser("tick", help="run one scheduling round"); s.set_defaults(fn=cmd_tick)
     s = sp.add_parser("daemon", help="schedule forever (installed by install-daemon)"); s.add_argument("--interval", type=int, default=15); s.set_defaults(fn=cmd_daemon)
     s = sp.add_parser("install-daemon", help="run the scheduler in the background (launchd / systemd --user)"); s.set_defaults(fn=cmd_install_daemon)

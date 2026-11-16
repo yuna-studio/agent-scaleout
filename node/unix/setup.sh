@@ -94,7 +94,7 @@ fi
 
 [ -n "$NAME" ] || { echo "--name is required" >&2; exit 4; }
 mkdir -p "$B/bin" "$B/queue" "$B/jobs" "$B/work" "$B/settings"; chmod 700 "$B"
-for f in ctl.sh runner.sh setup.sh gh-runner.sh; do [ -f "$PKG/$f" ] && cp "$PKG/$f" "$B/bin/$f"; done
+for f in ctl.sh runner.sh setup.sh gh-runner.sh provision.sh; do [ -f "$PKG/$f" ] && cp "$PKG/$f" "$B/bin/$f"; done
 mv -f "$B/bin/ctl.sh" "$B/bin/ctl"; chmod 755 "$B/bin/"*
 printf '#!/bin/bash\nnohup /bin/bash "$HOME/.scaleout/bin/runner.sh" >> "$HOME/.scaleout/runner.log" 2>&1 &\n' > "$B/bin/kick"; chmod 755 "$B/bin/kick"
 # agent permissions: keep the user's edited copy
@@ -112,6 +112,8 @@ for k in ("allow", "deny", "additionalDirectories"):
 json.dump(mine, open(sys.argv[1], "w"), indent=2, ensure_ascii=False)
 PY
 fi
+# keep settings set later on the node (PERMISSION_MODE, MIN_FREE_MEM_PCT, DEVICE_SCAN, LINGER_S, ...)
+extra="$(grep -v -E '^(NAME|WORK_ROOT|MAX_JOBS|AGENT|AGENT_CMD|MIN_FREE_GB)=' "$B/node.conf" 2>/dev/null || true)"
 cat > "$B/node.conf" <<EOF
 NAME=$NAME
 WORK_ROOT=$DIR
@@ -120,6 +122,7 @@ AGENT=$AGENT
 AGENT_CMD='$AGENT_CMD'
 MIN_FREE_GB=2
 EOF
+[ -n "$extra" ] && printf '%s\n' "$extra" >> "$B/node.conf"
 install_runner_service
 
 # optional reverse tunnel: node -> orchestrator, opening orchestrator:localhost:PORT -> this node's sshd

@@ -112,6 +112,15 @@ case "$verb" in
       if [ -n "$(find "$d/rc" -mtime +"$days" 2>/dev/null)" ]; then rm -rf "$d"; n=$((n + 1)); fi
     done
     find "$B/work" -mindepth 1 -maxdepth 1 -mtime +"$days" -exec rm -rf {} + 2>/dev/null
+    old="$(date -v-"${days}"d +%Y%m%d 2>/dev/null || date -d "-$days days" +%Y%m%d)"   # job refs of repo copies
+    for r in "$B"/repos/*.git; do
+      [ -d "$r" ] || continue
+      git -C "$r" for-each-ref --format='%(refname)' refs/scaleout | while read -r ref; do
+        jd="$(basename "$ref" | sed -n 's/^j\([0-9]\{8\}\)-.*/\1/p')"
+        [ -n "$jd" ] && [ "$jd" -lt "$old" ] && git -C "$r" update-ref -d "$ref"
+      done
+      git -C "$r" gc --auto -q 2>/dev/null
+    done
     echo "removed $n" ;;
 
   cleanup)  # cleanup [aggressive]  — free disk safely; prints GB before -> after
@@ -161,6 +170,31 @@ case "$verb" in
     e=$(( $(ms) - a ))
     printf '{"result":"load job: %s ms on %s","ms":%s}\n' "$e" "$(j "$(hostname)")" "$e" ;;
 
+  repo-init)  # repo-init <name> -> the node's bare copy of an orchestrator repo (git sends only missing objects)
+    r="$B/repos/$1.git"; [ -d "$r" ] || git init -q --bare "$r"; echo "$r" ;;
+  repo-checkout)  # repo-checkout <name> <commit> -> a locked work tree at <commit>; ignored files (build caches) are kept
+    r="$B/repos/$1.git"; i=1
+    while :; do
+      w="$B/repos/$1-wt$i"
+      if mkdir "$w.lock" 2>/dev/null; then break; fi
+      if [ -n "$(find "$w.lock" -maxdepth 0 -mmin +720 2>/dev/null)" ]; then rm -rf "$w.lock"; continue; fi
+      i=$((i + 1)); [ "$i" -gt 8 ] && { echo "no free work tree" >&2; exit 1; }
+    done
+    if [ -e "$w/.git" ]; then
+      git -C "$w" checkout -q -f --detach "$2" && git -C "$w" clean -fdq || { rm -rf "$w.lock"; echo "checkout failed" >&2; exit 1; }
+    else
+      git -C "$r" worktree prune 2>/dev/null; rm -rf "$w"
+      git -C "$r" worktree add -q -f --detach "$w" "$2" >/dev/null 2>&1 || { rm -rf "$w.lock"; echo "worktree add failed" >&2; exit 1; }
+    fi
+    echo "$w" ;;
+  repo-result)  # repo-result <worktree> <base> <job> -> commit holding everything the job changed (the base if nothing)
+    cd "$1" || exit 1
+    git add -A >/dev/null 2>&1
+    if git diff --cached --quiet "$2"; then c="$2"
+    else git -c user.name=agent-scaleout -c user.email=scaleout@localhost commit -q --no-verify -m "scaleout $3" && c="$(git rev-parse HEAD)"; fi
+    git update-ref "refs/scaleout/result/$3" "$c" && echo "$c" ;;
+  repo-unlock) rm -rf "$1.lock"; echo ok ;;
+
   conf)  # conf KEY VALUE  — set one node.conf value
     f="$B/node.conf"; touch "$f"; grep -v "^$1=" "$f" > "$f.tmp"; echo "$1=$2" >> "$f.tmp"; mv "$f.tmp" "$f"; echo ok ;;
 
@@ -187,6 +221,7 @@ case "$verb" in
       echo "$n $s"
     done ;;
   runner-install) bash "$B/bin/gh-runner.sh" install "$@" ;;
+  provision) env "$@" bash "$B/bin/provision.sh" ;;   # provision KEY=VALUE ...  (see provision.sh)
   runner-remove) bash "$B/bin/gh-runner.sh" remove "$@" ;;
   *) echo "unknown verb: $verb" >&2; exit 4 ;;
 esac

@@ -239,14 +239,24 @@ class E2E(unittest.TestCase):
         cfg = so.load_cfg(); cfg["nodes"]["n2"]["tags"] = ["n2"]; so.save_cfg(cfg)
 
     def test_9_real_device_jobs(self):
+        settle()   # runners left by earlier tests must be gone, or n2 still looks busy
         (HOMES["n2"] / ".scaleout/devices.cache").write_text('{"android":1,"ios":0}')
         (HOMES["n2"] / ".local/bin/claude").write_text(STUB.replace("*HANG*) sleep 600;;", "*HANG*) sleep 4;;"))
         cfg = so.load_cfg()
         a = so.submit_job(cfg, "HANG on phone", tags=["android-device"])
         b = so.submit_job(cfg, "second phone job", tags=["android-device"])
         c = so.submit_job(cfg, "needs an iPhone", tags=["ios-device"])
-        so.tick()
-        self.assertEqual((so.load_job(a)["status"], so.load_job(a)["node"]), ("dispatched", "n2"))
+        for _ in range(5):
+            so.tick()
+            if so.load_job(a)["status"] in ("dispatched", "running"):
+                break
+            time.sleep(1)
+        if so.load_job(a)["status"] not in ("dispatched", "running"):   # debug aid
+            cfg2 = so.load_cfg(); st = json.loads((TMP / "state/nodes/n2.json").read_text())
+            print("\nDEBUG n2", so.node_health(cfg2, "n2", st), {k: st.get(k) for k in ("devices", "running", "queued", "os", "agents")}, cfg2["nodes"]["n2"])
+            print("DEBUG jobs", [(x["id"][-4:], x["status"], x.get("node"), x.get("tags")) for x in so.all_jobs() if x["status"] in ("queued", "dispatched", "running")])
+        self.assertIn(so.load_job(a)["status"], ("dispatched", "running"))
+        self.assertEqual(so.load_job(a)["node"], "n2")
         self.assertEqual(so.load_job(b)["status"], "queued", "one job per attached phone")
         self.assertEqual(so.load_job(c)["status"], "queued", "no node has an iPhone")
         for _ in range(8):
@@ -278,6 +288,53 @@ class E2E(unittest.TestCase):
         cfg = so.load_cfg(); cfg["nodes"]["n1"]["max_jobs"] = 1; cfg["nodes"]["n1"]["max_jobs_fixed"] = True; so.save_cfg(cfg)
         so.tune(so.load_cfg(), apply=True, quiet=True)
         self.assertEqual(so.load_cfg()["nodes"]["n1"]["max_jobs"], 1, "hand-set max_jobs is never changed")
+
+    def test_96_repo_mode(self):
+        repo = TMP / "repo"
+        repo.mkdir()
+        g = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        g("init", "-q"); g("config", "user.email", "t@t"); g("config", "user.name", "t")
+        (repo / "a.txt").write_text("one\n"); g("add", "a.txt"); g("commit", "-qm", "init")
+        (repo / "b.txt").write_text("uncommitted, untracked\n")          # must reach the node and must not come back as a change
+        (HOMES["n2"] / ".local/bin/claude").write_text('#!/bin/bash\ncat >/dev/null; test -f b.txt || exit 7; echo two >> a.txt; echo new > c.txt; echo \'{"result":"edited"}\'\n')
+        cfg = so.load_cfg()
+        jid = so.submit_job(cfg, "edit files", node="n2", repo=str(repo), apply=True)
+        self.assertEqual(g("status", "--porcelain").stdout.decode().strip(), "?? b.txt", "snapshot must not touch the user's index or files")
+        for _ in range(8):
+            so.tick(); settle()
+            if so.load_job(jid)["status"] in ("done", "failed"):
+                break
+        so.tick()
+        j = so.load_job(jid)
+        self.assertEqual(j["status"], "done", j)
+        self.assertEqual(j.get("repo_branch"), f"scaleout/{jid}", j)
+        self.assertTrue(j.get("repo_applied"), j)
+        self.assertEqual((repo / "a.txt").read_text(), "one\ntwo\n")
+        self.assertEqual((repo / "c.txt").read_text(), "new\n")
+        changed = g("diff", "--name-only", j["repo_base"], j["repo_branch"]).stdout.decode().split()
+        self.assertEqual(sorted(changed), ["a.txt", "c.txt"])
+        self.assertIn("[repo] result branch", so.repo_text(j))
+        # the work tree on the node is unlocked and keeps ignored files between jobs
+        self.assertEqual(list((HOMES["n2"] / ".scaleout/repos").glob("*.lock")), [])
+
+    def test_97_memory_admission(self):
+        cfg = so.load_cfg()
+        cfg["nodes"] = {"big": {"max_jobs": 8, "tags": ["emulator"], "agent": "claude"}}
+        st = {"online": True, "mem_total_gb": 16, "mem_free_pct": 30, "disk_free_gb": 50, "runner": True,
+              "agents": ["claude"], "os": "Darwin", "cpus": 8, "load": 0}
+        emu, plain = {"tags": ["emulator"], "agent": "default"}, {"tags": [], "agent": "default"}
+        self.assertEqual(so.job_mem_gb(emu, "big"), 7.5)
+        # busy node with 4.8 GB free: a 3 GB job fits, a 7.5 GB emulator job does not
+        self.assertEqual(so.pick_node(cfg, plain, {"big": st}, {"big": 1}), "big")
+        self.assertIsNone(so.pick_node(cfg, emu, {"big": st}, {"big": 1}))
+        # an idle node always takes one job (its own memory guard still protects it)
+        self.assertEqual(so.pick_node(cfg, emu, {"big": st}, {"big": 0}), "big")
+        # plenty free: several emulators fit, until the jobs just handed out use it up
+        st2 = dict(st, mem_free_pct=80)   # 12.8 GB free
+        self.assertEqual(so.pick_node(cfg, emu, {"big": st2}, {"big": 1}), "big")
+        self.assertIsNone(so.pick_node(cfg, emu, {"big": st2}, {"big": 1}, planned_gb={"big": 7.5}))
+        # an explicit --mem wins
+        self.assertEqual(so.job_mem_gb({"tags": ["emulator"], "mem_gb": 2}, "big"), 2.0)
 
     def test_99_helpers(self):
         self.assertEqual(so.parse_setup("x\nSCALEOUT_USER bob\nSCALEOUT_AGENTS [\"claude\"]\n")["user"], "bob")

@@ -85,7 +85,9 @@ scaleout exec build-01 -- df -h                   # any shell command on a node
 | `-w NODE` | pin a node (default `auto`: least-loaded healthy node) |
 | `-a claude\|codex\|gemini` | pick an agent (default: the node's default) |
 | `-d DIR` | working folder on the node (default: the node's `--dir`) |
-| `--sync DIR` | work on an orchestrator folder: copied to the node before, copied back after |
+| `--repo DIR` | work on a git repo of this machine: the node gets its current working tree (uncommitted changes too; git sends only what changed), the result comes back as branch `scaleout/JOB` |
+| `--apply` | with `--repo`: also apply the result to this working tree (never forced; conflicts are reported) |
+| `--sync DIR` | non-git folders: copied to the node before, copied back after |
 | `--tags a,b` | node requirements, e.g. `xcode`, `gpu`, `windows`; `android-device` / `ios-device` = needs a phone plugged into the node |
 | `--timeout MIN` | hard limit (default 180) |
 
@@ -93,7 +95,19 @@ Exit codes: `0` ok · `1` agent failed · `2` still running · `3` no reachable 
 
 ## Use from Claude Code
 
-`scaleout init` installs `~/.claude/agents/scaleout.md`. In any session:
+```bash
+scaleout claude-setup          # every session on this machine: subagent + offload rules + low-memory hook
+scaleout claude-setup --remove
+```
+
+- **Rules**: `~/.claude/CLAUDE.md` gets one import line pointing at `agents/claude/scaleout-rules.md` of the installed copy,
+  so the rules update with the tool. They tell every session what to keep local (conversation, edits, quick checks) and
+  what to send to nodes (full builds, test suites, E2E, long jobs), and how.
+- **Hook**: a `PreToolUse` hook on Bash. When this machine has less than `MIN_FREE` % memory free
+  (`~/.config/scaleout/hook.conf`, default 25) and a node is healthy, heavy commands (`flutter build/test`, `xcodebuild`,
+  `gradlew assemble/test`, Maestro, Playwright, `npm test/build`, emulators) are refused with a message telling Claude
+  to send them to a node. `SCALEOUT_LOCAL=1` in a command bypasses it. Everything else passes.
+- The `scaleout` subagent relays a task to a node and returns the report verbatim. In any session:
 
 > "Use the scaleout subagent to run the full E2E suite on a free machine and report failures. Repo: …, branch: …, push fixes to a new branch."
 
@@ -114,6 +128,7 @@ Write tasks so they stand alone — the node's agent has not seen your conversat
 |---|---|---|
 | free disk on a node | `< 5 GB` | no new jobs (`disk-full`) |
 | free memory on a node | `< 15 %` | no new jobs (`mem-full`) |
+| memory a job needs | `--mem`, else learned per node and job kind, else by tag (emulator 7.5 GB, simulator 4.5, phone 3.5, other 3) | a busy node gets another job only if it fits in its free memory minus `mem_reserve_gb` (1.5); jobs handed out in the last 3 minutes count as already using theirs. No fixed limit on simulators or emulators; `max_jobs` is only a CPU-based upper bound |
 | free disk on a node | `< 8 GB` | node cleanup (old job folders, package caches; below 5 GB also caches under the node's home), at most hourly |
 | finished job folders | 3 days | removed — results are fetched and deleted right away anyway |
 | runner service missing | — | re-registered (`ctl repair`) |
@@ -169,6 +184,15 @@ What one mobile job roughly needs (measured on Apple Silicon Macs running Flutte
 So an 8 GB node runs one job with a real phone (no emulator), a 16 GB node runs two or three, and the CPU becomes the
 limit after that. 256 GB of disk is enough for Xcode, one simulator runtime, the Android SDK and caches (the node cleans
 itself below 8 GB free). Start with `--max-jobs 1` on 8 GB nodes; the node's memory guard also holds extra jobs.
+
+## Same tools on every node
+
+```bash
+scaleout provision NODE [--dry-run] [--flutter 3.35.6,3.41.9] [--android android-36] [--skip firebase]
+```
+Installs, without sudo and at this machine's versions: fvm and its Flutter versions, CocoaPods, Node.js, Firebase CLI,
+Android SDK platforms (into an SDK whose licenses were accepted on the node), Java for Android builds. Things that need a
+person are reported, not attempted: Homebrew itself (admin password), Xcode (Apple ID), Android license acceptance.
 
 ## Benchmark, load test, memory tuning
 
