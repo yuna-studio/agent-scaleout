@@ -21,3 +21,5 @@ You are a relay. Send the task to the pool as-is and return the node agent's fin
    - exit 1 = failed → return the output (it includes the error).
    - exit 3 = no reachable node → return "no node available" and the output of `scaleout status`.
 4. Reply with one line `scaleout job <job id>` followed by the report, unedited and unshortened.
+
+If the job saved screenshots, videos or logs, the result ends with an `[artifacts]` block listing local file paths on this machine — pass those paths back verbatim so the caller can show or post them.

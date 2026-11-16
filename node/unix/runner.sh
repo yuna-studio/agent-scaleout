@@ -33,7 +33,9 @@ mem_free_pct() {
 agent_cmd() {  # agent_cmd <agent> -> command line that reads the prompt on stdin and writes the answer to stdout
   local s=""; [ -f "$B/settings/claude.json" ] && s="--settings $B/settings/claude.json"
   case "$1" in
-    claude) echo "claude -p --output-format json $s" ;;
+    claude)  # PERMISSION_MODE=bypass in node.conf: never ask, the deny list in settings still applies
+      local pm=""; [ "${PERMISSION_MODE:-}" = bypass ] && pm="--permission-mode bypassPermissions"
+      echo "claude -p --output-format json $pm $s" ;;
     codex)  echo 'codex exec --skip-git-repo-check "$(cat)"' ;;
     gemini) echo 'gemini -p "$(cat)"' ;;
     custom) echo "${AGENT_CMD:-cat}" ;;
@@ -51,6 +53,11 @@ run_job() {
   cd "$wd" 2>/dev/null || { echo "workdir not found: $wd" > "$d/err.log"; echo 9 > "$d/rc"; return; }
   if [ "$(disk_free_gb)" -lt "$MIN_FREE_GB" ]; then echo "node disk almost full ($(disk_free_gb)GB)" > "$d/err.log"; echo 28 > "$d/rc"; return; fi
   cmd="$(agent_cmd "$agent")"
+  # continue an existing Claude Code session (its transcript must be reachable here, e.g. a shared ~/.claude/projects)
+  local resume; resume="$(sed -n 's/^RESUME=//p' "$d/meta" | tr -cd 'A-Za-z0-9-')"
+  [ -n "$resume" ] && [ "$agent" = claude ] && cmd="$cmd --resume $resume"
+  # screenshots, recordings, logs, reports saved here are fetched back to the orchestrator
+  mkdir -p "$d/artifacts"; export SCALEOUT_ARTIFACTS="$d/artifacts" SCALEOUT_JOB_ID="$(basename "$d")"
   date +%s > "$d/started"; touch "$d/heartbeat"
   local u0 peak u; u0="$(used_mb)"; peak="$u0"
   bash -c "$cmd" < "$d/prompt.md" > "$d/out" 2> "$d/err.log" &

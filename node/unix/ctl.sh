@@ -76,10 +76,10 @@ case "$verb" in
       "$(j "$OS")" "$(uname -m)" "$(j "$(hostname)")" "$(mem_free_pct)" "$(mem_total_gb)" "$(disk_free_gb "$HOME")" \
       "$(disk_free_gb "${WORK_ROOT:-$HOME}")" "$(load1)" "$(cpus)" "$(running_jobs)" "$(queued_jobs)" "$(runner_ok)" "$(agents)" "$(devices)" "$(skills_hash)" "$VERSION" ;;
 
-  submit)  # submit <jid> <agent> <timeout_min> <workdir>   (prompt on stdin)
+  submit)  # submit <jid> <agent> <timeout_min> <workdir> [resume-session-id]   (prompt on stdin)
     jid="$1"; d="$B/jobs/$jid"; mkdir -p "$d" "$B/queue"
     cat > "$d/prompt.md"
-    printf 'AGENT=%s\nTIMEOUT_MIN=%s\nWORKDIR=%s\n' "$2" "$3" "$4" > "$d/meta"
+    printf 'AGENT=%s\nTIMEOUT_MIN=%s\nWORKDIR=%s\nRESUME=%s\n' "$2" "$3" "$4" "${5:-}" > "$d/meta"
     touch "$B/queue/$jid"
     [ "$OS" = Darwin ] || "$B/bin/kick" >/dev/null 2>&1 &   # Linux without systemd path units: start the runner now
     echo queued ;;
@@ -89,12 +89,14 @@ case "$verb" in
     if [ ! -d "$d" ]; then echo '{"state":"missing"}'; exit 0; fi
     now="$(date +%s)"
     hb="$(stat -f %m "$d/heartbeat" 2>/dev/null || stat -c %Y "$d/heartbeat" 2>/dev/null || echo "$now")"
-    if [ -f "$d/rc" ]; then printf '{"state":"done","rc":%s,"mem_mb":%s}\n' "$(tr -dc '0-9' < "$d/rc")" "$(cat "$d/mem_mb" 2>/dev/null || echo 0)"
+    if [ -f "$d/rc" ]; then printf '{"state":"done","rc":%s,"mem_mb":%s,"artifacts":%s,"artifacts_kb":%s}\n' "$(tr -dc '0-9' < "$d/rc")" "$(cat "$d/mem_mb" 2>/dev/null || echo 0)" \
+      "$(find "$d/artifacts" -type f 2>/dev/null | wc -l | tr -d ' ')" "$(du -sk "$d/artifacts" 2>/dev/null | cut -f1 || echo 0)"
     elif [ -f "$d/started" ]; then printf '{"state":"running","heartbeat_age":%s}\n' "$((now - hb))"
     elif [ -f "$B/queue/$1" ]; then echo '{"state":"queued"}'
     else echo '{"state":"lost"}'; fi ;;
 
   result) cat "$B/jobs/$1/out" 2>/dev/null ;;
+  artifacts) tar -cf - -C "$B/jobs/$1/artifacts" . 2>/dev/null ;;   # artifacts <jid> -> tar of the job's artifacts folder
   err) tail -n "${2:-40}" "$B/jobs/$1/err.log" 2>/dev/null ;;
   cancel)
     d="$B/jobs/$1"; rm -f "$B/queue/$1"; touch "$d/cancelled" 2>/dev/null

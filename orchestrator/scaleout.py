@@ -32,7 +32,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 HOME = Path.home()
 CONF_DIR = Path(os.environ.get("SCALEOUT_CONF", HOME / ".config" / "scaleout"))
 STATE_DIR = Path(os.environ.get("SCALEOUT_STATE", HOME / ".local" / "state" / "scaleout"))
@@ -52,6 +52,7 @@ DEFAULTS: Dict[str, Any] = {
     "job_timeout_min": 180,
     "stall_min": 5,              # running job whose heartbeat is older than this is considered dead
     "node_wait_min": 10,
+    "max_artifacts_mb": 1024,    # a job's screenshots/videos/logs larger than this stay on the node
     "auto_tune": True,           # daily: set each node's max_jobs from the memory its real jobs used (not for --max-jobs nodes)         # job handed to a node but not started there (node short on memory) -> move it
     "offline_grace_min": 10,     # node unreachable this long -> its jobs are retried elsewhere
     "retries": 2,
@@ -678,8 +679,20 @@ def all_jobs() -> List[Dict[str, Any]]:
     return sorted((read_json(p, {}) for p in jobs_dir().glob("*.json")), key=lambda j: j.get("created", 0))
 
 
+def session_file(sid: str) -> Optional[Path]:
+    hits = sorted((HOME / ".claude" / "projects").glob(f"*/{sid}.jsonl"), key=lambda p: -p.stat().st_mtime)
+    return hits[0] if hits else None
+
+
 def submit_job(cfg: Dict[str, Any], prompt: str, node: Optional[str] = None, agent: str = "default", workdir: str = "",
-               sync: str = "", tags: Optional[List[str]] = None, timeout: Optional[int] = None, pull: bool = True) -> str:
+               sync: str = "", tags: Optional[List[str]] = None, timeout: Optional[int] = None, pull: bool = True,
+               resume: str = "", force: bool = False) -> str:
+    if resume:
+        resume = re.sub(r"[^A-Za-z0-9-]", "", resume)
+        f = session_file(resume)
+        if f and now() - f.stat().st_mtime < 120 and not force:
+            die(E_USAGE, f"session {resume} was written {int(now() - f.stat().st_mtime)}s ago — close it here first (or --force); "
+                         "two machines must never write one session at the same time")
     jid = time.strftime("j%Y%m%d-%H%M%S-") + "%04x" % random.randrange(65536)
     (STATE_DIR / "prompts").mkdir(parents=True, exist_ok=True)
     (STATE_DIR / "prompts" / f"{jid}.md").write_text(prompt)
@@ -690,7 +703,7 @@ def submit_job(cfg: Dict[str, Any], prompt: str, node: Optional[str] = None, age
         if not Path(sync).is_dir():
             die(E_USAGE, f"--sync folder not found: {sync}")
     save_job({"id": jid, "status": "queued", "created": now(), "node": None, "want_node": node, "agent": agent,
-              "workdir": workdir, "sync": sync, "pull": pull, "tags": tags or [], "attempts": 0,
+              "workdir": workdir, "sync": sync, "pull": pull, "tags": tags or [], "attempts": 0, "resume": resume,
               "timeout": timeout or cfg["defaults"]["job_timeout_min"], "history": []})
     return jid
 
@@ -773,7 +786,11 @@ def dispatch(cfg: Dict[str, Any], j: Dict[str, Any], name: str) -> bool:
         if n.ctl("recv", wd, input=tar, timeout=900).returncode != 0:
             return False
     prompt = (STATE_DIR / "prompts" / f"{j['id']}.md").read_bytes()
-    res = n.ctl("submit", j["id"], j.get("agent") or "default", str(j["timeout"]), wd, input=prompt, timeout=60)
+    if j.get("agent") != "bench":
+        prompt += ("\n\n---\n(agent-scaleout) Save every screenshot, screen recording, log or report you produce into the folder "
+                   "given by the SCALEOUT_ARTIFACTS environment variable; it is sent back to the requester automatically. "
+                   "List those file names in your final answer.\n").encode()
+    res = n.ctl("submit", j["id"], j.get("agent") or "default", str(j["timeout"]), wd, j.get("resume") or "", input=prompt, timeout=60)
     if res.returncode != 0:
         return False
     j.update({"status": "dispatched", "node": name, "dispatched_at": now(), "last_seen": now(), "node_workdir": wd})
@@ -817,6 +834,17 @@ def collect(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[str,
             j["mem_mb"] = int(s.get("mem_mb") or 0)
         if rc != 0:
             (STATE_DIR / "results" / f"{j['id']}.err").write_bytes(n.ctl("err", j["id"], "60").stdout)
+        if int(s.get("artifacts", 0) or 0) > 0:
+            adir = STATE_DIR / "results" / j["id"]
+            if int(s.get("artifacts_kb", 0) or 0) > d.get("max_artifacts_mb", 1024) * 1024:
+                j["artifacts_note"] = f"{s['artifacts']} files ({int(s['artifacts_kb']) // 1024} MB) left on {name}: larger than max_artifacts_mb"
+            else:
+                data = n.ctl("artifacts", j["id"], timeout=1800).stdout
+                if data:
+                    adir.mkdir(parents=True, exist_ok=True)
+                    subprocess.run(["tar", "-xf", "-", "-C", str(adir)], input=data)
+                    j["artifacts"] = sorted(str(p.relative_to(adir)) for p in adir.rglob("*") if p.is_file())
+                    j["artifacts_dir"] = str(adir)
         if j.get("sync") and j.get("pull", True):
             data = n.ctl("send", j["node_workdir"], timeout=900).stdout
             if data:
@@ -986,7 +1014,7 @@ def read_prompt(a) -> str:
 def cmd_submit(a) -> None:
     cfg = load_cfg()
     jid = submit_job(cfg, read_prompt(a), node=None if a.node in (None, "auto") else a.node, agent=a.agent,
-                     workdir=a.dir or "", sync=a.sync or "", tags=a.tags.split(",") if a.tags else [], timeout=a.timeout, pull=not a.no_pull)
+                     workdir=a.dir or "", sync=a.sync or "", tags=a.tags.split(",") if a.tags else [], timeout=a.timeout, pull=not a.no_pull, resume=a.resume, force=a.force)
     tick()
     print(jid)
 
@@ -994,23 +1022,44 @@ def cmd_submit(a) -> None:
 def cmd_run(a) -> None:
     cfg = load_cfg()
     jid = submit_job(cfg, read_prompt(a), node=None if a.node in (None, "auto") else a.node, agent=a.agent,
-                     workdir=a.dir or "", sync=a.sync or "", tags=a.tags.split(",") if a.tags else [], timeout=a.timeout, pull=not a.no_pull)
+                     workdir=a.dir or "", sync=a.sync or "", tags=a.tags.split(",") if a.tags else [], timeout=a.timeout, pull=not a.no_pull, resume=a.resume, force=a.force)
     print(jid, file=sys.stderr)
     rc, text = wait_job(jid, a.max)
-    print(text)
+    print(text + artifacts_text(load_job(jid)))
     sys.exit(rc)
 
 
 def cmd_wait(a) -> None:
     rc, text = wait_job(a.job, a.max)
-    print(text)
+    print(text + artifacts_text(load_job(a.job)))
     sys.exit(rc)
+
+
+def artifacts_text(j: Dict[str, Any]) -> str:
+    if j.get("artifacts"):
+        return f"\n\n[artifacts] {j['artifacts_dir']}\n" + "\n".join(f"  {x}" for x in j["artifacts"][:50])
+    return f"\n\n[artifacts] {j['artifacts_note']}" if j.get("artifacts_note") else ""
+
+
+def cmd_artifacts(a) -> None:
+    j = load_job(a.job)
+    if not j.get("artifacts"):
+        die(E_NOT_FOUND, j.get("artifacts_note") or "no artifacts for this job")
+    src = Path(j["artifacts_dir"])
+    if a.to:
+        dst = Path(a.to).expanduser(); dst.mkdir(parents=True, exist_ok=True)
+        for rel in j["artifacts"]:
+            (dst / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src / rel, dst / rel)
+        src = dst
+    for rel in j["artifacts"]:
+        print(src / rel)
 
 
 def cmd_result(a) -> None:
     j = load_job(a.job)
     rc, text = job_output(j) if j["status"] in ("done", "failed", "cancelled") else (E_RUNNING, f"still {j['status']}")
-    print(text)
+    print(text + artifacts_text(j))
     sys.exit(rc)
 
 
@@ -1512,11 +1561,15 @@ def main(argv: Optional[List[str]] = None) -> None:
         s.add_argument("--sync", help="orchestrator folder copied to the node before the job and copied back after")
         s.add_argument("--no-pull", action="store_true", help="with --sync: do not copy results back")
         s.add_argument("--tags", default=""); s.add_argument("--timeout", type=int, help="minutes")
+        s.add_argument("--resume", default="", help="continue this Claude Code session on the node (needs shared folders, see README)")
+        s.add_argument("--force", action="store_true", help="with --resume: even if the session was just written here")
 
     s = sp.add_parser("submit", help="queue a job and print its id"); job_opts(s); s.set_defaults(fn=cmd_submit)
     s = sp.add_parser("run", help="queue a job and wait for its result"); job_opts(s); s.add_argument("-m", "--max", type=int, default=540); s.set_defaults(fn=cmd_run)
     s = sp.add_parser("wait", help="wait for a job (exit 2 if still running)"); s.add_argument("job"); s.add_argument("-m", "--max", type=int, default=540); s.set_defaults(fn=cmd_wait)
     s = sp.add_parser("result", help="print a finished job's answer"); s.add_argument("job"); s.set_defaults(fn=cmd_result)
+    s = sp.add_parser("artifacts", help="screenshots/videos/logs a job saved (paths; --to DIR copies them)")
+    s.add_argument("job"); s.add_argument("--to"); s.set_defaults(fn=cmd_artifacts)
     s = sp.add_parser("logs", help="history and stderr of a job"); s.add_argument("job"); s.set_defaults(fn=cmd_logs)
     s = sp.add_parser("cancel", help="cancel a job"); s.add_argument("job"); s.set_defaults(fn=cmd_cancel)
     s = sp.add_parser("jobs", help="recent jobs"); s.add_argument("-n", "--limit", type=int, default=20); s.set_defaults(fn=cmd_jobs)

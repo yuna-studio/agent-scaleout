@@ -124,6 +124,29 @@ Write tasks so they stand alone — the node's agent has not seen your conversat
 Change with `scaleout config KEY VALUE` (e.g. `scaleout config min_free_disk_gb 10`) or per node (`scaleout config --node build-01 max_jobs 1`).
 Machine-wide cleanup (Docker prune, unavailable simulators) runs only when you ask: `scaleout cleanup NODE --deep`.
 
+## Screenshots, videos, logs (artifacts)
+
+Every job gets a folder on the node, named by the `SCALEOUT_ARTIFACTS` environment variable; the prompt tells the agent
+to save screenshots, screen recordings, logs and reports there. When the job finishes the orchestrator fetches the folder
+(`~/.local/state/scaleout/results/JOB/`, up to `max_artifacts_mb`) and lists the files under the answer.
+`scaleout artifacts JOB [--to DIR]` prints or copies them, so the requesting session can show or post them.
+
+## Node agent permissions
+
+Node agents run headless (`claude -p`): they never wait for a permission prompt — anything outside the allow list is
+refused at once and the agent works around it or reports it. `scaleout config --node NAME …` plus `ctl conf PERMISSION_MODE bypass`
+on the node runs the agent with `--permission-mode bypassPermissions` (never asks); the deny list in
+`~/.scaleout/settings/claude.json` (force pushes, protected branches, deploys, `rm -rf`, `sudo`, or any path you add)
+still applies. macOS privacy permissions (Full Disk Access, Screen Recording, network volumes) cannot be granted by
+software, not even root — click them once per node, or push a PPPC profile with an MDM when you run many nodes.
+
+## Continue a session on another machine
+
+`scaleout run --resume SESSION -w NODE -d DIR` continues a Claude Code session on a node, provided the node sees the same
+folder and the same `~/.claude/projects` (e.g. SMB shares of the orchestrator mounted on the node). It refuses a session
+written in the last 2 minutes, so two machines never write one transcript. Over a slow tunnel this is impractical; on a
+LAN it works. For heavy work across many nodes, prefer normal jobs: each node works in its own folder.
+
 ## Real devices
 
 Nodes count USB-attached phones (`adb devices`, `xcrun devicectl`) and report them in `scaleout status` (`A1 I1`).

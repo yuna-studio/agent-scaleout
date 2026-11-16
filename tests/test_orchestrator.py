@@ -29,7 +29,7 @@ so.AUTH_KEYS = TMP / "authorized_keys"
 so.KNOWN_HOSTS = TMP / "known_hosts"
 
 STUB = """#!/bin/bash
-p="$(cat)"
+p="$(head -n1)"; cat >/dev/null
 case "$p" in *HANG*) sleep 600;; *FAIL*) echo "boom" >&2; exit 3;; esac
 printf '{"result":"done: %s on %s","is_error":false}' "$p" "$(basename "$HOME")"
 """
@@ -83,7 +83,7 @@ class E2E(unittest.TestCase):
     def setUpClass(cls):
         cfg = so.load_cfg()
         cfg["orchestrator"] = {"user": "me", "lan": "127.0.0.1", "tunnel": {}}
-        cfg["defaults"].update({"metrics_ttl_s": 0, "min_free_disk_gb": 0, "cleanup_below_disk_gb": 0, "stall_min": 1, "offline_grace_min": 0})
+        cfg["defaults"].update({"metrics_ttl_s": 0, "min_free_disk_gb": 0, "min_free_mem_pct": 0, "cleanup_below_disk_gb": 0, "stall_min": 1, "offline_grace_min": 0, "auto_tune": False})
         cfg["skills"]["auto"] = False
         for n in ("n1", "n2"):
             HOMES[n] = make_node(n)

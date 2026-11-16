@@ -98,7 +98,20 @@ for f in ctl.sh runner.sh setup.sh gh-runner.sh; do [ -f "$PKG/$f" ] && cp "$PKG
 mv -f "$B/bin/ctl.sh" "$B/bin/ctl"; chmod 755 "$B/bin/"*
 printf '#!/bin/bash\nnohup /bin/bash "$HOME/.scaleout/bin/runner.sh" >> "$HOME/.scaleout/runner.log" 2>&1 &\n' > "$B/bin/kick"; chmod 755 "$B/bin/kick"
 # agent permissions: keep the user's edited copy
-[ -f "$B/settings/claude.json" ] || { [ -f "$PKG/claude-settings.json" ] && cp "$PKG/claude-settings.json" "$B/settings/claude.json"; }
+if [ ! -f "$B/settings/claude.json" ]; then
+  [ -f "$PKG/claude-settings.json" ] && cp "$PKG/claude-settings.json" "$B/settings/claude.json"
+elif [ -f "$PKG/claude-settings.json" ] && command -v python3 >/dev/null 2>&1; then
+  # keep the node's own edits, add allow/deny rules and folders that new versions introduce
+  python3 - "$B/settings/claude.json" "$PKG/claude-settings.json" <<'PY' || true
+import json, sys
+mine, new = (json.load(open(p)) for p in sys.argv[1:3])
+mp, np = mine.setdefault("permissions", {}), new.get("permissions", {})
+for k in ("allow", "deny", "additionalDirectories"):
+    cur = mp.setdefault(k, [])
+    cur += [x for x in np.get(k, []) if x not in cur]
+json.dump(mine, open(sys.argv[1], "w"), indent=2, ensure_ascii=False)
+PY
+fi
 cat > "$B/node.conf" <<EOF
 NAME=$NAME
 WORK_ROOT=$DIR
