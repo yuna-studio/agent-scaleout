@@ -474,6 +474,45 @@ class E2E(unittest.TestCase):
         names = tarfile.open(fileobj=io.BytesIO(so.node_package("windows"))).getnames()
         self.assertTrue({"ctl.ps1", "runner.ps1", "setup.ps1"} <= set(names), names)
 
+    def test_99c_stale_tunnel_freed(self):
+        # a node that slept leaves its reverse tunnel's sshd session holding the port: free it after a minute
+        cfg = so.load_cfg()
+        cfg["nodes"]["n3"] = {"os": "Darwin", "user": "me", "port": 22999, "max_jobs": 1, "agent": "claude"}
+        so.save_cfg(cfg)
+        freed = []
+        orig = (so.Node.ctl, so.socket_busy, so.free_stale_tunnel)
+        so.Node.ctl = lambda self, verb, *a, **k: subprocess.CompletedProcess([], 255, b"", b"Connection timed out during banner exchange")
+        so.socket_busy = lambda port: True
+        so.free_stale_tunnel = lambda port: freed.append(port) or [4242]
+        try:
+            st = so.refresh_metrics(so.load_cfg(), names=["n3"], max_age=0)["n3"]
+            self.assertFalse(st["online"])
+            self.assertEqual(freed, [], "not on the first miss: a busy node can be slow")
+            self.assertIn("stale_tunnel_since", st)
+            st["stale_tunnel_since"] = so.now() - 61
+            so.write_json(so.node_state_path("n3"), st)
+            st = so.refresh_metrics(so.load_cfg(), names=["n3"], max_age=0)["n3"]
+            self.assertEqual(freed, [22999])
+            self.assertNotIn("stale_tunnel_since", st)
+            # an unreachable node with no tunnel listener is just offline: nothing to free
+            so.Node.ctl = lambda self, verb, *a, **k: subprocess.CompletedProcess([], 255, b"", b"Connection refused")
+            st = so.refresh_metrics(so.load_cfg(), names=["n3"], max_age=0)["n3"]
+            self.assertNotIn("stale_tunnel_since", st)
+        finally:
+            so.Node.ctl, so.socket_busy, so.free_stale_tunnel = orig
+            cfg = so.load_cfg()
+            cfg["nodes"].pop("n3", None)
+            so.save_cfg(cfg)
+        # the real helper never kills a program that is not an sshd session
+        import socket
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        try:
+            self.assertEqual(so.free_stale_tunnel(srv.getsockname()[1]), [])
+        finally:
+            srv.close()
+
 
 if __name__ == "__main__":
     try:

@@ -377,6 +377,27 @@ def socket_busy(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
+def free_stale_tunnel(port: int) -> List[int]:
+    """Kill this user's sshd session still listening on a node's reverse-tunnel port.
+
+    A node that sleeps (a laptop lid) or loses its network leaves that session behind: it keeps the port, nothing
+    answers behind it (ssh times out in the banner exchange), and the node's tunnel cannot bind the port again when
+    it comes back, so the node stays offline until someone kills the session."""
+    if not shutil.which("lsof"):
+        return []
+    out = run(["lsof", "-nP", "-a", "-t", f"-iTCP:{port}", "-sTCP:LISTEN", "-u", str(os.getuid())], timeout=10).stdout.decode()
+    killed: List[int] = []
+    for pid in sorted({int(p) for p in out.split() if p.isdigit()}):
+        if "sshd" not in run(["ps", "-o", "comm=", "-p", str(pid)], timeout=5).stdout.decode():
+            continue   # only a tunnel's sshd session, never another program on that port
+        try:
+            os.kill(pid, 15)
+            killed.append(pid)
+        except OSError:
+            pass
+    return killed
+
+
 def tunnel_args(cfg: Dict[str, Any], port: int) -> List[str]:
     t = cfg["orchestrator"].get("tunnel") or {}
     if not t.get("host"):
@@ -769,10 +790,23 @@ def refresh_metrics(cfg: Dict[str, Any], names: Optional[List[str]] = None, max_
                 m = {}
             st.update(m)
             st.update({"online": True, "ts": now(), "last_ok": now(), "route": Node._route_cache.get(name, ("",))[0]})
+            st.pop("stale_tunnel_since", None)
             if int(m.get("running", 1) or 0) == 0 and m.get("mem_total_gb"):
                 st["idle_used_gb"] = round(float(m["mem_total_gb"]) * (100 - float(m.get("mem_free_pct", 0))) / 100, 1)
         else:
-            st.update({"online": False, "ts": now(), "error": res.stderr.decode().strip()[-200:]})
+            err = res.stderr.decode()
+            st.update({"online": False, "ts": now(), "error": err.strip()[-200:]})
+            port = cfg["nodes"].get(name, {}).get("port")
+            if port and "banner exchange" in err and socket_busy(int(port)):
+                # the tunnel port is open but nothing behind it answers: give a slow node a minute, then free the port
+                st.setdefault("stale_tunnel_since", now())
+                if now() - int(st["stale_tunnel_since"]) >= 60:
+                    pids = free_stale_tunnel(int(port))
+                    if pids:
+                        say(f"{name}: freed its stale reverse tunnel on port {port} (pid {', '.join(map(str, pids))}) so it can reconnect")
+                    st.pop("stale_tunnel_since", None)
+            else:
+                st.pop("stale_tunnel_since", None)
         write_json(node_state_path(name), st)
         out[name] = st
 
