@@ -1039,7 +1039,8 @@ def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[st
         if busy and cpu_used.get(name, 0) + job_cpu(j) > units and float(st.get("load", 0) or 0) >= cores:
             continue       # units full and the cores really busy; a heavy job in a quiet phase (load < cores) leaves room
         score = st.get("mem_free_pct", 0) + min(st.get("disk_free_gb", 0), 50) / 5 - 30 * busy - 10 * float(st.get("load", 0)) / max(int(st.get("cpus", 1)), 1)
-        score += float(n.get("score_bias", 0))   # e.g. the orchestrator as a node: used only when it has room, after the others
+        if float(st.get("load", 0) or 0) < cores:
+            score += float(n.get("score_bias", 0))   # the orchestrator goes first only while it is quiet; busy with CI or sessions, idle nodes win
         if score > best_score:
             best, best_score = name, score
     return best
@@ -1575,7 +1576,7 @@ def cmd_status(a) -> None:
     for name in sorted(metrics):
         st = metrics[name]
         h = node_health(cfg, name, st)
-        route = "-" if not st.get("online") else ("lan" if str(st.get("route", "")).endswith("-lan") else "tunnel")
+        route = "-" if not st.get("online") else ("local" if cfg["nodes"].get(name, {}).get("local") else "lan" if str(st.get("route", "")).endswith("-lan") else "tunnel")
         say(f"{name:<14}{h:<12}{route:<8}{str(st.get('mem_free_pct', '-')) + '%':>9}{str(st.get('disk_free_gb', '-')) + 'GB':>11}"
             f"{str(st.get('load', '-')):>8}{str(st.get('running', 0)) + '+' + str(st.get('queued', 0)):>7}  {fmt_devices(st):<9}{','.join(st.get('agents') or []) or '-'}")
     q = [j for j in all_jobs() if j.get("status") in ("queued", "dispatched", "running")]
