@@ -267,6 +267,7 @@ class E2E(unittest.TestCase):
         self.assertEqual(so.load_job(a)["node"], "n2")
         self.assertEqual(so.load_job(b)["status"], "queued", "one job per attached phone")
         self.assertEqual(so.load_job(c)["status"], "queued", "no node has an iPhone")
+        self.assertIn("lacks ios-device", so.load_job(c).get("wait", ""), "a waiting job says why")
         for _ in range(8):
             settle(); so.tick()
             if so.load_job(b)["status"] == "done":
