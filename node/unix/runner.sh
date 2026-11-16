@@ -21,6 +21,10 @@ echo $$ > "$LOCK/pid"; trap 'rm -rf "$LOCK"' EXIT
 
 running() { jobs -rp | wc -l | tr -d ' '; }
 disk_free_gb() { df -Pk "$HOME" | awk 'NR==2 {printf "%d", $4/1048576}'; }
+used_mb() {  # memory in use on this machine, MB
+  if [ "$(uname -s)" = Darwin ]; then echo $(( $(sysctl -n hw.memsize) / 1048576 * (100 - $(sysctl -n kern.memorystatus_level 2>/dev/null || echo 50)) / 100 ))
+  else awk '/MemTotal/ {t=$2} /MemAvailable/ {a=$2} END {printf "%d", (t-a)/1024}' /proc/meminfo; fi
+}
 mem_free_pct() {
   if [ "$(uname -s)" = Darwin ]; then sysctl -n kern.memorystatus_level 2>/dev/null || echo 100
   else awk '/MemTotal/ {t=$2} /MemAvailable/ {a=$2} END {if (t) printf "%d", a*100/t; else print 100}' /proc/meminfo; fi
@@ -33,6 +37,7 @@ agent_cmd() {  # agent_cmd <agent> -> command line that reads the prompt on stdi
     codex)  echo 'codex exec --skip-git-repo-check "$(cat)"' ;;
     gemini) echo 'gemini -p "$(cat)"' ;;
     custom) echo "${AGENT_CMD:-cat}" ;;
+    bench)  echo "bash $B/bin/ctl loadjob" ;;   # `scaleout bench --load`: synthetic work, no agent account used
     *) echo "$1" ;;   # any other command line
   esac
 }
@@ -47,12 +52,14 @@ run_job() {
   if [ "$(disk_free_gb)" -lt "$MIN_FREE_GB" ]; then echo "node disk almost full ($(disk_free_gb)GB)" > "$d/err.log"; echo 28 > "$d/rc"; return; fi
   cmd="$(agent_cmd "$agent")"
   date +%s > "$d/started"; touch "$d/heartbeat"
+  local u0 peak u; u0="$(used_mb)"; peak="$u0"
   bash -c "$cmd" < "$d/prompt.md" > "$d/out" 2> "$d/err.log" &
   local cpid=$!; echo "$cpid" > "$d/pid"
   # heartbeat + timeout watchdog: the orchestrator treats a stale heartbeat as a dead runner
   local waited=0
   while kill -0 "$cpid" 2>/dev/null; do
     sleep 10; waited=$((waited + 10)); touch "$d/heartbeat"
+    u="$(used_mb)"; [ "$u" -gt "$peak" ] && peak="$u" && echo $((peak - u0)) > "$d/mem_mb"   # peak memory this job added
     if [ "$waited" -ge $((timeout * 60)) ]; then
       echo "timed out after ${timeout} min" >> "$d/err.log"; kill -TERM "$cpid" 2>/dev/null; sleep 5; kill -KILL "$cpid" 2>/dev/null
     fi
@@ -62,9 +69,15 @@ run_job() {
   echo "$rc" > "$d/rc"; date +%s > "$d/finished"
 }
 
+idle=0
 while :; do
   set -- "$Q"/*
-  if [ ! -e "$1" ]; then [ "$(running)" -eq 0 ] && break; sleep 2; continue; fi
+  if [ ! -e "$1" ]; then
+    # linger a little before exiting: launchd will not start us again for ~10 s after we quit
+    if [ "$(running)" -eq 0 ]; then idle=$((idle + 2)); [ "$idle" -ge "${LINGER_S:-30}" ] && break; else idle=0; fi
+    sleep 2; continue
+  fi
+  idle=0
   for f in "$@"; do
     while [ "$(running)" -ge "$MAX_JOBS" ]; do sleep 2; done
     # do not start another agent while this machine is short on memory (other apps, other agents);

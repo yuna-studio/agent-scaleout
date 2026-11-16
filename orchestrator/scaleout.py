@@ -32,7 +32,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 HOME = Path.home()
 CONF_DIR = Path(os.environ.get("SCALEOUT_CONF", HOME / ".config" / "scaleout"))
 STATE_DIR = Path(os.environ.get("SCALEOUT_STATE", HOME / ".local" / "state" / "scaleout"))
@@ -51,7 +51,8 @@ DEFAULTS: Dict[str, Any] = {
     "cleanup_below_disk_gb": 8,  # ask the node to reclaim disk below this
     "job_timeout_min": 180,
     "stall_min": 5,              # running job whose heartbeat is older than this is considered dead
-    "node_wait_min": 10,         # job handed to a node but not started there (node short on memory) -> move it
+    "node_wait_min": 10,
+    "auto_tune": True,           # daily: set each node's max_jobs from the memory its real jobs used (not for --max-jobs nodes)         # job handed to a node but not started there (node short on memory) -> move it
     "offline_grace_min": 10,     # node unreachable this long -> its jobs are retried elsewhere
     "retries": 2,
     "keep_job_days": 3,
@@ -122,7 +123,9 @@ def run(cmd: List[str], input: Optional[bytes] = None, timeout: Optional[float] 
 
 # ── ssh plumbing ─────────────────────────────────────────────────────────────
 SSH_BASE = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", "-o", "ServerAliveInterval=20",
-            "-o", "StrictHostKeyChecking=accept-new"]
+            "-o", "StrictHostKeyChecking=accept-new",
+            # reuse one connection per node: a fresh SSH handshake (through a tunnel) costs ~1 s on every call
+            "-o", "ControlMaster=auto", "-o", "ControlPath=~/.ssh/scaleout-cm-%C", "-o", "ControlPersist=120"]
 
 
 def ssh_block_put(name: str, body: str) -> None:
@@ -208,7 +211,9 @@ class Node:
         hit = Node._route_cache.get(self.name)
         if hit and not fresh and time.time() - hit[1] < 60:
             return hit[0] or None
-        for a in self.aliases():
+        last = read_json(node_state_path(self.name), {}).get("route")
+        order = sorted(self.aliases(), key=lambda x: x != last)   # the route that worked last time first
+        for a in order:
             try:
                 if run(SSH_BASE + ["-n", "-o", "ConnectTimeout=4", a, "exit"], timeout=12).returncode == 0:
                     Node._route_cache[self.name] = (a, time.time())
@@ -387,13 +392,16 @@ def cmd_add(a) -> None:
     say(f"installing node '{name}' ({uname}) …")
     if run(boot + ["mkdir -p ~/.scaleout/pkg && tar -xzf - -C ~/.scaleout/pkg"], input=node_package("unix"), timeout=120).returncode != 0:
         die(E_UNREACHABLE, "could not upload the node package")
+    auto_jobs = a.max_jobs is None
+    a.max_jobs = a.max_jobs or 2
     args = ["--name", name, "--dir", a.dir, "--max-jobs", str(a.max_jobs), "--agent", a.agent] + (tunnel_args(cfg, port) if port else [])
     res = run(boot + ["-n", "bash ~/.scaleout/pkg/setup.sh " + " ".join(shlex.quote(x) for x in args)], timeout=600)
     out = res.stdout.decode()
     if res.returncode != 0:
         die(E_UNREACHABLE, f"node setup failed:\n{out}\n{res.stderr.decode()}")
     info = parse_setup(out)
-    node = finish_register(cfg, name, info, port, {"lan": lan, "dir": a.dir, "max_jobs": a.max_jobs, "agent": a.agent, "tags": a.tags.split(",") if a.tags else []})
+    node = finish_register(cfg, name, info, port, {"lan": lan, "dir": a.dir, "max_jobs": a.max_jobs, "agent": a.agent, "tags": a.tags.split(",") if a.tags else [],
+                                                   **({"price": a.price} if a.price else {}), **({} if auto_jobs else {"max_jobs_fixed": True})})
     say(f"  user {node['user']} · LAN {node.get('lan') or '-'} · tunnel port {node.get('port') or '-'} · agents {', '.join(node.get('agents') or []) or 'none'}")
     for note in [l for l in out.splitlines() if l.startswith("SCALEOUT_NOTE")]:
         say("  ! " + note[len("SCALEOUT_NOTE "):])
@@ -402,6 +410,9 @@ def cmd_add(a) -> None:
         say("  ! no coding agent found on the node — install and sign in to one (e.g. Claude Code) there")
     elif not a.no_test:
         selftest(name)
+    if not a.no_test:
+        say("  benchmark ...")
+        run_bench([name], apply=auto_jobs, quiet_table=True)
     say(f"node '{name}' ready")
 
 
@@ -499,6 +510,9 @@ def cmd_invite(a) -> None:
     inv.mkdir(parents=True)
     run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(inv / "enroll"), "-C", f"scaleout-invite-{name}"], check=True)
     node = cfg["nodes"].get(name, {})
+    a.max_jobs = a.max_jobs or 2
+    if a.price:
+        node["price"] = a.price
     node.update({"pending": True, "expires": now() + a.hours * 3600, "dir": a.dir, "max_jobs": a.max_jobs, "agent": a.agent,
                  "tags": a.tags.split(",") if a.tags else node.get("tags", []), "os": "windows" if win else node.get("os", "")})
     if port:
@@ -612,6 +626,8 @@ def refresh_metrics(cfg: Dict[str, Any], names: Optional[List[str]] = None, max_
                 m = {}
             st.update(m)
             st.update({"online": True, "ts": now(), "last_ok": now(), "route": Node._route_cache.get(name, ("",))[0]})
+            if int(m.get("running", 1) or 0) == 0 and m.get("mem_total_gb"):
+                st["idle_used_gb"] = round(float(m["mem_total_gb"]) * (100 - float(m.get("mem_free_pct", 0))) / 100, 1)
         else:
             st.update({"online": False, "ts": now(), "error": res.stderr.decode().strip()[-200:]})
         write_json(node_state_path(name), st)
@@ -703,7 +719,9 @@ def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[st
         if any(int(devs.get(t[:-7], 0) or 0) <= dev_load.get((name, t), 0) for t in (j.get("tags") or []) if t in DEVICE_TAGS):
             continue
         agent = j.get("agent") or "default"
-        if agent not in ("default", "custom") and agent not in (st.get("agents") or []):
+        if agent == "bench" and st.get("os", "").lower() == "windows":
+            continue
+        if agent not in ("default", "custom", "bench") and agent not in (st.get("agents") or []):
             continue
         if agent == "default" and not st.get("agents"):
             continue
@@ -795,6 +813,8 @@ def collect(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[str,
         (STATE_DIR / "results").mkdir(parents=True, exist_ok=True)
         (STATE_DIR / "results" / f"{j['id']}.out").write_bytes(out)
         rc = int(s.get("rc", 1))
+        if s.get("mem_mb") is not None:
+            j["mem_mb"] = int(s.get("mem_mb") or 0)
         if rc != 0:
             (STATE_DIR / "results" / f"{j['id']}.err").write_bytes(n.ctl("err", j["id"], "60").stdout)
         if j.get("sync") and j.get("pull", True):
@@ -847,6 +867,13 @@ def maintain(cfg: Dict[str, Any], metrics: Dict[str, Dict[str, Any]]) -> None:
             n.ctl("gc", str(d["keep_job_days"]))
             st["last_gc"] = now()
             write_json(node_state_path(name), st)
+    if d.get("auto_tune", True):
+        last = read_json(STATE_DIR / "tune.json", {}).get("t", 0)
+        if now() - last > 24 * 3600:
+            try:
+                tune(cfg, apply=True, quiet=True)
+            finally:
+                write_json(STATE_DIR / "tune.json", {"t": now()})
     orphans = read_json(STATE_DIR / "orphans.json", [])
     left = []
     for name, jid in orphans:
@@ -899,7 +926,9 @@ def tick(verbose: bool = False) -> None:
                     if t in DEVICE_TAGS:
                         dev_load[(j["node"], t)] = dev_load.get((j["node"], t), 0) + 1
         for name, st in metrics.items():  # work the node already has (other orchestrators, manual jobs)
-            load[name] = max(load.get(name, 0), int(st.get("running", 0)) + int(st.get("queued", 0)))
+            reported = int(st.get("running", 0)) + int(st.get("queued", 0))
+            reported -= sum(1 for j in jobs if j.get("node") == name and j.get("finished_at", 0) >= st.get("ts", 0))
+            load[name] = max(load.get(name, 0), reported)
         for j in jobs:
             if j.get("status") != "queued":
                 continue
@@ -1218,6 +1247,229 @@ def cmd_runner(a) -> None:
     sys.exit(0 if r.returncode == 0 else E_JOB_FAILED)
 
 
+# ── commands: bench / stats ──────────────────────────────────────────────────
+# Reference machine = Apple M1 (8 cores), measured with `ctl bench` / `ctl loadjob`.
+# Score 100 = one M1 Mac mini with 8 GB running one mobile job (agent + build + test) at a time.
+REF_SINGLE_MBPS = 55.0
+REF_MULTI_MBPS = 230.0
+REF_LOAD_S = 54.0
+JOB_GB, BASE_GB = 3.5, 3.0   # memory one mobile job needs (agent + build, phone attached) / what the OS keeps
+
+
+def bench_score(b: Dict[str, Any]) -> Dict[str, Any]:
+    single = float(b.get("single_mbps", 0)) / REF_SINGLE_MBPS
+    multi = float(b.get("multi_mbps", 0)) / REF_MULTI_MBPS
+    mem_slots = max(0, int((float(b.get("mem_total_gb", 0)) - BASE_GB) // JOB_GB))
+    cpu_slots = max(1, int(2 * multi + 0.25))
+    slots = min(mem_slots, cpu_slots)
+    speed = 1 / (0.6 + 0.4 / max(single, 0.1))   # ~60 % of a job is waiting for the model, ~40 % is CPU work
+    return {"single_x": round(single, 2), "multi_x": round(multi, 2), "mem_slots": mem_slots, "cpu_slots": cpu_slots,
+            "slots": slots, "score": int(round(slots * speed * 100))}
+
+
+def bench_history() -> List[Dict[str, Any]]:
+    return read_json(STATE_DIR / "bench.json", [])
+
+
+def per10k(score: int, price: Any) -> str:
+    return f"{score / (int(price) / 10000):.1f}" if price else "-"
+
+
+def run_bench(names: List[str], apply: bool = False, quiet_table: bool = False) -> None:
+    cfg = load_cfg()
+    res: Dict[str, Any] = {}
+
+    def one(name: str) -> None:
+        try:
+            r = Node(name, cfg).ctl("bench", timeout=300)
+            res[name] = json.loads(r.stdout.decode().strip().splitlines()[-1])
+        except Exception as e:  # unreachable, not supported ...
+            res[name] = {"error": str(e)[:80] or "unreachable"}
+    threads = [threading.Thread(target=one, args=(n,)) for n in names]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    hist = [h for h in bench_history() if "nodes" in h]
+    prev = dict(hist[-1]["nodes"]) if hist else {}
+    cur = {k: v for k, v in prev.items() if k in cfg["nodes"]}
+    for name in names:
+        b = res.get(name) or {}
+        if "error" in b or "single_mbps" not in b:
+            say(f"  {name}: no benchmark ({b.get('error', 'no answer')})")
+            continue
+        sc = bench_score(b)
+        cur[name] = {**sc, "model": b.get("model", ""), "mem_gb": b.get("mem_total_gb"), "cpus": b.get("cpus"),
+                     "disk_mbps": b.get("disk_write_mbps"), "price": cfg["nodes"][name].get("price")}
+        if apply and sc["slots"] >= 1 and cfg["nodes"][name].get("max_jobs") != sc["slots"] and not cfg["nodes"][name].get("max_jobs_fixed"):
+            cfg["nodes"][name]["max_jobs"] = sc["slots"]
+            Node(name, cfg).ctl("conf", "MAX_JOBS", str(sc["slots"]))
+            save_cfg(cfg)
+            say(f"  {name}: max_jobs set to {sc['slots']} (measured)")
+    total = sum(v["score"] for v in cur.values())
+    before = sum(v["score"] for k, v in prev.items() if k in cfg["nodes"])
+    full = bench_history()
+    full.append({"t": now(), "nodes": cur, "total": total})
+    write_json(STATE_DIR / "bench.json", full[-200:])
+    if not quiet_table:
+        say(f"{'node':<14}{'model':<30}{'mem':>5}{'cores':>6}{'1-core':>8}{'all':>7}{'jobs':>6}{'score':>7}{'price':>11}{'per 10k':>9}")
+        for name in sorted(cur):
+            v = cur[name]
+            say(f"{name:<14}{str(v.get('model', ''))[:29]:<30}{str(v.get('mem_gb', '?')) + 'G':>5}{str(v.get('cpus', '?')):>6}"
+                f"{v['single_x']:>7.2f}x{v['multi_x']:>6.2f}x{v['slots']:>6}{v['score']:>7}"
+                f"{(format(v['price'], ',') if v.get('price') else '-'):>11}{per10k(v['score'], v.get('price')):>9}")
+    for name in names:
+        if name in cur and name not in prev:
+            v = cur[name]
+            paid = f" for {v['price']:,} -> {per10k(v['score'], v['price'])} points per 10k" if v.get("price") else ""
+            say(f"  {name} added {v['score']} points{paid}")
+    x = f" ({total / before:.2f}x)" if before else ""
+    say(f"pool score {total}  (was {before}, {total - before:+d}{x}) · 100 = one M1 8GB Mac mini doing one mobile job")
+
+
+def run_load(cfg: Dict[str, Any], jobs: int, max_s: int) -> None:
+    names = [n for n, v in cfg["nodes"].items() if not v.get("pending") and v.get("os", "").lower() != "windows"]
+    slots = sum(int(cfg["nodes"][n].get("max_jobs", 2)) for n in names)
+    jobs = jobs or max(4, 3 * slots)
+    say(f"load test: {jobs} synthetic build jobs (~2.5 GB, 4 busy cores, 512 MB written each) on {len(names)} node(s), {slots} slot(s)")
+    ids = []
+    for _ in range(jobs):
+        jid = submit_job(cfg, "load test", agent="bench", timeout=20)
+        j = load_job(jid)
+        j["bench"] = True
+        save_job(j)
+        ids.append(jid)
+    start = time.time()
+    while True:
+        tick()
+        js = [load_job(i) for i in ids]
+        if all(j["status"] in ("done", "failed", "cancelled") for j in js):
+            break
+        if time.time() - start > max_s:
+            for j in js:
+                if j["status"] not in ("done", "failed", "cancelled"):
+                    cmd_cancel(type("A", (), {"job": j["id"]})())
+            break
+        time.sleep(2)
+    wall = time.time() - start
+    per: Dict[str, List[int]] = {}
+    for jid in ids:
+        j = load_job(jid)
+        if j["status"] == "done":
+            try:
+                ms = json.loads((STATE_DIR / "results" / f"{jid}.out").read_text().strip().splitlines()[-1]).get("ms", 0)
+            except (ValueError, IndexError, OSError):
+                ms = 0
+            per.setdefault(j["node"], []).append(int(ms))
+        for f in (job_path(jid), STATE_DIR / "prompts" / f"{jid}.md", STATE_DIR / "results" / f"{jid}.out", STATE_DIR / "results" / f"{jid}.err"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+    done = sum(len(v) for v in per.values())
+    score = int(round(done * REF_LOAD_S / wall * 100)) if wall else 0
+    for n in sorted(per):
+        say(f"  {n:<14}{len(per[n]):>3} jobs · avg {sum(per[n]) / len(per[n]) / 1000:.0f}s each")
+    say(f"{done}/{jobs} done in {wall / 60:.1f} min · {done / wall * 3600:.0f} jobs/hour")
+    hist = bench_history()
+    last = next((h["load"] for h in reversed(hist) if "load" in h), None)
+    hist.append({"t": now(), "load": {"jobs": jobs, "done": done, "wall_s": round(wall), "score": score, "nodes": sorted(per)}})
+    write_json(STATE_DIR / "bench.json", hist[-200:])
+    was = f" (last load test {last['score']}, {score - last['score']:+d})" if last else ""
+    say(f"load score {score}{was} · 100 = one M1 8GB Mac mini working through the same jobs one at a time")
+
+
+def cmd_bench(a) -> None:
+    cfg = load_cfg()
+    if a.history:
+        for h in bench_history():
+            t = time.strftime("%Y-%m-%d %H:%M", time.localtime(h["t"]))
+            if "load" in h:
+                L = h["load"]
+                say(f"{t}  load  score {L['score']:>5}  {L['done']}/{L['jobs']} jobs in {L['wall_s']}s on {','.join(L['nodes'])}")
+            else:
+                say(f"{t}  pool  score {h['total']:>5}  " + " ".join(f"{k}={v['score']}" for k, v in sorted(h["nodes"].items())))
+        return
+    if a.load:
+        return run_load(cfg, a.jobs, a.max)
+    names = a.names or [n for n, v in cfg["nodes"].items() if not v.get("pending")]
+    run_bench(names, apply=a.apply)
+
+
+def p90(xs: List[float]) -> float:
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, int(round(0.9 * (len(xs) - 1))))]
+
+
+def tune(cfg: Dict[str, Any], apply: bool = False, quiet: bool = False, days: int = 14) -> None:
+    """max_jobs from measured memory: (total - idle use - 1 GB headroom) / p90 of the memory one real job added,
+    capped by the CPU slots `scaleout bench` measured."""
+    since = now() - days * 86400
+    per: Dict[str, List[float]] = {}
+    for j in all_jobs():
+        if j.get("bench") or j.get("created", 0) < since or j.get("status") != "done" or not j.get("node") or not j.get("mem_mb"):
+            continue
+        per.setdefault(j["node"], []).append(j["mem_mb"] / 1024)
+    hist = [h for h in bench_history() if "nodes" in h]
+    bench = hist[-1]["nodes"] if hist else {}
+    if not quiet:
+        say(f"{'node':<14}{'jobs':>5}{'mem/job p90':>13}{'idle use':>10}{'total':>7}{'cpu slots':>11}{'max_jobs':>10}  ->")
+    for name, n in cfg["nodes"].items():
+        st = read_json(node_state_path(name), {})
+        xs = per.get(name, [])
+        cur = int(n.get("max_jobs", 2))
+        if len(xs) < 5 or not st.get("mem_total_gb"):
+            if not quiet:
+                say(f"{name:<14}{len(xs):>5}{'-':>13}{'-':>10}{str(st.get('mem_total_gb', '-')) + 'G':>7}{'-':>11}{cur:>10}  (needs 5 finished jobs)")
+            continue
+        job_gb = max(0.5, p90(xs))
+        idle = float(st.get("idle_used_gb") or BASE_GB)
+        mem_slots = max(1, int((float(st["mem_total_gb"]) - idle - 1) // job_gb))
+        cpu = int((bench.get(name) or {}).get("cpu_slots") or 99)
+        rec = max(1, min(mem_slots, cpu, 8))
+        fixed = n.get("max_jobs_fixed")
+        if not quiet:
+            say(f"{name:<14}{len(xs):>5}{job_gb:>12.1f}G{idle:>9.1f}G{str(st['mem_total_gb']) + 'G':>7}{(cpu if cpu != 99 else '-'):>11}{cur:>10}  {rec}{' (fixed by --max-jobs)' if fixed else ''}")
+        if apply and not fixed and rec != cur:
+            n["max_jobs"] = rec
+            if Node(name, cfg).ctl("conf", "MAX_JOBS", str(rec)).returncode == 0:
+                save_cfg(cfg)
+                if not quiet:
+                    say(f"  {name}: max_jobs {cur} -> {rec}")
+
+
+def cmd_tune(a) -> None:
+    tune(load_cfg(), apply=a.apply, days=a.days)
+
+
+def cmd_stats(a) -> None:
+    since = now() - a.days * 86400
+    rows: Dict[str, Dict[str, List[float]]] = {}
+    for j in all_jobs():
+        if j.get("bench") or j.get("created", 0) < since or not j.get("node"):
+            continue
+        r = rows.setdefault(j["node"], {"done": [], "failed": [], "run": [], "wait": [], "mem": []})
+        if j.get("mem_mb"):
+            r["mem"].append(j["mem_mb"] / 1024)
+        if j.get("status") in ("done", "failed"):
+            r[j["status"]].append(1)
+            disp = [h["t"] for h in j.get("history", []) if h.get("event") == "dispatched"]
+            if disp and j.get("finished_at"):
+                r["run"].append(j["finished_at"] - disp[-1])
+                r["wait"].append(disp[0] - j["created"])
+
+    def avg(xs: List[float]) -> str:
+        return f"{sum(xs) / len(xs) / 60:.1f}m" if xs else "-"
+    say(f"last {a.days} day(s)")
+    say(f"{'node':<14}{'done':>6}{'failed':>8}{'avg run':>10}{'avg wait':>10}{'mem/job p90':>13}")
+    for n in sorted(rows):
+        r = rows[n]
+        mem = f"{p90(r['mem']):.1f}G" if r["mem"] else "-"
+        say(f"{n:<14}{len(r['done']):>6}{len(r['failed']):>8}{avg(r['run']):>10}{avg(r['wait']):>10}{mem:>13}")
+    allw = [w for r in rows.values() for w in r["wait"]]
+    say(f"pool: {sum(len(r['done']) for r in rows.values())} done · average wait before a node took a job: {avg(allw)}" if allw else "pool: no finished jobs yet")
+
+
 # ── cli ──────────────────────────────────────────────────────────────────────
 def main(argv: Optional[List[str]] = None) -> None:
     p = argparse.ArgumentParser(prog="scaleout", description="Spread coding-agent jobs across the machines on your network.")
@@ -1233,7 +1485,8 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     def node_opts(s: argparse.ArgumentParser) -> None:
         s.add_argument("--dir", default="~/scaleout-work", help="default working folder on the node")
-        s.add_argument("--max-jobs", type=int, default=2)
+        s.add_argument("--max-jobs", type=int, default=None, help="parallel jobs (default: 2, or what `scaleout bench` measures)")
+        s.add_argument("--price", type=int, help="what the machine cost you (any currency) - bench shows score per 10k")
         s.add_argument("--agent", default="claude", help="claude | codex | gemini | any command reading the prompt on stdin")
         s.add_argument("--tags", default="", help="comma separated, e.g. xcode,gpu")
 
@@ -1276,6 +1529,16 @@ def main(argv: Optional[List[str]] = None) -> None:
     s = sp.add_parser("update", help="push this version to nodes"); s.add_argument("names", nargs="*"); s.set_defaults(fn=cmd_update)
     s = sp.add_parser("config", help="show/set defaults (or --node NAME settings)"); s.add_argument("key", nargs="?"); s.add_argument("value", nargs="?"); s.add_argument("--node"); s.set_defaults(fn=cmd_config)
 
+    s = sp.add_parser("bench", help="score nodes (100 = one M1 8GB Mac mini) and track how the pool grows; --load runs a load test")
+    s.add_argument("names", nargs="*"); s.add_argument("--apply", action="store_true", help="set each node's max_jobs to the measured slots")
+    s.add_argument("--load", action="store_true", help="push synthetic build jobs through the real scheduler and time them")
+    s.add_argument("--jobs", type=int, default=0, help="with --load: how many (default 3 per slot)")
+    s.add_argument("--max", type=int, default=1800, help="with --load: give up after this many seconds")
+    s.add_argument("--history", action="store_true"); s.set_defaults(fn=cmd_bench)
+    s = sp.add_parser("tune", help="suggest (or --apply) max_jobs per node from the memory real jobs used")
+    s.add_argument("--apply", action="store_true"); s.add_argument("--days", type=int, default=14); s.set_defaults(fn=cmd_tune)
+    s = sp.add_parser("stats", help="real work done per node: jobs, failures, run and wait times, memory per job")
+    s.add_argument("--days", type=int, default=7); s.set_defaults(fn=cmd_stats)
     s = sp.add_parser("tick", help="run one scheduling round"); s.set_defaults(fn=cmd_tick)
     s = sp.add_parser("daemon", help="schedule forever (installed by install-daemon)"); s.add_argument("--interval", type=int, default=15); s.set_defaults(fn=cmd_daemon)
     s = sp.add_parser("install-daemon", help="run the scheduler in the background (launchd / systemd --user)"); s.set_defaults(fn=cmd_install_daemon)

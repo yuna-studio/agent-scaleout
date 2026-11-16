@@ -43,7 +43,7 @@ def make_node(name: str) -> Path:
         (b / d).mkdir()
     shutil.copy(ROOT / "node/unix/ctl.sh", b / "bin/ctl")
     shutil.copy(ROOT / "node/unix/runner.sh", b / "bin/runner.sh")
-    (b / "node.conf").write_text(f"NAME={name}\nWORK_ROOT=~/work\nMAX_JOBS=1\nAGENT=claude\nMIN_FREE_GB=0\nMIN_FREE_MEM_PCT=0\nRUNNER=manual\nDEVICE_SCAN=off\n")
+    (b / "node.conf").write_text(f"NAME={name}\nWORK_ROOT=~/work\nMAX_JOBS=1\nAGENT=claude\nMIN_FREE_GB=0\nMIN_FREE_MEM_PCT=0\nRUNNER=manual\nDEVICE_SCAN=off\nLINGER_S=0\n")
     (b / "devices.cache").write_text('{"android":0,"ios":0}')
     (h / ".local/bin").mkdir(parents=True)
     (h / ".local/bin/claude").write_text(STUB)
@@ -256,6 +256,28 @@ class E2E(unittest.TestCase):
         self.assertEqual((so.load_job(a)["status"], so.load_job(b)["status"], so.load_job(b)["node"]), ("done", "done", "n2"))
         so.cmd_cancel(type("A", (), {"job": c})())
         self.assertEqual(so.fmt_devices({"devices": {"android": 1, "ios": 2}}), "A1 I2")
+
+    def test_95_bench_and_tune(self):
+        self.assertEqual(so.bench_score({"single_mbps": 55, "multi_mbps": 230, "mem_total_gb": 8})["score"], 100)
+        self.assertEqual(so.bench_score({"single_mbps": 55, "multi_mbps": 230, "mem_total_gb": 16})["score"], 200)
+        self.assertEqual(so.bench_score({"single_mbps": 55, "multi_mbps": 230, "mem_total_gb": 4})["slots"], 0)
+        so.run_bench(["n1", "n2"])
+        h = so.bench_history()[-1]
+        self.assertEqual(set(h["nodes"]), {"n1", "n2"})
+        self.assertGreater(h["total"], 0)
+        # five finished jobs that each added 4 GB -> a 16 GB node with 3 GB idle fits 3 of them
+        cfg = so.load_cfg()
+        st = json.loads((TMP / "state/nodes/n1.json").read_text()); st.update({"mem_total_gb": 16, "idle_used_gb": 3}); so.write_json(TMP / "state/nodes/n1.json", st)
+        for i in range(5):
+            jid = so.submit_job(cfg, f"m{i}", node="n1")
+            j = so.load_job(jid); j.update({"status": "done", "node": "n1", "mem_mb": 4096, "finished_at": so.now()}); so.save_job(j)
+        h["nodes"]["n1"]["cpu_slots"] = 99; so.write_json(TMP / "state/bench.json", [h])
+        so.tune(so.load_cfg(), apply=True, quiet=True)
+        self.assertEqual(so.load_cfg()["nodes"]["n1"]["max_jobs"], 3)
+        self.assertIn("MAX_JOBS=3", (HOMES["n1"] / ".scaleout/node.conf").read_text())
+        cfg = so.load_cfg(); cfg["nodes"]["n1"]["max_jobs"] = 1; cfg["nodes"]["n1"]["max_jobs_fixed"] = True; so.save_cfg(cfg)
+        so.tune(so.load_cfg(), apply=True, quiet=True)
+        self.assertEqual(so.load_cfg()["nodes"]["n1"]["max_jobs"], 1, "hand-set max_jobs is never changed")
 
     def test_99_helpers(self):
         self.assertEqual(so.parse_setup("x\nSCALEOUT_USER bob\nSCALEOUT_AGENTS [\"claude\"]\n")["user"], "bob")

@@ -11,6 +11,11 @@ OS="$(uname -s)"
 VERSION="__VERSION__"
 
 j() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }   # JSON-escape a short string
+ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time*1000' 2>/dev/null || python3 -c 'import time; print(int(time.time()*1000))' 2>/dev/null || echo "$(date +%s)000"; }
+model() {
+  if [ "$OS" = Darwin ]; then echo "$(sysctl -n machdep.cpu.brand_string 2>/dev/null) · $(sysctl -n hw.model 2>/dev/null)"
+  else sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo 2>/dev/null | head -1; fi
+}
 
 mem_free_pct() {
   if [ "$OS" = Darwin ]; then sysctl -n kern.memorystatus_level 2>/dev/null || echo 0
@@ -84,7 +89,7 @@ case "$verb" in
     if [ ! -d "$d" ]; then echo '{"state":"missing"}'; exit 0; fi
     now="$(date +%s)"
     hb="$(stat -f %m "$d/heartbeat" 2>/dev/null || stat -c %Y "$d/heartbeat" 2>/dev/null || echo "$now")"
-    if [ -f "$d/rc" ]; then printf '{"state":"done","rc":%s}\n' "$(tr -dc '0-9' < "$d/rc")"
+    if [ -f "$d/rc" ]; then printf '{"state":"done","rc":%s,"mem_mb":%s}\n' "$(tr -dc '0-9' < "$d/rc")" "$(cat "$d/mem_mb" 2>/dev/null || echo 0)"
     elif [ -f "$d/started" ]; then printf '{"state":"running","heartbeat_age":%s}\n' "$((now - hb))"
     elif [ -f "$B/queue/$1" ]; then echo '{"state":"queued"}'
     else echo '{"state":"lost"}'; fi ;;
@@ -123,6 +128,39 @@ case "$verb" in
       command -v docker >/dev/null && docker system prune -af >/dev/null 2>&1
     fi
     echo "disk_free_gb $before -> $(disk_free_gb)" ;;
+
+  bench)  # hardware probe for `scaleout bench`: gzip of random data on one core and on all cores, disk write, memory
+    t="$B/bench.tmp"; rm -rf "$t"; mkdir -p "$t"
+    head -c 33554432 /dev/urandom > "$t/r"
+    a="$(ms)"; gzip -c "$t/r" > /dev/null; gzip -c "$t/r" > /dev/null; s1=$(( $(ms) - a ))
+    n="$(cpus)"; a="$(ms)"; i=0
+    while [ "$i" -lt "$n" ]; do ( gzip -c "$t/r" > /dev/null; gzip -c "$t/r" > /dev/null ) & i=$((i + 1)); done; wait
+    s2=$(( $(ms) - a ))
+    a="$(ms)"; i=0; while [ "$i" -lt 16 ]; do cat "$t/r" >> "$t/d"; i=$((i + 1)); done; sync; s3=$(( $(ms) - a ))
+    rm -rf "$t"
+    [ "$s1" -gt 0 ] || s1=1; [ "$s2" -gt 0 ] || s2=1; [ "$s3" -gt 0 ] || s3=1
+    printf '{"single_mbps":%s,"multi_mbps":%s,"disk_write_mbps":%s,"cpus":%s,"mem_total_gb":%s,"mem_free_pct":%s,"disk_free_gb":%s,"model":"%s"}\n' \
+      "$((64000 / s1))" "$((64000 * n / s2))" "$((512000 / s3))" "$n" "$(mem_total_gb)" "$(mem_free_pct)" "$(disk_free_gb "${WORK_ROOT:-$HOME}")" "$(j "$(model)")" ;;
+
+  loadjob)  # synthetic mobile job for `scaleout bench --load`: holds ~2.5 GB the whole time and alternates
+            # "waiting for the model" (sleep) with build bursts on 4 cores, like an agent that edits, builds, tests
+    t="$B/work/load.$$"; mkdir -p "$t"; head -c 33554432 /dev/urandom > "$t/r"; touch "$t/hold"
+    a="$(ms)"
+    perl -e 'open(F, "<", $ARGV[0]) or exit; local $/; my $r = <F>; my $x = $r x 78; sleep 1 while -e $ARGV[1];' "$t/r" "$t/hold" &
+    hp=$!; phase=0
+    while [ "$phase" -lt 3 ]; do
+      sleep "${LOAD_WAIT_S:-8}"; w=0; pids=""
+      while [ "$w" -lt 4 ]; do ( i=0; while [ "$i" -lt "${LOAD_ROUNDS:-12}" ]; do gzip -c "$t/r" > /dev/null; i=$((i + 1)); done ) & pids="$pids $!"; w=$((w + 1)); done
+      for p in $pids; do wait "$p"; done
+      phase=$((phase + 1))
+    done
+    i=0; while [ "$i" -lt 16 ]; do cat "$t/r" >> "$t/d"; i=$((i + 1)); done; sync
+    rm -f "$t/hold"; wait "$hp" 2>/dev/null; rm -rf "$t"
+    e=$(( $(ms) - a ))
+    printf '{"result":"load job: %s ms on %s","ms":%s}\n' "$e" "$(j "$(hostname)")" "$e" ;;
+
+  conf)  # conf KEY VALUE  — set one node.conf value
+    f="$B/node.conf"; touch "$f"; grep -v "^$1=" "$f" > "$f.tmp"; echo "$1=$2" >> "$f.tmp"; mv "$f.tmp" "$f"; echo ok ;;
 
   recv)  # recv <dir-relative-to-home-or-abs>  — tar on stdin
     t="${1/#\~/$HOME}"; mkdir -p "$t" && tar -xf - -C "$t" && echo ok ;;

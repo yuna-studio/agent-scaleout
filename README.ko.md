@@ -51,6 +51,12 @@ scaleout exec build-01 -- df -h                    # 노드에서 아무 명령
 - **실기기:** 노드에 꽂힌 안드로이드 · 아이폰 수를 세요(`scaleout status`의 `A1 I1`). `--tags android-device`나 `ios-device`를 붙인 일은 빈 폰이 있는 노드에만, 폰 하나에 한 일씩 가요. 에뮬레이터 하나가 메모리 약 4.5GB를 쓰니, 8GB 노드는 실기기를 꽂아 쓰면 좋아요.
 - **기기 전체 정리:** Docker prune, 시뮬레이터 정리는 사람이 `scaleout cleanup 노드 --deep`으로 부를 때만 해요.
 
+## 벤치마크 · 부하 시험 · 메모리 튜닝
+- **점수:** 100점 = M1 8GB 맥미니 한 대가 모바일 일(에이전트 + 빌드 + 테스트)을 하나씩 할 때. `scaleout add 이름 주소 --price 200000`으로 붙이면 알아서 재고 「100점 더함 · 만원당 5점 · 풀 200 → 300(1.5배)」처럼 보여 줘요.
+- **명령:** `scaleout bench`(다시 재기) · `bench --load`(가짜 빌드 일로 실제 배정 경로 부하 시험) · `bench --history`(풀이 얼마나 커졌나) · `stats`(실제 일 · 실패 · 걸린 시간 · 일당 메모리) · `tune --apply`(실제 일이 쓴 메모리로 동시 일 수 맞추기, 데몬이 하루 한 번 자동).
+- **주의:** 같은 와이파이인데 서로 핑이 안 되면 공유기의 무선 격리(AP isolation) 때문이에요. 끄거나, 랜선으로 꽂거나, 터널 · Tailscale을 쓰세요.
+- **macOS 외장 디스크:** 백그라운드 서비스(launchd)는 외장 USB 디스크를 못 읽어요. 작업 폴더 · 툴체인 · 캐시는 내장에 두세요(`relocate.sh`가 막아 줘요).
+
 ## 그 밖
 - **스킬 동기화:** 오케스트레이터의 `~/.claude/skills · agents · commands`가 바뀌면 일 보내기 전에 노드로 자동 복사돼요(`scaleout sync-skills`로 직접도 가능).
 - **GitHub 러너:** `scaleout runner add 노드 --org 조직`으로 노드에 자체 호스팅 러너를 깔아요.

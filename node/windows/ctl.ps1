@@ -23,6 +23,8 @@ function Kick { Start-ScheduledTask -TaskName "scaleout-runner" -ErrorAction Sil
 
 switch ($Verb) {
   "version" { $Version }
+  "bench" { '{"error":"bench is not available on Windows nodes yet"}' }
+  "conf" { $f = Join-Path $B "node.conf"; $l = @(); if (Test-Path $f) { $l = @(Get-Content $f | Where-Object { $_ -notmatch "^$($Rest[0])=" }) }; $l += "$($Rest[0])=$($Rest[1])"; $l | Set-Content $f; "ok" }
   "metrics" {
     $cpu = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
     $n = [Environment]::ProcessorCount

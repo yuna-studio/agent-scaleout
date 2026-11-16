@@ -147,6 +147,31 @@ So an 8 GB node runs one job with a real phone (no emulator), a 16 GB node runs 
 limit after that. 256 GB of disk is enough for Xcode, one simulator runtime, the Android SDK and caches (the node cleans
 itself below 8 GB free). Start with `--max-jobs 1` on 8 GB nodes; the node's memory guard also holds extra jobs.
 
+## Benchmark, load test, memory tuning
+
+How much did that second-hand machine add? Every node gets a score; **100 = one M1 Mac mini with 8 GB running one mobile
+job (agent + build + test) at a time.** `scaleout add` benchmarks new nodes automatically.
+
+```bash
+scaleout add m1-b alice@192.168.1.31 --price 200000   # what you paid (any currency)
+#   m1-b added 100 points for 200,000 -> 5.0 points per 10k
+#   pool score 300  (was 200, +100, 1.50x)
+scaleout bench            # re-score all nodes: CPU (1 core / all cores), memory, disk -> job slots and score
+scaleout bench --load     # load test: synthetic build jobs through the real scheduler, timed end to end
+scaleout bench --history  # how the pool grew
+scaleout stats            # real jobs per node: done, failed, run and wait times, memory per job
+scaleout tune [--apply]   # max_jobs from the memory real jobs used (the daemon does this daily)
+```
+
+- **Score** = job slots × speed. Slots = min(memory slots, CPU slots): one mobile job needs ~3.5 GB on top of ~3 GB for the OS;
+  CPU slots grow with all-core speed. Speed counts only the CPU part of a job (~40 %) — the rest is waiting for the model.
+- **Load test** jobs hold ~2.5 GB, alternate waits with 4-core build bursts and write 512 MB, so slots, memory guard, dispatch
+  latency and CPU contention all show up. Load score 100 = one M1 8 GB working through the same jobs one at a time.
+  The synthetic jobs use no agent account.
+- **Memory tuning.** The node runner records how much memory each job really added (peak). Once a node has 5 finished jobs,
+  `tune` sets `max_jobs = (memory - idle use - 1 GB) / p90(memory per job)`, capped by the CPU slots. Nodes added with an
+  explicit `--max-jobs` are never changed.
+
 ## Skills sync
 
 `~/.claude/skills`, `~/.claude/agents` and `~/.claude/commands` on the orchestrator are copied to nodes automatically before a
@@ -203,6 +228,8 @@ scaleout runner add|remove|ls [NAME] --org ORG|--repo OWNER/REPO [--labels L] [-
 | job fails at once with rc 28 | node disk almost full → `scaleout cleanup NAME --aggressive`. |
 | tunnel never comes up | read `~/.scaleout/tunnel.log` on the node; the LAN route still works when the node is home. |
 | pasted commands break | chat apps can turn spaces into non-breaking spaces; invites are one base64 line for that reason. |
+| same Wi-Fi, but nodes cannot reach each other (no ping) | the router isolates Wi-Fi clients ("AP / client isolation"). Turn it off, plug the machines into the router or a switch with Ethernet, or use a tunnel / Tailscale (`scaleout add NAME user@100.x.y.z`). |
+| a macOS service fails with "Operation not permitted" | launchd services cannot read external USB disks. Keep `--dir`, toolchains and caches on the internal disk. |
 
 ## Bonus: relocate heavy folders to another disk
 
@@ -215,6 +242,10 @@ tools/relocate.sh swap /Volumes/BigSSD ~/workspace ~/.gradle    # 2) quick re-sy
 tools/relocate.sh back ~/workspace                              # undo
 ```
 Use `KEEP_OLD=1` when the folder is the current directory of a running program (the old copy is kept aside instead of deleted).
+
+**macOS caveat:** background services (launchd: CI runners, scheduled scripts, this tool's node runner) get
+"Operation not permitted" on external USB disks. Only move folders that are used interactively (old projects, archives,
+backups). `relocate.sh` skips folders it sees in a LaunchAgent and known toolchains/caches (`FORCE=1` overrides).
 
 ## Development
 
