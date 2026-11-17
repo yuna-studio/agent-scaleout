@@ -521,6 +521,43 @@ class E2E(unittest.TestCase):
         finally:
             srv.close()
 
+    def test_99d_idle_work_trees_reclaimed(self):
+        # repo work trees keep build caches between jobs; idle ones go (least recently used first), busy ones stay
+        home = TMP / "reclaim-home"
+        (home / ".scaleout/bin").mkdir(parents=True)
+        ctl = home / ".scaleout/bin/ctl"
+        shutil.copy(ROOT / "node/unix/ctl.sh", ctl)
+        ctl.chmod(0o755)
+        env = {k: v for k, v in os.environ.items() if k != "SCALEOUT_NODE_HOME"}
+        env["HOME"] = str(home)   # cleanup empties caches under $HOME: only the temp one
+        c = lambda *a: subprocess.run([str(ctl), *a], env=env, check=True, stdout=subprocess.PIPE).stdout.decode().strip()
+        src = TMP / "reclaim-src"
+        src.mkdir()
+        g = lambda *a: subprocess.run(["git", "-C", str(src), *a], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.decode().strip()
+        g("init", "-q"); g("config", "user.email", "t@t"); g("config", "user.name", "t")
+        (src / "a.txt").write_text("one\n"); g("add", "a.txt"); g("commit", "-qm", "init")
+        bare = c("repo-init", "r")
+        g("push", "-q", bare, "HEAD:refs/scaleout/base")
+        sha = g("rev-parse", "HEAD")
+        w1, w2, w3 = (c("repo-checkout", "r", sha) for _ in range(3))
+        self.assertEqual([Path(w).name for w in (w1, w2, w3)], ["r-wt1", "r-wt2", "r-wt3"])
+        c("repo-unlock", w1); c("repo-unlock", w2)          # w3: a job still works in it
+        old = time.time() - 5 * 86400
+        os.utime(w1, (old, old))
+        self.assertIn("work trees 1", c("gc", "3"))          # idle 5 days: gone; idle today: kept for its build cache
+        self.assertFalse(Path(w1).exists())
+        self.assertTrue(Path(w2).exists() and Path(w3).exists())
+        self.assertIn("work trees dropped 1", c("cleanup", "", "999999"))   # short of disk: every idle one goes
+        self.assertFalse(Path(w2).exists())
+        self.assertTrue(Path(w3).exists(), "never the work tree of a running job")
+        stale = time.time() - 13 * 3600                       # a crashed job's lock is stale after 12 hours
+        os.utime(w3 + ".lock", (stale, stale))
+        self.assertIn("work trees dropped 1", c("cleanup", "", "999999"))
+        self.assertEqual(list((home / ".scaleout/repos").iterdir()), [Path(bare)])
+        wl = subprocess.run(["git", "-C", bare, "worktree", "list"], check=True, stdout=subprocess.PIPE).stdout.decode()
+        self.assertEqual(wl.count("\n"), 1, wl)
+        self.assertEqual(Path(c("repo-checkout", "r", sha)).name, "r-wt1", "the next job makes its work tree again")
+
 
 if __name__ == "__main__":
     try:
