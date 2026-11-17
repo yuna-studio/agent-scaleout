@@ -294,6 +294,14 @@ class E2E(unittest.TestCase):
         so.tune(so.load_cfg(), apply=True, quiet=True)
         self.assertEqual(so.load_cfg()["nodes"]["n1"]["max_jobs"], 3)
         self.assertIn("MAX_JOBS=3", (HOMES["n1"] / ".scaleout/node.conf").read_text())
+        # measured CPU slots set the ceiling: heavy jobs (7 GB p90) must not pin a 16 GB, 2-slot node to one job,
+        # since every job's memory is checked when it is handed out
+        for i in range(5):
+            jid = so.submit_job(cfg, f"h{i}", node="n1")
+            j = so.load_job(jid); j.update({"status": "done", "node": "n1", "mem_mb": 7 * 1024, "finished_at": so.now()}); so.save_job(j)
+        h["nodes"]["n1"]["cpu_slots"] = 2; so.write_json(TMP / "state/bench.json", [h])
+        so.tune(so.load_cfg(), apply=True, quiet=True)
+        self.assertEqual(so.load_cfg()["nodes"]["n1"]["max_jobs"], 2)
         cfg = so.load_cfg(); cfg["nodes"]["n1"]["max_jobs"] = 1; cfg["nodes"]["n1"]["max_jobs_fixed"] = True; so.save_cfg(cfg)
         so.tune(so.load_cfg(), apply=True, quiet=True)
         self.assertEqual(so.load_cfg()["nodes"]["n1"]["max_jobs"], 1, "hand-set max_jobs is never changed")
