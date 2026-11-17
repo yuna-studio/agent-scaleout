@@ -236,7 +236,7 @@ scaleout bench            # re-score all nodes: CPU (1 core / all cores), memory
 scaleout bench --load     # load test: synthetic build jobs through the real scheduler, timed end to end
 scaleout bench --history  # how the pool grew
 scaleout stats            # real jobs per node: done, failed, run and wait times, memory per job
-scaleout tune [--apply]   # max_jobs from the memory real jobs used (the daemon does this daily)
+scaleout tune [--apply]   # max_jobs from the measured CPU slots (the daemon does this daily)
 ```
 
 - **Score** = job slots × speed. Slots = min(memory slots, CPU slots): one mobile job needs ~3.5 GB on top of ~3 GB for the OS;
@@ -244,9 +244,11 @@ scaleout tune [--apply]   # max_jobs from the memory real jobs used (the daemon 
 - **Load test** jobs hold ~2.5 GB, alternate waits with 4-core build bursts and write 512 MB, so slots, memory guard, dispatch
   latency and CPU contention all show up. Load score 100 = one M1 8 GB working through the same jobs one at a time.
   The synthetic jobs use no agent account.
-- **Memory tuning.** The node runner records how much memory each job really added (peak). Once a node has 5 finished jobs,
-  `tune` sets `max_jobs = (memory - idle use - 1 GB) / p90(memory per job)`, capped by the CPU slots. Nodes added with an
-  explicit `--max-jobs` are never changed.
+- **Tuning.** `tune` sets `max_jobs` to the CPU slots `scaleout bench` measured. Memory is not part of it: every job is
+  checked against the node's free memory when it is handed out (learned per node and job kind from the peak memory the
+  runner records), so a few heavy simulator jobs do not stop small jobs from running side by side. A node bench has not
+  measured falls back to `(memory - idle use - 1 GB) / p90(memory per job)` once it has 5 finished jobs. Nodes added with
+  an explicit `--max-jobs` are never changed.
 
 ## Skills sync
 

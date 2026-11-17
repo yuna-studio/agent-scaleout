@@ -58,7 +58,7 @@ DEFAULTS: Dict[str, Any] = {
     "max_load_per_cpu": 2.0,     # a busy node whose 1-minute load is above this × cores gets no new job (simulators are CPU-heavy)
     "reap_idle_min": 20,         # simulators/emulators with no test running this long are shut down (0 = never), here and on nodes       # memory a node always keeps free when the scheduler fits jobs into it
     "max_artifacts_mb": 1024,    # a job's screenshots/videos/logs larger than this stay on the node
-    "auto_tune": True,           # daily: set each node's max_jobs from the memory its real jobs used (not for --max-jobs nodes)         # job handed to a node but not started there (node short on memory) -> move it
+    "auto_tune": True,           # daily: set each node's max_jobs from its measured CPU slots (not for --max-jobs nodes)         # job handed to a node but not started there (node short on memory) -> move it
     "offline_grace_min": 10,     # node unreachable this long -> its jobs are retried elsewhere
     "retries": 2,
     "keep_job_days": 3,
@@ -1977,8 +1977,9 @@ def p90(xs: List[float]) -> float:
 
 
 def tune(cfg: Dict[str, Any], apply: bool = False, quiet: bool = False, days: int = 14) -> None:
-    """max_jobs from measured memory: (total - idle use - 1 GB headroom) / p90 of the memory one real job added,
-    capped by the CPU slots `scaleout bench` measured."""
+    """max_jobs = the CPU slots `scaleout bench` measured. Memory is checked for every job when it is handed out (it must
+    fit in the node's free memory), so the worst jobs' memory must not cap how many small ones run side by side; only a
+    node bench has not measured falls back to (total - idle use - 1 GB headroom) / p90 of the memory one real job added."""
     since = now() - days * 86400
     per: Dict[str, List[float]] = {}
     for j in all_jobs():
@@ -2001,7 +2002,7 @@ def tune(cfg: Dict[str, Any], apply: bool = False, quiet: bool = False, days: in
         idle = float(st.get("idle_used_gb") or BASE_GB)
         mem_slots = max(1, int((float(st["mem_total_gb"]) - idle - 1) // job_gb))
         cpu = int((bench.get(name) or {}).get("cpu_slots") or 99)
-        rec = max(1, min(mem_slots, cpu, 8))
+        rec = max(1, min(cpu if cpu != 99 else mem_slots, 8))
         fixed = n.get("max_jobs_fixed")
         if not quiet:
             say(f"{name:<14}{len(xs):>5}{job_gb:>12.1f}G{idle:>9.1f}G{str(st['mem_total_gb']) + 'G':>7}{(cpu if cpu != 99 else '-'):>11}{cur:>10}  {rec}{' (fixed by --max-jobs)' if fixed else ''}")
