@@ -32,6 +32,25 @@ disk_free_gb() {  # free GB of the disk holding $1 (falls back to $HOME when the
 load1() { if [ "$OS" = Darwin ]; then sysctl -n vm.loadavg | awk '{print $2}'; else cut -d' ' -f1 /proc/loadavg; fi; }
 cpus() { if [ "$OS" = Darwin ]; then sysctl -n hw.ncpu; else nproc; fi; }
 running_jobs() { local n=0 d; for d in "$B"/jobs/*/; do [ -f "$d/started" ] && [ ! -f "$d/rc" ] && n=$((n + 1)); done; echo "$n"; }
+idle_wt() {  # idle_wt <work tree> -> takes its lock when no job holds it (a lock older than 12 h was left by a crashed job)
+  [ -n "$(find "$1.lock" -maxdepth 0 -mmin +720 2>/dev/null)" ] && rm -rf "$1.lock"
+  mkdir "$1.lock" 2>/dev/null
+}
+reclaim_wts() {  # reclaim_wts <free GB wanted> [idle days] -> how many repo work trees were dropped
+  # An idle work tree of repo jobs keeps its build caches (often several GB) so the next job there builds faster. Drop them
+  # least recently used first until <free GB wanted> is free; with [idle days], also every one idle longer than that.
+  local want="$1" days="${2:-}" w r n=0
+  for w in $(ls -dtr "$B"/repos/*-wt[0-9]* 2>/dev/null); do
+    [ -f "$w/.git" ] || continue                     # work trees only: not bare copies, not locks
+    if [ "$(disk_free_gb "$B")" -ge "$want" ]; then
+      [ -n "$days" ] && [ -n "$(find "$w" -maxdepth 0 -mtime +"$days" 2>/dev/null)" ] || continue
+    fi
+    idle_wt "$w" || continue                         # a job works in it
+    rm -rf "$w"; rmdir "$w.lock" 2>/dev/null; n=$((n + 1))
+  done
+  if [ "$n" -gt 0 ]; then for r in "$B"/repos/*.git; do [ -d "$r" ] && git -C "$r" worktree prune 2>/dev/null; done; fi
+  echo "$n"
+}
 queued_jobs() { ls "$B/queue" 2>/dev/null | wc -l | tr -d ' '; }
 runner_ok() {
   if [ "${RUNNER:-}" = manual ]; then echo true; return; fi   # the user starts runner.sh some other way
@@ -127,7 +146,7 @@ case "$verb" in
     echo cancelled ;;
   rm) rm -rf "$B/jobs/$1" "$B/queue/$1" "$B/work/$1"; echo removed ;;
 
-  gc)  # gc <days>  — drop finished job folders older than N days
+  gc)  # gc <days>  — drop finished job folders, and repo work trees idle, older than N days
     days="${1:-3}"; n=0
     for d in "$B"/jobs/*/; do
       [ -f "$d/rc" ] || continue
@@ -143,24 +162,25 @@ case "$verb" in
       done
       git -C "$r" gc --auto -q 2>/dev/null
     done
-    echo "removed $n" ;;
+    echo "removed $n, work trees $(reclaim_wts 0 "$days")" ;;
 
-  cleanup)  # cleanup [aggressive]  — free disk safely; prints GB before -> after
-    before="$(disk_free_gb)"
+  cleanup)  # cleanup [aggressive|deep] [GB wanted, default 20]  — free disk safely; prints GB before -> after
+    before="$(disk_free_gb)"; want="${2:-20}"
     "$0" gc 1 >/dev/null
     rm -rf "$B"/jobs/*/out.prev 2>/dev/null
     for p in "$HOME/Library/Caches/pip" "$HOME/.cache/pip" "$HOME/Library/Caches/Homebrew" "$HOME/.cache/yarn" \
              "$HOME/Library/Developer/Xcode/DerivedData" "$HOME/.npm/_cacache" "$HOME/.cache/go-build"; do
       [ -d "$p" ] && rm -rf "$p" 2>/dev/null
     done
-    if [ "${1:-}" = aggressive ] || [ "${1:-}" = deep ]; then   # caches under $HOME only — rebuilt on demand
+    wts="$(reclaim_wts "$want")"   # idle repo work trees, least recently used first, until <GB wanted> is free
+    if [ "${1:-}" = deep ] || { [ "${1:-}" = aggressive ] && [ "$(disk_free_gb)" -lt "$want" ]; }; then   # caches under $HOME only — rebuilt on demand
       for p in "$HOME/.gradle/caches" "$HOME/.cache" "$HOME/Library/Caches"; do [ -d "$p" ] && rm -rf "$p"/* 2>/dev/null; done
     fi
     if [ "${1:-}" = deep ]; then   # only when a human asks (scaleout cleanup --deep): machine-wide
       command -v xcrun >/dev/null && xcrun simctl delete unavailable 2>/dev/null
       command -v docker >/dev/null && docker system prune -af >/dev/null 2>&1
     fi
-    echo "disk_free_gb $before -> $(disk_free_gb)" ;;
+    echo "disk_free_gb $before -> $(disk_free_gb), work trees dropped $wts" ;;
 
   bench)  # hardware probe for `scaleout bench`: gzip of random data on one core and on all cores, disk write, memory
     t="$B/bench.tmp"; rm -rf "$t"; mkdir -p "$t"
@@ -208,6 +228,7 @@ case "$verb" in
       git -C "$r" worktree prune 2>/dev/null; rm -rf "$w"
       git -C "$r" worktree add -q -f --detach "$w" "$2" >/dev/null 2>&1 || { rm -rf "$w.lock"; echo "worktree add failed" >&2; exit 1; }
     fi
+    touch "$w"   # last use: reclaim_wts drops the least recently used first
     echo "$w" ;;
   repo-result)  # repo-result <worktree> <base> <job> -> commit holding everything the job changed (the base if nothing)
     cd "$1" || exit 1

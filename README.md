@@ -131,8 +131,9 @@ Write tasks so they stand alone — the node's agent has not seen your conversat
 | free disk on a node | `< 5 GB` | no new jobs (`disk-full`) |
 | free memory on a node | `< 15 %` | no new jobs (`mem-full`) |
 | memory a job needs | `--mem`, else learned per node and job kind, else by tag (emulator 7.5 GB, simulator 4.5, phone 3.5, other 3) | a busy node gets another job only if it fits in its free memory minus `mem_reserve_gb` (1.5); jobs handed out in the last 3 minutes count as already using theirs. No fixed limit on simulators or emulators; `max_jobs` is only a CPU-based upper bound |
-| free disk on a node | `< 8 GB` | node cleanup (old job folders, package caches; below 5 GB also caches under the node's home), at most hourly |
+| free disk on a node | `< 8 GB` | node cleanup: old job folders, package caches, then idle repo work trees, least recently used first, until 20 GB is free (`cleanup_target_disk_gb`); below 5 GB also caches under the node's home if that was not enough. At most hourly, every 10 minutes while the node is `disk-full` |
 | finished job folders | 3 days | removed — results are fetched and deleted right away anyway |
+| idle repo work trees | 3 days | removed — they only keep build caches for the next job in the same repo; a running job's tree is never touched |
 | runner service missing | — | re-registered (`ctl repair`) |
 | free disk when a job starts | `< 2 GB` | job refused (exit 28) instead of filling the disk |
 | free memory when a job starts | `< 12 %` | the node holds the job (never starts a second agent into swap); after 10 min the orchestrator moves it to another node |

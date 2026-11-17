@@ -50,6 +50,7 @@ DEFAULTS: Dict[str, Any] = {
     "min_free_disk_gb": 5,       # do not dispatch to a node with less free disk
     "min_free_mem_pct": 15,      # ... or less free memory
     "cleanup_below_disk_gb": 8,  # ask the node to reclaim disk below this
+    "cleanup_target_disk_gb": 20,  # ... and to drop idle repo work trees (least recently used first) until this much is free
     "job_timeout_min": 180,
     "stall_min": 5,              # running job whose heartbeat is older than this is considered dead
     "node_wait_min": 10,
@@ -1323,8 +1324,9 @@ def maintain(cfg: Dict[str, Any], metrics: Dict[str, Dict[str, Any]]) -> None:
                 st["last_gc"] = now()
                 write_json(node_state_path(name), st)
             continue
-        if st.get("disk_free_gb", 99) < d["cleanup_below_disk_gb"] and now() - st.get("last_cleanup", 0) > 3600:
-            res = n.ctl("cleanup", "aggressive" if st.get("disk_free_gb", 99) < d["min_free_disk_gb"] else "", timeout=900)
+        full = st.get("disk_free_gb", 99) < d["min_free_disk_gb"]   # disk-full: jobs wait, so try again sooner
+        if st.get("disk_free_gb", 99) < d["cleanup_below_disk_gb"] and now() - st.get("last_cleanup", 0) > (600 if full else 3600):
+            res = n.ctl("cleanup", "aggressive" if full else "", str(d["cleanup_target_disk_gb"]), timeout=900)
             st["last_cleanup"] = now()
             st["cleanup_note"] = res.stdout.decode().strip()[-120:]
             write_json(node_state_path(name), st)
@@ -1662,7 +1664,8 @@ def cmd_exec(a) -> None:
 def cmd_cleanup(a) -> None:
     cfg = load_cfg()
     for name in a.names or [n for n, v in cfg["nodes"].items() if not v.get("local")]:
-        r = Node(name, cfg).ctl("cleanup", "deep" if a.deep else ("aggressive" if a.aggressive else ""), timeout=900)
+        r = Node(name, cfg).ctl("cleanup", "deep" if a.deep else ("aggressive" if a.aggressive else ""),
+                                str(cfg["defaults"]["cleanup_target_disk_gb"]), timeout=900)
         say(f"{name}: {r.stdout.decode().strip() or r.stderr.decode().strip()}")
 
 
