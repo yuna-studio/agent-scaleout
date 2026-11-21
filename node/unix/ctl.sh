@@ -144,6 +144,7 @@ case "$verb" in
       "$(find "$d/artifacts" -type f 2>/dev/null | wc -l | tr -d ' ')" "$(du -sk "$d/artifacts" 2>/dev/null | cut -f1 || echo 0)"
     elif [ -f "$d/started" ]; then printf '{"state":"running","heartbeat_age":%s}\n' "$((now - hb))"
     elif [ -f "$B/queue/$1" ]; then echo '{"state":"queued"}'
+    elif [ -n "$(find "$d/taken" -mmin -2 2>/dev/null)" ]; then echo '{"state":"queued"}'   # a runner took it and is starting the agent
     else echo '{"state":"lost"}'; fi ;;
 
   result) cat "$B/jobs/$1/out" 2>/dev/null ;;

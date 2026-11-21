@@ -122,7 +122,9 @@ while :; do
     while [ "$(running)" -gt 0 ] && { [ "$(mem_free_pct)" -lt "$MIN_FREE_MEM_PCT" ] || overloaded; }; do sleep 5; done
     if [ "$(mem_free_pct)" -lt "$MIN_FREE_MEM_PCT" ]; then sleep 15; continue 2; fi
     [ "$(running)" -eq 0 ] && [ ! -f "$B/devices.baseline" ] && baseline
-    id="$(basename "$f")"; rm -f "$f"
+    id="$(basename "$f")"
+    touch "$J/$id/taken" 2>/dev/null   # before the queue entry goes: between the two, `ctl state` must not see a lost job
+    rm -f "$f"
     [ -d "$J/$id" ] || continue
     run_job "$J/$id" &
   done

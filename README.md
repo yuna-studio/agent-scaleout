@@ -108,18 +108,25 @@ Exit codes: `0` ok · `1` agent failed · `2` still running · `3` no reachable 
 ## Use from Claude Code
 
 ```bash
-scaleout claude-setup          # every session on this machine: subagent + offload rules + low-memory hook
+scaleout claude-setup          # installs the Claude Code plugin scaleout@agent-scaleout
 scaleout claude-setup --remove
 ```
 
-- **Rules**: `~/.claude/CLAUDE.md` gets one import line pointing at `agents/claude/scaleout-rules.md` of the installed copy,
-  so the rules update with the tool. They tell every session what to keep local (conversation, edits, quick checks) and
-  what to send to nodes (full builds, test suites, E2E, long jobs), and how.
-- **Hook**: a `PreToolUse` hook on Bash. When this machine has less than `MIN_FREE` % memory free or a 1-minute load
-  above `MAX_LOAD_PER_CPU` × cores (`~/.config/scaleout/hook.conf`, defaults 25 and 3) and a node is healthy, heavy commands (`flutter build/test`, `xcodebuild`,
-  `gradlew assemble/test`, Maestro, Playwright, `npm test/build`, emulators) are refused with a message telling Claude
-  to send them to a node. `SCALEOUT_LOCAL=1` in a command bypasses it. Everything else passes.
-- The `scaleout` subagent relays a task to a node and returns the report verbatim. In any session:
+The plugin is read from the installed package (`~/.local/share/agent-scaleout/plugin`), so `scaleout update` keeps it
+current. It carries:
+
+- **Offload hook** (`PreToolUse` on Bash): while a node has room, heavy commands (`flutter build/test`, `xcodebuild`,
+  `gradlew assemble/test`, Maestro, Playwright, `npm test/build`, emulators) are refused here with a message naming the
+  least busy machines and showing how to queue several items at once. The pool has several machines; work run here runs
+  one at a time. `SCALEOUT_LOCAL=1` in a command bypasses it (a device attached here). `~/.config/scaleout/hook.conf`:
+  `OFFLOAD=always` (default) · `OFFLOAD=pressure` (only when this machine has less than `MIN_FREE` % memory free or load
+  above `MAX_LOAD_PER_CPU` × cores, defaults 25 and 3) · `OFFLOAD=off`.
+- **Rules for every session** (`SessionStart`): what to keep here (conversation, edits, quick checks), what to send to the
+  pool, and how: split independent items, queue them all with `scaleout submit`, keep working, collect with
+  `scaleout wait`. Items do not have to stay in the session.
+- **Record of heavy commands run here** (`PostToolUse`): `scaleout top` shows them next to the jobs.
+- **The `scaleout` subagent** relays one task to the pool and returns the report verbatim; start one per item, several
+  in one message. **`/scaleout:status`**, **`/scaleout:top`**, **`/scaleout:usage`**.
 
 > "Use the scaleout subagent to run the full E2E suite on a free machine and report failures. Repo: …, branch: …, push fixes to a new branch."
 

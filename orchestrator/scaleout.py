@@ -33,7 +33,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "0.8.1"
+VERSION = "0.9.0"
 HOME = Path.home()
 CONF_DIR = Path(os.environ.get("SCALEOUT_CONF", HOME / ".config" / "scaleout"))
 STATE_DIR = Path(os.environ.get("SCALEOUT_STATE", HOME / ".local" / "state" / "scaleout"))
@@ -465,11 +465,8 @@ def cmd_init(a) -> None:
         o["tunnel"] = detect_cloudflare_tunnel()
     ensure_key()
     save_cfg(cfg)
-    agents = HOME / ".claude" / "agents"
     if (HOME / ".claude").is_dir():
-        agents.mkdir(parents=True, exist_ok=True)
-        shutil.copy(PKG_ROOT / "agents" / "claude" / "scaleout.md", agents / "scaleout.md")
-        say("Claude Code subagent 'scaleout' installed: ~/.claude/agents/scaleout.md")
+        say("Claude Code: run `scaleout claude-setup` to install the scaleout plugin (offload hook, rules, subagent, commands)")
     say(f"orchestrator ready (agent-scaleout {VERSION}) · user {o['user']} · LAN {o['lan'] or '?'}")
     t = o.get("tunnel") or {}
     say(f"  reverse tunnel for off-LAN nodes: {t['host']}" if t.get("host") else "  nodes connect over the LAN (add a tunnel later with: scaleout init --tunnel-host HOST [--tunnel-proxy CMD])")
@@ -2575,42 +2572,94 @@ SHARE = HOME / ".local" / "share" / "agent-scaleout"
 RULES_BEGIN, RULES_END = "<!-- agent-scaleout: offload rules (scaleout claude-setup) -->", "<!-- /agent-scaleout -->"
 
 
-def cmd_claude_setup(a) -> None:
-    """Every Claude Code session on this machine: the scaleout subagent, the offload rules (imported into
-    ~/.claude/CLAUDE.md from the installed copy, so updates follow) and the low-memory offload hook."""
-    claude = HOME / ".claude"
-    claude.mkdir(exist_ok=True)
-    rules = SHARE / "agents" / "claude" / "scaleout-rules.md"
-    hook = SHARE / "agents" / "claude" / "offload-hook.sh"
-    md = claude / "CLAUDE.md"
-    text = md.read_text() if md.exists() else ""
-    text = re.sub(re.escape(RULES_BEGIN) + r".*?" + re.escape(RULES_END) + r"\n?", "", text, flags=re.S).rstrip("\n")
-    if not a.remove:
-        text += f"\n\n{RULES_BEGIN}\n@{str(rules).replace(str(HOME), '~', 1)}\n{RULES_END}\n"
-    md.write_text(text.lstrip("\n") if text.strip() else "")
-    say(f"{'removed' if a.remove else 'imported'} offload rules {'from' if a.remove else 'in'} {md}")
+def cmd_hook(a) -> None:
+    """`scaleout hook pre|post|session`: what the Claude Code plugin's hooks run. The logic lives in the installed package
+    (agents/claude), so a scaleout update updates the hooks too."""
+    base = SHARE / "agents" / "claude"
+    if not base.is_dir():
+        base = PKG_ROOT / "agents" / "claude"
+    if a.event in ("pre", "post"):
+        script = base / ("offload-hook.sh" if a.event == "pre" else "post-hook.sh")
+        if not script.exists():
+            sys.exit(0)   # never get in the way of a command
+        os.execv("/bin/bash", ["bash", str(script)])
+    if a.event == "session":   # the offload rules, as context for every new session on this machine
+        if not CONFIG.exists():
+            sys.exit(0)   # not an orchestrator: nothing to say
+        rules = (base / "scaleout-rules.md").read_text() if (base / "scaleout-rules.md").exists() else ""
+        if rules:
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": rules}}, ensure_ascii=False))
 
+
+def _manual_setup_remove() -> List[str]:
+    """Take out what earlier versions put in by hand: the rules import in ~/.claude/CLAUDE.md, the hooks in settings.json
+    and ~/.claude/agents/scaleout.md (the plugin carries all three now)."""
+    claude, done = HOME / ".claude", []
+    md = claude / "CLAUDE.md"
+    if md.exists():
+        text = md.read_text()
+        new = re.sub(re.escape(RULES_BEGIN) + r".*?" + re.escape(RULES_END) + r"\n?", "", text, flags=re.S)
+        if new != text:
+            md.write_text(new.rstrip("\n") + "\n" if new.strip() else ""); done.append(f"rules import in {md}")
     sp = claude / "settings.json"
-    cfg = json.loads(sp.read_text()) if sp.exists() else {}
     if sp.exists():
-        shutil.copy(sp, sp.with_suffix(".json.scaleout-bak"))
-    post = SHARE / "agents" / "claude" / "post-hook.sh"
-    for event, script in (("PreToolUse", hook), ("PostToolUse", post), ("PostToolUseFailure", post)):
-        hs = cfg.setdefault("hooks", {}).setdefault(event, [])
-        hs[:] = [e for e in hs if not any(script.name in h.get("command", "") for h in e.get("hooks", []))]
-        if not a.remove:   # PostToolUse*: closes the record of a heavy command a session ran here (the queue shows it)
-            hs.append({"matcher": "Bash", "hooks": [{"type": "command", "timeout": 10, "command": f'[ ! -x "{script}" ] || "{script}"'}]})
-        if not hs:
-            cfg["hooks"].pop(event)
-    if not cfg["hooks"]:
-        cfg.pop("hooks")
-    sp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
-    say(f"{'removed' if a.remove else 'installed'} the low-memory offload hook and the queue's record of heavy commands run here {'from' if a.remove else 'in'} {sp}"
-        + ("" if a.remove else "  (threshold: MIN_FREE in ~/.config/scaleout/hook.conf, default 25 %)"))
-    if not a.remove:
-        (claude / "agents").mkdir(exist_ok=True)
-        shutil.copy(PKG_ROOT / "agents" / "claude" / "scaleout.md", claude / "agents" / "scaleout.md")
-        say("scaleout subagent: ~/.claude/agents/scaleout.md")
+        cfg = json.loads(sp.read_text())
+        hooks, n = cfg.get("hooks") or {}, 0
+        for event in list(hooks):
+            keep = [e for e in hooks[event] if not any(x in h.get("command", "") for h in e.get("hooks", [])
+                                                      for x in ("offload-hook.sh", "post-hook.sh", "scaleout hook"))]
+            n += len(hooks[event]) - len(keep)
+            if keep:
+                hooks[event] = keep
+            else:
+                hooks.pop(event)
+        if n:
+            shutil.copy(sp, sp.with_suffix(".json.scaleout-bak"))
+            if hooks:
+                cfg["hooks"] = hooks
+            else:
+                cfg.pop("hooks", None)
+            sp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n"); done.append(f"{n} hook(s) in {sp}")
+    ag = claude / "agents" / "scaleout.md"
+    if ag.exists():
+        ag.unlink(); done.append(str(ag))
+    return done
+
+
+def cmd_claude_setup(a) -> None:
+    """Every Claude Code session on this machine gets scaleout through its plugin: the offload hook (heavy work goes to the
+    pool while a node has room), the rules as session context, the relay subagent and /scaleout:status · top · usage.
+    The plugin is read from the installed package (~/.local/share/agent-scaleout), so `scaleout update` keeps it current."""
+    claude_bin = shutil.which("claude") or str(HOME / ".local" / "bin" / "claude")
+    market = SHARE if (SHARE / ".claude-plugin" / "marketplace.json").exists() else PKG_ROOT
+    for x in _manual_setup_remove():
+        say(f"removed the old manual setup: {x}")
+    if a.remove:
+        r = run([claude_bin, "plugin", "uninstall", "scaleout@agent-scaleout"], timeout=120)
+        say("plugin removed" if r.returncode == 0 else f"plugin: {(r.stderr or r.stdout).decode().strip()[-200:]}")
+        return
+    if not Path(claude_bin).exists():
+        die(E_USAGE, "Claude Code not found (install it, then run scaleout claude-setup again)")
+    listed = run([claude_bin, "plugin", "marketplace", "list"], timeout=120).stdout.decode()
+    if "agent-scaleout" not in listed:
+        r = run([claude_bin, "plugin", "marketplace", "add", str(market)], timeout=300)
+        if r.returncode != 0:
+            die(E_USAGE, f"could not add the plugin marketplace {market}: {(r.stderr or r.stdout).decode().strip()[-300:]}")
+    else:
+        run([claude_bin, "plugin", "marketplace", "update", "agent-scaleout"], timeout=300)
+    plugins = run([claude_bin, "plugin", "list"], timeout=120).stdout.decode()
+    if "scaleout@agent-scaleout" in plugins:
+        r = run([claude_bin, "plugin", "update", "scaleout@agent-scaleout"], timeout=300)
+    else:
+        r = run([claude_bin, "plugin", "install", "scaleout@agent-scaleout"], timeout=300)
+    if r.returncode != 0:
+        die(E_USAGE, f"plugin install failed: {(r.stderr or r.stdout).decode().strip()[-300:]}")
+    say(f"Claude Code plugin scaleout@agent-scaleout installed from {market}: offload hook, rules for every new session,"
+        " the scaleout subagent, /scaleout:status · top · usage")
+    conf = CONF_DIR / "hook.conf"
+    mode = re.search(r"^OFFLOAD=(\w+)", conf.read_text(), re.M).group(1) if conf.exists() and re.search(r"^OFFLOAD=", conf.read_text(), re.M) else "always"
+    say(f"offload: {mode} (heavy builds and tests go to the pool while a node has room; set OFFLOAD=pressure or off in {conf})")
+    say("running sessions take the hook at once; the rules reach sessions started from now on")
 
 
 # ── commands: usage + top ────────────────────────────────────────────────────
@@ -3274,7 +3323,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     s.add_argument("names", nargs="*"); s.add_argument("--flutter", help="versions, comma separated (default: this machine's fvm versions)")
     s.add_argument("--android", help="platforms, e.g. android-35,android-36"); s.add_argument("--skip", help="e.g. firebase,android,xcode")
     s.add_argument("--dry-run", action="store_true"); s.set_defaults(fn=cmd_provision)
-    s = sp.add_parser("claude-setup", help="make every Claude Code session here offload heavy work (rules + low-memory hook)")
+    s = sp.add_parser("claude-setup", help="install the Claude Code plugin: offload hook, rules for every session, relay subagent, /scaleout commands")
     s.add_argument("--remove", action="store_true"); s.set_defaults(fn=cmd_claude_setup)
     s = sp.add_parser("top", help="live dashboard: orchestrator + nodes (memory, disk, load, jobs) and Claude tokens; low CPU")
     s.add_argument("-i", "--interval", type=int, default=5); s.add_argument("--once", action="store_true"); s.set_defaults(fn=cmd_top)
@@ -3285,6 +3334,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     s = sp.add_parser("rename", help="give a machine your own name (orchestrator and node are roles); no new name: back to its id")
     s.add_argument("name"); s.add_argument("new", nargs="?"); s.set_defaults(fn=cmd_rename)
     s = sp.add_parser("tick", help="run one scheduling round"); s.set_defaults(fn=cmd_tick)
+    s = sp.add_parser("hook", help=argparse.SUPPRESS); s.add_argument("event", choices=["pre", "post", "session"]); s.set_defaults(fn=cmd_hook)
     s = sp.add_parser("daemon", help="schedule forever (installed by install-daemon)"); s.add_argument("--interval", type=int, default=15); s.set_defaults(fn=cmd_daemon)
     s = sp.add_parser("install-daemon", help="run the scheduler in the background (launchd / systemd --user)"); s.set_defaults(fn=cmd_install_daemon)
 

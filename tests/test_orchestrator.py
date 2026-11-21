@@ -220,6 +220,7 @@ class E2E(unittest.TestCase):
         self.assertEqual((src / "output.txt").read_text(), "hello")
 
     def test_8_job_held_by_busy_node_moves(self):
+        settle(30)   # runners left by earlier tests must be gone, or two runners can take the same job on n2
         conf = HOMES["n1"] / ".scaleout/node.conf"
         orig = conf.read_text()
         conf.write_text(orig.replace("MIN_FREE_MEM_PCT=0", "MIN_FREE_MEM_PCT=101"))   # n1 "never has enough memory"

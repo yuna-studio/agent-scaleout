@@ -1,0 +1,15 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "agent-scaleout",
+  "description": "agent-scaleout: spread coding-agent work across the machines on your network",
+  "owner": { "name": "Yuna Studio" },
+  "plugins": [
+    {
+      "name": "scaleout",
+      "description": "Send heavy builds, tests and E2E to the scaleout pool and run independent items at the same time: offload hook, the rules every session gets, a relay subagent, /scaleout:status · top · usage.",
+      "source": "./plugin",
+      "category": "productivity",
+      "homepage": "https://github.com/yuna-studio/agent-scaleout"
+    }
+  ]
+}
