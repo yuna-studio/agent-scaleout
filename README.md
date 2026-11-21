@@ -57,11 +57,21 @@ pins the host key (no yes/no prompt) and runs a test job.
 scaleout invite build-02                 # macOS / Linux node
 scaleout invite build-win --os windows   # Windows 10/11 node
 ```
-It prints one line. Paste it into a terminal (or an Administrator PowerShell) on the node — in person or through any remote desktop.
+On the same network it prints a short line to type on the node, e.g.
+`bash <(curl -fsSL http://192.168.1.10:51234/Xy… 2>/dev/null || wget -qO- http://192.168.1.10:51234/Xy…)` — the orchestrator serves the
+script on its LAN address for an hour (`--serve MIN`, `0` for none) or until the invite is used. Elsewhere, paste the long line it prints too
+(or the Windows line into an Administrator PowerShell).
 On macOS it also installs Homebrew (with the Xcode command line tools) and Claude Code when they are missing
 (`--no-brew`, `--no-claude` to skip); you then run `claude` once there to sign in.
+On Linux (apt) it first sets the machine up as a node, asking for its password once: the SSH server, curl, git, build tools and JDK 17,
+no sleep or suspend, and `loginctl enable-linger` so the node runs while nobody is logged in (`--no-prep` skips it; `--autologin` also logs
+the desktop in by itself after a restart, for emulators that need a screen). It waits for automatic updates that hold the package lock.
 The line turns the SSH server on (asking for that machine's password once), downloads the node package *from the orchestrator*,
 installs it, registers the node and exchanges keys. Invite keys are single-use, expire after 24 h and can do nothing but enroll.
+
+**A node the orchestrator cannot reach** (behind a second router, or away from home): the node keeps a reverse tunnel to the orchestrator.
+It goes straight to the orchestrator's LAN address whenever that answers (a node behind a second router at home reaches it this way), and
+only otherwise through a public SSH endpoint. On Linux without Homebrew, the node fetches `cloudflared` itself when that endpoint needs it.
 
 **Nodes outside the LAN.** If the orchestrator has a public SSH endpoint, nodes keep a reverse tunnel to it and work from anywhere:
 
@@ -90,7 +100,7 @@ scaleout exec build-01 -- df -h                   # any shell command on a node
 | `--repo DIR` | work on a git repo of this machine: the node gets its current working tree (uncommitted changes too; git sends only what changed), the result comes back as branch `scaleout/JOB` |
 | `--apply` | with `--repo`: also apply the result to this working tree (never forced; conflicts are reported) |
 | `--sync DIR` | non-git folders: copied to the node before, copied back after |
-| `--tags a,b` | node requirements, e.g. `xcode`, `gpu`, `windows`; `android-device` / `ios-device` = needs a phone plugged into the node |
+| `--tags a,b` | node requirements, e.g. `xcode`, `gpu`; a node's OS counts as a tag (`mac`, `linux`, `windows`; `scaleout status` shows each machine's OS); `android-device` / `ios-device` = needs a phone plugged into the node |
 | `--timeout MIN` | hard limit (default 180) |
 
 Exit codes: `0` ok · `1` agent failed · `2` still running · `3` no reachable node · `4` usage · `5` not found.
@@ -217,7 +227,8 @@ person are reported, not attempted: Homebrew itself (admin password), Xcode (App
 ```bash
 scaleout top          # live: orchestrator + nodes (memory, swap, disk, load, jobs, phones), queue, recent jobs,
                       #   Claude sessions working now with their running subagents, tokens (subagents included)
-scaleout usage        # Claude tokens: every session on this machine (5 h / today / 7 days) and work done by each node
+scaleout usage        # Claude tokens of every machine (all sessions there): today / 7 / 30 days, the days as grass, jobs per machine
+scaleout rename macbook studio   # your own name for a machine (orchestrator and node are roles); commands take either
 ```
 `top` reads only what the daemon already collected (no SSH of its own) and sleeps between refreshes, so it costs almost no
 CPU. Tokens of this machine come from `~/.claude/projects/*/*.jsonl`, read incrementally (only new lines). Work done by a
@@ -287,7 +298,8 @@ Runners live in `~/.scaleout/gh-runners/` on the node and run as the node user (
 ```
 scaleout init [--tunnel-host H] [--tunnel-proxy CMD] [--lan IP] [--user U]
 scaleout add NAME user@host | --ssh ALIAS   [--dir D] [--max-jobs N] [--agent A] [--tags a,b] [--no-tunnel] [--no-test]
-scaleout invite NAME [--os unix|windows] [--hours 24] [--dir D] [--max-jobs N] [--agent A] [--tags a,b]
+scaleout invite NAME [--os unix|windows] [--hours 24] [--serve MIN] [--no-prep] [--autologin] [--dir D] [--max-jobs N] [--agent A] [--tags a,b]
+scaleout rename NAME [NEW]                     # your own name for a machine (orchestrator and node are roles); commands take either
 scaleout remove NAME · nodes · status [NAME…] · doctor NAME · update [NAME…] · local on|off [--max-jobs N]
 scaleout submit|run [-f FILE] [-w NODE] [-a AGENT] [-d DIR] [--sync DIR] [--repo DIR [--apply]] [--tags a,b] [--mem GB] [--cpu N] [--timeout MIN]
 scaleout wait|result|logs|cancel JOB · jobs [-n N] · gc

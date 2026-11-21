@@ -44,6 +44,7 @@ def make_node(name: str) -> Path:
         (b / d).mkdir()
     shutil.copy(ROOT / "node/unix/ctl.sh", b / "bin/ctl")
     shutil.copy(ROOT / "node/unix/runner.sh", b / "bin/runner.sh")
+    shutil.copy(ROOT / "node/unix/usage.py", b / "bin/usage.py")
     (b / "node.conf").write_text(f"NAME={name}\nWORK_ROOT=~/work\nMAX_JOBS=1\nAGENT=claude\nMIN_FREE_GB=0\nMIN_FREE_MEM_PCT=0\nRUNNER=manual\nDEVICE_SCAN=off\nLINGER_S=0\nKEEP_DEVICES=1\n")
     (b / "devices.cache").write_text('{"android":0,"ios":0}')
     (h / ".local/bin").mkdir(parents=True)
@@ -425,8 +426,150 @@ class E2E(unittest.TestCase):
         self.assertGreaterEqual(per["cost"], 0.25)
         self.assertGreaterEqual(per["busy_s"], 119)
         lines = "\n".join(so.top_lines(so.load_cfg(), type("U", (), {"window": lambda self, s: {"in": 0, "out": 0, "cache_read": 0, "cache_write": 0, "msgs": 0}})(), 5))
-        self.assertIn("WORK DONE BY NODES", lines)
+        self.assertIn("SCALEOUT JOBS BY MACHINE", lines)
+        self.assertIn("MACHINES", lines)
+        self.assertIn("macOS", lines)   # every machine's OS is on the dashboard
         self.assertIn("orchestrator", lines)
+
+    def test_98a_tokens_per_machine(self):
+        """Every session's tokens on a node, per day: a message written twice counts once; the numbers reach the orchestrator."""
+        proj = HOMES["n1"] / ".claude/projects/p"
+        (proj / "s1/subagents").mkdir(parents=True)
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+        row = lambda mid, out: json.dumps({"timestamp": ts, "message": {"id": mid, "usage": {
+            "input_tokens": 1, "output_tokens": out, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 10}}})
+        (proj / "s1.jsonl").write_text(row("m1", 5) + "\n" + row("m1", 5) + "\n" + row("m2", 7) + "\nnot json\n")
+        (proj / "s1/subagents/a.jsonl").write_text(row("m3", 9) + "\n")
+        so.write_json(so.USAGE_DAYS, {"machines": {so.LOCAL: {"days": {}, "tried": so.now()}}})   # this host's real transcripts stay out
+        cfg = so.load_cfg()
+        today = time.strftime("%Y-%m-%d")
+        d = so.collect_usage(cfg, max_age=600)["machines"]["n1"]["days"][today]
+        self.assertEqual((d["out"], d["msgs"], d["cache_read"]), (21, 3, 300))
+        with open(proj / "s1.jsonl", "a") as f:
+            f.write(row("m2", 7) + "\n" + row("m4", 1) + "\n")   # m2 again (another content block), then a new message
+        self.assertEqual(so.collect_usage(cfg, max_age=600)["machines"]["n1"]["days"][today]["out"], 21)   # asked a moment ago: kept
+        d = so.collect_usage(cfg, max_age=0)["machines"]["n1"]["days"][today]
+        self.assertEqual((d["out"], d["msgs"]), (22, 4))
+        text = "\n".join(so.tokens_lines(cfg, None, weeks=4))
+        self.assertIn("n1", text)
+        self.assertIn("Mon", text)
+        self.assertEqual(so.day_tokens({"days": {today: d}}, today), 4 + 22 + 400 + 40)
+
+    def test_98c_names_and_os(self):
+        """A machine's own name works wherever its id does; its OS counts as a tag and shows in words."""
+        cfg = so.load_cfg()
+        cfg["nodes"]["n1"]["label"] = "studio"
+        self.assertEqual((so.node_id(cfg, "studio"), so.node_id(cfg, "n1"), so.node_id(cfg, "nobody")), ("n1", "n1", "nobody"))
+        self.assertEqual((so.label_of(cfg, "n1"), so.label_of(cfg, "n2"), so.role_of(cfg, "n1"), so.role_of(cfg, so.LOCAL)),
+                         ("studio", "n2", "node", "orchestrator"))
+        self.assertEqual(so.fmt_os({"os": "Linux", "arch": "x86_64"}), "Linux x64")
+        self.assertEqual(so.fmt_os({"os": "Darwin", "arch": "arm64"}), "macOS arm64")
+        self.assertEqual(so.fmt_os({}, {"os": "windows"}), "Windows")
+        self.assertIn("mac", so.OS_TAGS["darwin"])
+        self.assertEqual((so.vlen("미니"), so.vlen(so.pad("미니", 6)), so.vlen(so.clip("abcdefgh", 5))), (4, 6, 5))
+
+    def test_98d_session_runs(self):
+        """A heavy command a session runs here (not through scaleout) is remembered by the hooks and shown with the jobs."""
+        hooks = ROOT / "agents/claude"
+        env = dict(os.environ, SCALEOUT_STATE=str(so.STATE_DIR), HOME=str(TMP / "hookhome"))   # no hook.conf, no nodes: it runs here
+        hook = lambda script, data: subprocess.run(["bash", str(hooks / script)], input=json.dumps(data).encode(), env=env,
+                                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode
+        pre = lambda tid, cmd, bg=False: hook("offload-hook.sh", {"session_id": "sess1", "cwd": "/p/app", "tool_use_id": tid,
+                                                                   "tool_input": {"command": cmd, "run_in_background": bg}})
+        self.assertEqual(pre("toolu_t1", "cd app && flutter test"), 0)
+        self.assertEqual(pre("toolu_t2", "ls -la"), 0)                              # light: not remembered
+        self.assertEqual(pre("toolu_t3", "SCALEOUT_LOCAL=1 xcodebuild test"), 0)
+        self.assertEqual(pre("toolu_t4", "npm run build", bg=True), 0)
+        self.assertEqual(sorted(p.stem for p in so.DIRECT_DIR.glob("*.json")), ["toolu_t1", "toolu_t3", "toolu_t4"])
+        self.assertEqual(hook("post-hook.sh", {"hook_event_name": "PostToolUse", "tool_use_id": "toolu_t1", "duration_ms": 5000}), 0)
+        hook("post-hook.sh", {"hook_event_name": "PostToolUseFailure", "tool_use_id": "toolu_t3", "is_interrupt": True})
+        hook("post-hook.sh", {"hook_event_name": "PostToolUse", "tool_use_id": "toolu_t4", "tool_response": {"backgroundTaskId": "bgt4"}})
+        hook("post-hook.sh", {"hook_event_name": "PostToolUse", "tool_use_id": "toolu_t2"})
+        runs = {j["id"][-2:]: j for j in so.direct_runs()}
+        self.assertEqual({k: v["status"] for k, v in runs.items()}, {"t1": "done", "t3": "cancelled", "t4": "running"})
+        self.assertEqual(runs["t1"]["what"], "flutter test")
+        self.assertAlmostEqual(runs["t1"]["finished_at"] - runs["t1"]["created"], 5, delta=0.5)
+        out = Path(f"/tmp/claude-{os.getuid()}/scaleout-test/sess1/tasks/bgt4.output")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("ok\n[exited with code 2]\n")
+        try:
+            self.assertEqual({j["id"][-2:]: j["status"] for j in so.direct_runs()}["t4"], "failed")
+        finally:
+            shutil.rmtree(out.parent.parent.parent, ignore_errors=True)
+        text = "\n".join(so.top_lines(so.load_cfg(), type("U", (), {"window": lambda self, s: {"in": 0, "out": 0, "cache_read": 0, "cache_write": 0, "msgs": 0}})(), 5))
+        self.assertIn("flutter test", text)
+        self.assertIn("in a session", text)
+
+    def test_98e_tunnel_prefers_lan(self):
+        """The reverse tunnel goes straight to the orchestrator whenever its LAN address answers, else through the tunnel host."""
+        cfg = so.load_cfg()
+        cfg["orchestrator"].update({"lan": "127.0.0.1", "ssh_port": 22, "tunnel": {"host": "orch.example.com", "proxy": "cloudflared access ssh --hostname %h"}})
+        args = so.tunnel_args(cfg, 2299)
+        self.assertEqual(args[args.index("--tunnel-lan") + 1], "127.0.0.1:22")
+        f = TMP / "tunnel-ssh-config"
+        for lan, want in (("127.0.0.1:1", "orch.example.com"), ("", "orch.example.com")):
+            env = dict(os.environ, OS=os.uname().sysname, TH="orch.example.com", TU="me", TP="2299", TSP="22",
+                       TPROXY="/bin/false access ssh --hostname %h", TLAN=lan)
+            text = subprocess.run(["bash", "-c", 'eval "$(sed -n "/^tunnel_block()/,/^}/p" "$1")"; tunnel_block', "_", str(ROOT / "node/unix/setup.sh")],
+                                  env=env, stdout=subprocess.PIPE, check=True).stdout.decode()
+            f.write_text(text)
+            self.assertIn("RemoteForward 2299 localhost:22", text)
+            self.assertEqual("Match originalhost" in text, bool(lan))
+            got = subprocess.run(["ssh", "-G", "-F", str(f), "scaleout-orchestrator"], stdout=subprocess.PIPE).stdout.decode()
+            self.assertIn(f"hostname {want}\n", got)   # port 1 on this host does not answer: the tunnel host
+        cfg["orchestrator"]["tunnel"] = {}
+        so.save_cfg(cfg)
+
+    def test_98f_invite_short_line(self):
+        """`scaleout invite` serves its script on the LAN for a short line to type; Linux basics are in it; using the invite stops it."""
+        import contextlib, io, re, urllib.request
+        cfg = so.load_cfg()
+        cfg["orchestrator"].update({"lan": "127.0.0.1", "user": "me", "tunnel": {}})
+        so.save_cfg(cfg)
+        args = so.main.__globals__["argparse"].Namespace(name="newpc", os="unix", hours=1, no_brew=True, no_claude=True, no_prep=False,
+                                                          autologin=True, serve=1, dir="~/w", max_jobs=None, price=None, agent="claude", tags=None)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            so.cmd_invite(args)
+        text = out.getvalue()
+        url = re.search(r"curl -fsSL (http://127\.0\.0\.1:\d+/\S+) ", text).group(1)
+        self.assertIn("Not on the same network? Paste this instead:", text)
+        body = ""
+        for _ in range(50):   # the server starts in the background
+            try:
+                body = urllib.request.urlopen(url, timeout=2).read().decode()
+                break
+            except OSError:
+                time.sleep(0.1)
+        self.assertIn("[0/5] Linux node basics", body)
+        self.assertIn("SO_PREP=1; SO_AUTOLOGIN=1", body)
+        self.assertIn("loginctl enable-linger", body)
+        with self.assertRaises(OSError):
+            urllib.request.urlopen(url.rsplit("/", 1)[0] + "/wrong", timeout=2)
+        shutil.rmtree(so.CONF_DIR / "invites" / "newpc", ignore_errors=True)   # what enrolling does: the server stops
+        time.sleep(6)
+        with self.assertRaises(OSError):
+            urllib.request.urlopen(url, timeout=2)
+        cfg = so.load_cfg(); cfg["nodes"].pop("newpc", None); so.save_cfg(cfg)
+
+    def test_98h_extra_tokens(self):
+        """A job's starting context (first request's whole input) is counted as tokens spent only because it ran apart."""
+        sid = "11111111-2222-3333-4444-555555555555"
+        proj = HOMES["n2"] / ".claude/projects/q"
+        proj.mkdir(parents=True, exist_ok=True)
+        row = lambda mid, i, cw, cr: json.dumps({"type": "assistant", "message": {"id": mid, "usage": {
+            "input_tokens": i, "cache_creation_input_tokens": cw, "cache_read_input_tokens": cr, "output_tokens": 5}}})
+        (proj / f"{sid}.jsonl").write_text("\n".join([row("a", 3, 20000, 0), row("a", 3, 20000, 0), row("b", 2, 500, 20003)]) + "\n")
+        out = json.loads(fake_ctl(so.Node("n2", so.load_cfg()), "job-tokens", sid).stdout.decode().strip())
+        self.assertEqual(out, {"start": 20003, "requests": 2})
+        j = so.load_job(so.submit_job(so.load_cfg(), "measured"))
+        j.update({"status": "done", "node": "n2", "dispatched_at": so.now() - 60, "finished_at": so.now(),
+                  "usage": {"in": 5, "out": 10, "cache_read": 20003, "cache_write": 20500}, "start_tokens": 20003, "requests": 2})
+        so.save_job(j)
+        per = so.job_usage(3600)["n2"]
+        self.assertGreaterEqual(per["extra"], 20003)
+        self.assertGreaterEqual(per["measured"], 1)
+        self.assertIn("extra 7d", "\n".join(so.tokens_lines(so.load_cfg(), None, weeks=2, grass=False)))
 
     def test_98b_claude_now(self):
         """Sessions working now, their running subagents (finished or stale ones left out), names from /rename."""

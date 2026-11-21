@@ -3,7 +3,8 @@
 # (`scaleout add` or the `scaleout invite` one-liner). You can also run it by hand from the unpacked package:
 #
 #   bash setup.sh --name build-01 [--dir ~/scaleout-work] [--max-jobs 2] [--agent claude|codex|gemini|"<command>"]
-#                 [--tunnel-host HOST --tunnel-user USER --tunnel-port 2201 [--tunnel-ssh-port 22] [--tunnel-proxy "cloudflared access ssh --hostname %h"]]
+#                 [--tunnel-host HOST --tunnel-user USER --tunnel-port 2201 [--tunnel-ssh-port 22] [--tunnel-proxy "cloudflared access ssh --hostname %h"]
+#                  [--tunnel-lan 192.168.1.10:22]]   (the orchestrator on the LAN: the tunnel goes there directly whenever it answers)
 #   bash setup.sh --repair       re-register services
 #   bash setup.sh --uninstall    remove services (job history in ~/.scaleout/jobs is kept)
 #
@@ -11,7 +12,7 @@
 set -u
 B="$HOME/.scaleout"; PKG="$(cd "$(dirname "$0")" && pwd)"; OS="$(uname -s)"
 NAME=""; DIR="~/scaleout-work"; MAX_JOBS=2; AGENT=claude; AGENT_CMD=""
-TH=""; TU=""; TP=""; TSP=22; TPROXY=""; MODE=install
+TH=""; TU=""; TP=""; TSP=22; TPROXY=""; TLAN=""; MODE=install
 while [ $# -gt 0 ]; do
   case "$1" in
     --name) NAME="$2"; shift 2 ;;
@@ -23,6 +24,7 @@ while [ $# -gt 0 ]; do
     --tunnel-port) TP="$2"; shift 2 ;;
     --tunnel-ssh-port) TSP="$2"; shift 2 ;;
     --tunnel-proxy) TPROXY="$2"; shift 2 ;;
+    --tunnel-lan) TLAN="$2"; shift 2 ;;
     --repair) MODE=repair; shift ;;
     --uninstall) MODE=uninstall; shift ;;
     *) echo "unknown option: $1" >&2; exit 4 ;;
@@ -37,6 +39,26 @@ ssh_block_del() {
   t="$(mktemp)"; awk '$0=="# >>> scaleout-orchestrator"{s=1;next} $0=="# <<< scaleout-orchestrator"{s=0;next} !s' "$f" > "$t" && cat "$t" > "$f"; rm -f "$t"
 }
 
+get_cloudflared() {  # a Linux node without Homebrew: cloudflared's own static build in ~/.local/bin (no sudo)
+  local arch; case "$(uname -m)" in x86_64|amd64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; armv7l) arch=arm ;; *) return 1 ;; esac
+  mkdir -p "$HOME/.local/bin"
+  curl -fsSL -o "$HOME/.local/bin/cloudflared.new" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$arch" \
+    && chmod 755 "$HOME/.local/bin/cloudflared.new" && mv -f "$HOME/.local/bin/cloudflared.new" "$HOME/.local/bin/cloudflared"
+}
+tunnel_block() {  # the ssh config block for the reverse tunnel. With --tunnel-lan, a Match rule sends it straight to the orchestrator
+                  # whenever that address answers (same network, or a router in between that lets this side out); else the tunnel host
+  printf '\n# >>> scaleout-orchestrator\n'
+  if [ -n "$TLAN" ]; then
+    local lh="${TLAN%:*}" lp="${TLAN##*:}" probe
+    [ "$lp" = "$TLAN" ] && lp=22
+    if [ "$OS" = Darwin ]; then probe="nc -z -G 2 $lh $lp"; else probe="nc -z -w 2 $lh $lp"; fi
+    printf 'Match originalhost scaleout-orchestrator exec "%s >/dev/null 2>&1"\n  HostName %s\n  Port %s\n  ProxyCommand none\n' "$probe" "$lh" "$lp"
+  fi
+  printf 'Host scaleout-orchestrator\n  HostName %s\n  Port %s\n  User %s\n' "$TH" "$TSP" "$TU"
+  printf '  IdentityFile ~/.ssh/scaleout_orchestrator\n  IdentitiesOnly yes\n'
+  [ -n "$TPROXY" ] && printf '  ProxyCommand %s\n' "$TPROXY"
+  printf '  ServerAliveInterval 30\n  ServerAliveCountMax 3\n  ExitOnForwardFailure yes\n  StrictHostKeyChecking accept-new\n  RemoteForward %s localhost:22\n# <<< scaleout-orchestrator\n' "$TP"
+}
 mac_plist() {  # mac_plist <label> <extra xml> <args...>
   local label="$1" extra="$2"; shift 2; local f="$LA/$label.plist"
   mkdir -p "$LA"
@@ -104,7 +126,7 @@ fi
 [ -n "$NAME" ] || { echo "--name is required" >&2; exit 4; }
 mkdir -p "$B/bin" "$B/queue" "$B/jobs" "$B/work" "$B/settings"; chmod 700 "$B"
 # swap files in (new inode) instead of overwriting: a running runner.sh keeps reading its own copy
-for f in ctl.sh runner.sh setup.sh gh-runner.sh provision.sh; do
+for f in ctl.sh runner.sh setup.sh gh-runner.sh provision.sh usage.py; do
   [ -f "$PKG/$f" ] || continue
   dst="$B/bin/$f"; [ "$f" = ctl.sh ] && dst="$B/bin/ctl"
   cp "$PKG/$f" "$dst.new.$$" && chmod 755 "$dst.new.$$" && mv -f "$dst.new.$$" "$dst"
@@ -144,17 +166,13 @@ if [ -n "$TH" ] && [ -n "$TP" ]; then
   if [ -n "$TPROXY" ]; then
     pbin="${TPROXY%% *}"
     if ! command -v "$pbin" >/dev/null 2>&1 && command -v brew >/dev/null 2>&1; then brew install "$pbin" >/dev/null 2>&1; fi
-    p="$(command -v "$pbin" 2>/dev/null)"; [ -n "$p" ] && TPROXY="$p ${TPROXY#* }"
+    if ! command -v "$pbin" >/dev/null 2>&1 && [ "$pbin" = cloudflared ] && [ "$OS" = Linux ]; then get_cloudflared || echo "SCALEOUT_NOTE could not fetch cloudflared"; fi
+    p="$(command -v "$pbin" 2>/dev/null || { [ -x "$HOME/.local/bin/$pbin" ] && echo "$HOME/.local/bin/$pbin"; })"; [ -n "$p" ] && TPROXY="$p ${TPROXY#* }"
   fi
   mkdir -p "$HOME/.ssh"; chmod 700 "$HOME/.ssh"
   [ -f "$HOME/.ssh/scaleout_orchestrator" ] || ssh-keygen -q -t ed25519 -N "" -f "$HOME/.ssh/scaleout_orchestrator" -C "scaleout-$NAME"
   ssh_block_del; touch "$HOME/.ssh/config"; chmod 600 "$HOME/.ssh/config"
-  {
-    printf '\n# >>> scaleout-orchestrator\nHost scaleout-orchestrator\n  HostName %s\n  Port %s\n  User %s\n' "$TH" "$TSP" "$TU"
-    printf '  IdentityFile ~/.ssh/scaleout_orchestrator\n  IdentitiesOnly yes\n'
-    [ -n "$TPROXY" ] && printf '  ProxyCommand %s\n' "$TPROXY"
-    printf '  ServerAliveInterval 30\n  ServerAliveCountMax 3\n  ExitOnForwardFailure yes\n  StrictHostKeyChecking accept-new\n  RemoteForward %s localhost:22\n# <<< scaleout-orchestrator\n' "$TP"
-  } >> "$HOME/.ssh/config"
+  tunnel_block >> "$HOME/.ssh/config"
   SIG="$( { awk '$0=="# >>> scaleout-orchestrator"{p=1} p; $0=="# <<< scaleout-orchestrator"{p=0}' "$HOME/.ssh/config"; } | shasum 2>/dev/null | cut -d' ' -f1)"
   if [ "$OS" = Darwin ]; then
     mac_plist dev.scaleout.tunnel "<key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>30</integer>
@@ -171,6 +189,33 @@ if [ -n "$TH" ] && [ -n "$TP" ]; then
     echo "SCALEOUT_NOTE no service manager for the tunnel; run: ssh -fN scaleout-orchestrator"
   fi
   echo "SCALEOUT_PUBKEY $(cat "$HOME/.ssh/scaleout_orchestrator.pub")"
+fi
+
+# Claude Code on this node opens in bypass mode (no permission prompts) with Code Mode on, on the recommended model (no "model"
+# pinned, so it follows Claude Code's recommendation) at xhigh effort — for every session here, not only
+# scaleout jobs (those keep their own deny list: sudo, pushes to protected branches, deploys). CLAUDE_DEFAULTS=off in node.conf skips it
+if [ "${CLAUDE_DEFAULTS:-on}" != off ] && command -v python3 >/dev/null 2>&1; then
+  python3 - "$HOME/.claude/settings.json" <<'PY2' && echo "SCALEOUT_NOTE claude: bypass mode, Code Mode, recommended model at xhigh by default"
+import json, os, sys
+p = sys.argv[1]
+os.makedirs(os.path.dirname(p), exist_ok=True)
+try:
+    s = json.load(open(p))
+except (OSError, ValueError):
+    s = {}
+before = json.dumps(s, sort_keys=True)
+s.setdefault("permissions", {})["defaultMode"] = "bypassPermissions"
+s["skipDangerousModePermissionPrompt"] = True
+s.setdefault("env", {})["CLAUDE_CODE_EXPERIMENTAL_CODE_MODE"] = "on"
+s.pop("model", None)            # the recommended model, whatever Claude Code recommends now
+s["effortLevel"] = "xhigh"
+if json.dumps(s, sort_keys=True) != before:
+    tmp = p + ".scaleout-tmp"
+    with open(tmp, "w") as f:
+        json.dump(s, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, p)
+PY2
 fi
 
 echo "SCALEOUT_OS $OS"
