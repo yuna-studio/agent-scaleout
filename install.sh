@@ -21,7 +21,7 @@ if [ -z "$SRC" ] || [ ! -f "$SRC/orchestrator/scaleout.py" ]; then   # piped fro
 fi
 
 mkdir -p "$DEST" "$HOME/.local/bin"
-for d in orchestrator node agents tools; do rm -rf "$DEST/$d"; cp -R "$SRC/$d" "$DEST/$d"; done
+for d in orchestrator node agents tools plugin .claude-plugin; do rm -rf "$DEST/$d"; [ -d "$SRC/$d" ] && cp -R "$SRC/$d" "$DEST/$d"; done
 cp "$SRC/README.md" "$SRC/LICENSE" "$DEST/" 2>/dev/null || true
 chmod +x "$DEST/orchestrator/scaleout.py" "$DEST/tools/"*.sh "$DEST/node/unix/"*.sh
 ln -sf "$DEST/orchestrator/scaleout.py" "$HOME/.local/bin/scaleout"
