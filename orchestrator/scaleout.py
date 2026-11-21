@@ -2032,6 +2032,19 @@ def tokens_lines(cfg: Dict[str, Any], lu: Optional["LocalUsage"], weeks: int = 1
                  + c(f"{read:>9}", C_DIM if read in ("now", "reading…") or "m ago" in read else C_WARN))
     L.append(pad(c("total", C_ACCENT, bold=True), nw + 14) + "".join(c(f"{fmt_tok(x) if x else '-':>10}", C_ACCENT, bold=True) for x in tot))
     L.append(c(pad("  output tokens", nw + 14) + "".join(f"{fmt_tok(x) if x else '-':>10}" for x in out), C_DIM))
+    # wasted by scaleout: what node jobs spent only because each ran as its own agent (the context it loaded before any work)
+    waste = [0] * len(spans)
+    for j in all_jobs():
+        if j.get("bench") or not j.get("start_tokens") or not j.get("finished_at"):
+            continue
+        d = time.strftime("%Y-%m-%d", time.localtime(j["finished_at"]))
+        for i, (_, since) in enumerate(spans):
+            if d >= since:
+                waste[i] += int(j["start_tokens"])
+    if any(waste):
+        L.append(pad(c("  wasted by scaleout", C_WARN), nw + 14) + "".join(c(f"{fmt_tok(x) if x else '-':>10}", C_WARN) for x in waste)
+                 + c(f"   {waste[1] * 100 / max(1, tot[1]):.1f}% of 7 days", C_WARN))
+        L.append(c("    = context each node job loads before any work, spent only because it ran apart (est.)", C_DIM))
     if lu is not None:
         w5 = lu.window(5 * 3600)
         L.append(c(f"  {label_of(cfg, LOCAL)}, last 5 h: {fmt_tok(tokens_of(w5))} ({fmt_tok(w5['out'])} output)", C_DIM))
@@ -2042,7 +2055,7 @@ def tokens_lines(cfg: Dict[str, Any], lu: Optional["LocalUsage"], weeks: int = 1
     nodes = sorted(set().union(*[x.keys() for x in per]))
     if nodes:
         L.append("")
-        L.append(c(f"{'SCALEOUT JOBS BY MACHINE':<30}{'5 h':>10}{'today':>10}{'7 days':>10}{'jobs 7d':>9}{'busy 7d':>9}{'$ 7d':>8}{'extra 7d':>10}", C_DIM))
+        L.append(c(f"{'SCALEOUT JOBS BY MACHINE':<30}{'5 h':>10}{'today':>10}{'7 days':>10}{'jobs 7d':>9}{'busy 7d':>9}{'$ 7d':>8}{'wasted 7d':>10}", C_DIM))
         ext = [0, 0, 0]   # extra tokens, jobs measured, all tokens of those jobs (7 days)
         for n in nodes:
             t = [x.get(n, {}) for x in per]
@@ -2052,9 +2065,8 @@ def tokens_lines(cfg: Dict[str, Any], lu: Optional["LocalUsage"], weeks: int = 1
                      + f"{int(t[2].get('jobs', 0)):>9}{t[2].get('busy_s', 0) / 3600:>8.1f}h{t[2].get('cost', 0):>8.2f}"
                      + c(f"{fmt_tok(e) if t[2].get('measured') else '-':>10}", C_WARN if e else C_DIM))
         if ext[1]:
-            L.append(c(f"  extra 7d: {fmt_tok(ext[0])} over {ext[1]} jobs = {ext[0] * 100 / max(1, ext[2]):.1f}% of their tokens"
-                       f" — spent only because each ran as its own agent", C_DIM))
-            L.append(c("  = the context a job loads before any work · not counted: files it re-read, logs this session skipped", C_DIM))
+            L.append(c(f"  wasted 7d: {fmt_tok(ext[0])} over {ext[1]} jobs = {ext[0] * 100 / max(1, ext[2]):.1f}% of their tokens"
+                       f" · not counted: files a job re-read, logs this session skipped", C_DIM))
     return L
 
 

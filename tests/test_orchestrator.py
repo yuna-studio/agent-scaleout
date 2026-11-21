@@ -569,7 +569,7 @@ class E2E(unittest.TestCase):
         per = so.job_usage(3600)["n2"]
         self.assertGreaterEqual(per["extra"], 20003)
         self.assertGreaterEqual(per["measured"], 1)
-        self.assertIn("extra 7d", "\n".join(so.tokens_lines(so.load_cfg(), None, weeks=2, grass=False)))
+        self.assertIn("wasted 7d", "\n".join(so.tokens_lines(so.load_cfg(), None, weeks=2, grass=False)))
 
     def test_98b_claude_now(self):
         """Sessions working now, their running subagents (finished or stale ones left out), names from /rename."""
