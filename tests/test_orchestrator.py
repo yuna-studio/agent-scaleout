@@ -710,6 +710,41 @@ class E2E(unittest.TestCase):
         self.assertEqual(Path(c("repo-checkout", "r", sha)).name, "r-wt1", "the next job makes its work tree again")
 
 
+
+class DispatchFailure(unittest.TestCase):
+    """A node has room but the hand-over fails: the job must say why instead of waiting with nothing shown."""
+
+    def test_error_line_picks_the_git_reason(self):
+        text = "To ssh://node/repo.git\n ! [remote rejected]   abc -> refs/scaleout/base/j1 (shallow update not allowed)\nerror: failed to push some refs to 'ssh://node/repo.git'"
+        self.assertIn("failed to push", so.dispatch_error_line(text))
+        self.assertEqual(so.dispatch_error_line(""), "")
+        self.assertLessEqual(len(so.dispatch_error_line("fatal: " + "x" * 500)), 160)
+
+    def test_tick_records_why_the_hand_over_failed(self):
+        job = {"id": "j-test", "status": "queued", "history": []}
+        saved = []
+        real = (so.TickLock, so.load_cfg, so.refresh_metrics, so.all_jobs, so.pick_node, so.dispatch, so.save_job, so.maintain)
+
+        class Lock:
+            def __enter__(self): return True
+            def __exit__(self, *a): return False
+
+        def failing(cfg, j, name):
+            j["dispatch_error"] = "could not send the repository: shallow update not allowed"
+            return False
+
+        so.TickLock, so.load_cfg, so.refresh_metrics = Lock, (lambda: {"nodes": {}}), (lambda cfg: {})
+        so.all_jobs, so.pick_node, so.dispatch = (lambda: [job]), (lambda *a, **k: "n1"), failing
+        so.save_job, so.maintain = (lambda j: saved.append(dict(j))), (lambda cfg, metrics: None)
+        try:
+            so.tick()
+        finally:
+            (so.TickLock, so.load_cfg, so.refresh_metrics, so.all_jobs, so.pick_node, so.dispatch, so.save_job, so.maintain) = real
+        self.assertEqual(job["status"], "queued")
+        self.assertEqual(job["wait"], "n1: could not send the repository: shallow update not allowed")
+        self.assertNotIn("dispatch_error", job)
+        self.assertTrue(saved)
+
 if __name__ == "__main__":
     try:
         unittest.main(verbosity=2)
