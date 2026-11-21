@@ -5,7 +5,9 @@
 # Works with bash 3.2 (stock macOS): no `wait -n`, no associative arrays, and ${var} before non-ASCII text.
 set -u
 B="${SCALEOUT_NODE_HOME:-$HOME/.scaleout}"   # the orchestrator runs its own jobs from another folder
-export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$HOME/Library/Android/sdk/platform-tools:${ANDROID_HOME:-$HOME/Android/Sdk}/platform-tools:$PATH"
+SDK_DIR="${ANDROID_HOME:-$HOME/Android/Sdk}"; [ "$(uname -s)" = Darwin ] && [ -z "${ANDROID_HOME:-}" ] && SDK_DIR="$HOME/Library/Android/sdk"
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$SDK_DIR/platform-tools:$SDK_DIR/emulator:$HOME/.maestro/bin:$PATH"
+export ANDROID_HOME="${ANDROID_HOME:-$SDK_DIR}" MAESTRO_CLI_NO_ANALYTICS=1 MAESTRO_CLI_ANALYSIS_NOTIFICATION_DISABLED=true
 [ -f "$B/node.conf" ] && . "$B/node.conf"
 OS="$(uname -s)"
 VERSION="__VERSION__"
@@ -109,13 +111,21 @@ claude_now() {  # subagents running under the agents here: {"subagents":N,"descs
   printf '{"subagents":%s,"descs":[%s]}' "$n" "${d%,}"
 }
 
+caps() {   # what this machine can run, as tags a job may ask for: an Android emulator (SDK emulator + an AVD), iOS simulators (Xcode)
+  local c=""
+  { [ -x "$SDK_DIR/emulator/emulator" ] && ls "$HOME"/.android/avd/*.ini >/dev/null 2>&1; } && c="$c\"emulator\","
+  [ "$OS" = Darwin ] && xcrun simctl help >/dev/null 2>&1 && c="$c\"simulator\",\"ios-simulator\","
+  command -v maestro >/dev/null 2>&1 && c="$c\"maestro\","
+  printf '[%s]' "${c%,}"
+}
+
 verb="${1:-}"; shift || true
 case "$verb" in
   version) echo "$VERSION" ;;
   metrics)
-    printf '{"os":"%s","arch":"%s","host":"%s","mem_free_pct":%s,"mem_total_gb":%s,"disk_free_gb":%s,"work_free_gb":%s,"load":%s,"cpus":%s,"running":%s,"queued":%s,"runner":%s,"agents":%s,"devices":%s,"claude":%s,"skills_hash":"%s","version":"%s"}\n' \
+    printf '{"os":"%s","arch":"%s","host":"%s","mem_free_pct":%s,"mem_total_gb":%s,"disk_free_gb":%s,"work_free_gb":%s,"load":%s,"cpus":%s,"running":%s,"queued":%s,"runner":%s,"agents":%s,"devices":%s,"claude":%s,"caps":%s,"skills_hash":"%s","version":"%s"}\n' \
       "$(j "$OS")" "$(uname -m)" "$(j "$(hostname)")" "$(mem_free_pct)" "$(mem_total_gb)" "$(disk_free_gb "$HOME")" \
-      "$(disk_free_gb "${WORK_ROOT:-$HOME}")" "$(load1)" "$(cpus)" "$(running_jobs)" "$(queued_jobs)" "$(runner_ok)" "$(agents)" "$(devices)" "$(claude_now)" "$(skills_hash)" "$VERSION" ;;
+      "$(disk_free_gb "${WORK_ROOT:-$HOME}")" "$(load1)" "$(cpus)" "$(running_jobs)" "$(queued_jobs)" "$(runner_ok)" "$(agents)" "$(devices)" "$(claude_now)" "$(caps)" "$(skills_hash)" "$VERSION" ;;
 
   submit)  # submit <jid> <agent> <timeout_min> <workdir> [resume-session-id]   (prompt on stdin)
     jid="$1"; d="$B/jobs/$jid"; mkdir -p "$d" "$B/queue"
@@ -258,9 +268,57 @@ case "$verb" in
   send)  # send <dir>  — tar to stdout (excludes heavy build dirs)
     t="${1/#\~/$HOME}"; tar -cf - -C "$t" --exclude node_modules --exclude .gradle --exclude build --exclude .dart_tool --exclude DerivedData . ;;
   skills-hash) echo "$1" > "$B/skills.hash"; echo ok ;;
+  job-tokens)  # job-tokens <session id>: the first request's whole input (what a fresh agent loads before any work) and how many requests
+    python3 - "${1:-}" <<'JT'
+import glob, json, os, sys
+sid = sys.argv[1]
+files = glob.glob(os.path.join(os.path.expanduser("~"), ".claude", "projects", "*", sid + ".jsonl")) if sid else []
+first, seen = None, set()
+for line in open(files[0]) if files else []:
+    try:
+        r = json.loads(line)
+    except ValueError:
+        continue
+    m = r.get("message") or {}
+    u = m.get("usage") or {}
+    if r.get("type") != "assistant" or not u or r.get("isSidechain"):
+        continue
+    mid = m.get("id") or r.get("requestId") or ""
+    if mid in seen:
+        continue
+    seen.add(mid)
+    if first is None:
+        first = int(u.get("input_tokens") or 0) + int(u.get("cache_creation_input_tokens") or 0) + int(u.get("cache_read_input_tokens") or 0)
+print(json.dumps({"start": first or 0, "requests": len(seen)}))
+JT
+    ;;
+  relocate)  # relocate <orchestrator home>: skills that name the orchestrator's home (e.g. its ~/harness_workspace) point at this one
+    [ "${1:-}" = "$HOME" ] && { echo same; exit 0; }
+    python3 - "$1" "$HOME" <<'RELOC'
+import os, sys
+old, new = (sys.argv[1].rstrip("/") + "/").encode(), (sys.argv[2].rstrip("/") + "/").encode()
+n = 0
+for top in (".claude/skills", ".claude/agents", ".claude/commands", "harness_workspace/.bin", "harness_workspace/my"):
+    for root, dirs, files in os.walk(os.path.join(sys.argv[2], top)):
+        dirs[:] = [d for d in dirs if d not in ("log", "runs", ".harness-runs", ".git")]
+        for f in files:
+            p = os.path.join(root, f)
+            try:
+                b = open(p, "rb").read()
+            except OSError:
+                continue
+            if b"\0" in b[:4096] or old not in b:
+                continue
+            open(p, "wb").write(b.replace(old, new))
+            n += 1
+print("relocated", n)
+RELOC
+    ;;
 
   repair)  # re-register the runner service
     bash "$B/bin/setup.sh" --repair && echo repaired ;;
+  usage)  # daily Claude tokens of every session on this machine -> one JSON line (see usage.py)
+    python3 "$(dirname "$0")/usage.py" 2>/dev/null || echo '{}' ;;
   doctor)
     echo "host: $(hostname) · $OS $(uname -r) · $(uname -m) · ${VERSION}"
     echo "memory: $(mem_total_gb)GB, free $(mem_free_pct)% · disk free $(disk_free_gb)GB · load $(load1)/$(cpus)"

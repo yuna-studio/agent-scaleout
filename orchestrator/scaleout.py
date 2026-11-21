@@ -33,7 +33,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 HOME = Path.home()
 CONF_DIR = Path(os.environ.get("SCALEOUT_CONF", HOME / ".config" / "scaleout"))
 STATE_DIR = Path(os.environ.get("SCALEOUT_STATE", HOME / ".local" / "state" / "scaleout"))
@@ -66,6 +66,10 @@ DEFAULTS: Dict[str, Any] = {
     "port_base": 2201,
 }
 SKILL_PATHS = [".claude/skills", ".claude/agents", ".claude/commands"]
+# Harness Studio skills run ~/harness_workspace/.bin/run.py on their folder in ~/harness_workspace/my: sent with the skills
+# (without run logs), so those skills work on nodes too
+SKILL_EXTRA = ["harness_workspace/.bin", "harness_workspace/my"]
+SKILL_SKIP = {"log", "runs", ".harness-runs", "node_modules", ".git", ".dart_tool", "build", ".gradle"}
 
 
 # ── small utils ──────────────────────────────────────────────────────────────
@@ -263,6 +267,15 @@ def local_ctl(n: Dict[str, Any], verb: str, *args: str, input: Optional[bytes] =
     return r
 
 
+def lan_answers(host: str, port: int, timeout: float = 0.6) -> bool:
+    """A quick TCP probe: is the node's SSH port on the LAN reachable from here right now?"""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 class Node:
     """A node and how to reach it."""
 
@@ -297,6 +310,9 @@ class Node:
             return hit[0] or None
         last = read_json(node_state_path(self.name), {}).get("route")
         order = sorted(self.aliases(), key=lambda x: x != last)   # the route that worked last time first
+        lan = f"scaleout-{self.name}-lan"
+        if lan in order and order[0] != lan and lan_answers(self.n["lan"], int(self.n.get("ssh_port", 22))):
+            order = [lan] + [x for x in order if x != lan]   # a direct LAN connection beats a tunnel whenever it answers
         for a in order:
             try:
                 if run(SSH_BASE + ["-n", "-o", "ConnectTimeout=4", a, "exit"], timeout=12).returncode == 0:
@@ -407,6 +423,8 @@ def tunnel_args(cfg: Dict[str, Any], port: int) -> List[str]:
          "--tunnel-ssh-port", str(t.get("ssh_port", 22))]
     if t.get("proxy"):
         a += ["--tunnel-proxy", t["proxy"]]
+    if cfg["orchestrator"].get("lan"):   # straight to the orchestrator whenever the node can reach it on the LAN (no proxy needed)
+        a += ["--tunnel-lan", f"{cfg['orchestrator']['lan']}:{cfg['orchestrator'].get('ssh_port', 22)}"]
     return a
 
 
@@ -548,8 +566,26 @@ def selftest(name: str) -> None:
 
 INVITE_UNIX = r'''set -e
 N=__N__; ROUTE_LAN=__LAN__; ROUTE_HOST=__HOST__; ROUTE_PROXY=__PROXY__; OU=__OU__; OSP=__OSP__; SO_BREW=__BREW__; SO_CLAUDE=__CLAUDE__
+SO_PREP=__PREP__; SO_AUTOLOGIN=__AUTOLOGIN__
 K="$(mktemp)"; trap 'rm -f "$K"' EXIT
 printf '%s' __KEY__ | base64 --decode > "$K"; chmod 600 "$K"
+if [ "$(uname -s)" = Linux ] && [ "$SO_PREP" = 1 ] && command -v apt-get >/dev/null; then
+  echo "[0/5] Linux node basics — your password is asked once"
+  echo "  packages: SSH server, curl, git, build tools, JDK 17 (waits if automatic updates hold the package lock; a few minutes)"
+  sudo -v
+  sudo apt-get -o DPkg::Lock::Timeout=900 update -q
+  sudo env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=900 install -y -q \
+    openssh-server curl git netcat-openbsd unzip zip xz-utils build-essential clang cmake ninja-build pkg-config libgtk-3-dev openjdk-17-jdk-headless
+  echo "  never sleeps (a node that sleeps takes no jobs)"
+  sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target >/dev/null
+  echo "  services run without anyone logged in (loginctl enable-linger)"
+  sudo loginctl enable-linger "$(whoami)"
+  if [ "$SO_AUTOLOGIN" = 1 ] && [ -f /etc/gdm3/custom.conf ]; then
+    echo "  logs in to the desktop by itself after a restart"
+    sudo sed -i "s/^#\? *AutomaticLoginEnable.*/AutomaticLoginEnable=true/; s/^#\? *AutomaticLogin *=.*/AutomaticLogin=$(whoami)/" /etc/gdm3/custom.conf
+    grep -q '^AutomaticLogin=' /etc/gdm3/custom.conf || sudo sed -i "/^\[daemon\]/a AutomaticLoginEnable=true\nAutomaticLogin=$(whoami)" /etc/gdm3/custom.conf
+  fi
+fi
 echo "[1/5] SSH server (how the orchestrator reaches this machine)"
 if ! (nc -z -w 2 127.0.0.1 22 || nc -z -G 2 127.0.0.1 22) >/dev/null 2>&1; then
   echo "  turning on the SSH server — your password may be asked once"
@@ -574,11 +610,21 @@ if [ "$SO_CLAUDE" = 1 ] && ! command -v claude >/dev/null; then
   if curl -fsSL https://claude.ai/install.sh | bash >/dev/null 2>&1 && command -v claude >/dev/null; then NEW_CLAUDE=1; echo "  Claude Code ok"
   else echo "  ! Claude Code did not install — later: curl -fsSL https://claude.ai/install.sh | bash"; fi
 elif command -v claude >/dev/null; then echo "  Claude Code ok"; fi
+# ~/.local/bin (Claude Code, and later fvm / node) on the PATH of new terminals: shells only add it when it existed at login
+for rc in ~/.bashrc ~/.zshrc; do
+  { [ -f "$rc" ] || [ "$rc" = ~/.bashrc -a "$(uname -s)" = Linux ] || [ "$rc" = ~/.zshrc -a "$(uname -s)" = Darwin ]; } || continue
+  grep -q '\.local/bin' "$rc" 2>/dev/null || printf '\n# Claude Code and node tools (agent-scaleout)\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$rc"
+done
 echo "[3/5] route to the orchestrator"
 EN=(ssh -i "$K" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=15 -p "$OSP")
 if [ -n "$ROUTE_LAN" ] && (nc -z -w 3 "$ROUTE_LAN" "$OSP" || nc -z -G 3 "$ROUTE_LAN" "$OSP") >/dev/null 2>&1; then T="$OU@$ROUTE_LAN"; echo "  LAN ($ROUTE_LAN)"
 elif [ -n "$ROUTE_HOST" ]; then
-  if [ -n "$ROUTE_PROXY" ]; then P="${ROUTE_PROXY%% *}"; command -v "$P" >/dev/null || { command -v brew >/dev/null && brew install "$P" >/dev/null; }; EN+=(-o "ProxyCommand=$(command -v "$P") ${ROUTE_PROXY#* }"); fi
+  if [ -n "$ROUTE_PROXY" ]; then P="${ROUTE_PROXY%% *}"; command -v "$P" >/dev/null || { command -v brew >/dev/null && brew install "$P" >/dev/null; } || true
+    if ! command -v "$P" >/dev/null && [ "$P" = cloudflared ] && [ "$(uname -s)" = Linux ]; then
+      case "$(uname -m)" in x86_64) A=amd64 ;; aarch64) A=arm64 ;; *) A=arm ;; esac; mkdir -p ~/.local/bin
+      curl -fsSL -o ~/.local/bin/cloudflared "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$A" && chmod 755 ~/.local/bin/cloudflared
+    fi
+    EN+=(-o "ProxyCommand=$(command -v "$P") ${ROUTE_PROXY#* }"); fi
   T="$OU@$ROUTE_HOST"; echo "  $ROUTE_HOST"
 else echo "  cannot reach the orchestrator at $ROUTE_LAN" >&2; exit 3; fi
 echo "[4/5] install"
@@ -661,6 +707,7 @@ def cmd_invite(a) -> None:
         f.write(f'restrict,command="{exe} _enroll {name}" {(inv / "enroll.pub").read_text().strip()}\n')
     key = base64.b64encode((inv / "enroll").read_bytes()).decode()
     q = shlex.quote
+    long_line = ""   # the paste-anywhere line, shown too when a short LAN line is printed
     if win:
         script = (INVITE_WIN.replace("__N__", name).replace("__LAN__", o.get("lan", "")).replace("__OU__", o["user"])
                   .replace("__OSP__", str(o.get("ssh_port", 22))).replace("__KEY__", key).replace("__CLAUDE__", "0" if a.no_claude else "1"))
@@ -670,16 +717,63 @@ def cmd_invite(a) -> None:
     else:
         script = (INVITE_UNIX.replace("__N__", q(name)).replace("__LAN__", q(o.get("lan", ""))).replace("__HOST__", q(t.get("host", "")))
                   .replace("__PROXY__", q(t.get("proxy", ""))).replace("__OU__", q(o["user"])).replace("__OSP__", q(str(o.get("ssh_port", 22))))
-                  .replace("__KEY__", q(key)).replace("__BREW__", "0" if a.no_brew else "1").replace("__CLAUDE__", "0" if a.no_claude else "1"))
+                  .replace("__KEY__", q(key)).replace("__BREW__", "0" if a.no_brew else "1").replace("__CLAUDE__", "0" if a.no_claude else "1")
+                  .replace("__PREP__", "0" if a.no_prep else "1").replace("__AUTOLOGIN__", "1" if a.autologin else "0"))
         b64 = base64.b64encode(script.encode()).decode()
         line = f'bash -c "$(echo {b64} | base64 --decode)"'
         where = "Paste this into a terminal on the node (macOS / Linux):"
+        if a.serve and o.get("lan"):   # short enough to type: this machine serves the script on the LAN until it is used
+            token = base64.urlsafe_b64encode(os.urandom(9)).decode()
+            sp_ = inv / "serve"; sp_.mkdir(exist_ok=True)
+            (sp_ / token).write_text("#!/bin/bash\n" + script)
+            with socket.socket() as probe:   # a free port on the LAN address
+                probe.bind((o["lan"], 0))
+                port_ = probe.getsockname()[1]
+            subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_serve", str(sp_), o["lan"], str(port_), str(a.serve), token],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            url = f"http://{o['lan']}:{port_}/{token}"
+            long_line = line
+            line = f'bash <(curl -fsSL {url} 2>/dev/null || wget -qO- {url})'
+            where = f"Type this in a terminal on the node (same network; served for {a.serve} min or until used):"
     say(f"invite for '{name}' — single use, valid {a.hours} h{f' · tunnel port {port}' if port else ''}")
     say(where)
     say()
     say(line)
     say()
+    if long_line:
+        say("Not on the same network? Paste this instead:")
+        say()
+        say(long_line)
+        say()
     say("The SSH server is turned on if needed (password asked once). The node's coding agent must be signed in.")
+    if not win and not a.no_prep:
+        say("On Linux (apt) it also installs the build tools, keeps the machine awake and lets the node run while nobody is logged in"
+            + (" and logs in to the desktop by itself" if a.autologin else "") + ".")
+
+
+def cmd_serve(a) -> None:
+    """`scaleout invite --serve`: hand out one invite script on the LAN, then stop (never called by hand)."""
+    import http.server
+    folder, token = Path(a.folder), a.token
+    end = time.time() + int(a.minutes) * 60
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            f = folder / token
+            if self.path.strip("/") != token or not f.exists():
+                self.send_response(404); self.end_headers(); return
+            body = f.read_bytes()
+            self.send_response(200); self.send_header("Content-Type", "text/plain"); self.send_header("Content-Length", str(len(body))); self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args: Any) -> None:
+            pass
+    srv = http.server.HTTPServer((a.host, int(a.port)), H)
+    srv.timeout = 5
+    while time.time() < end and (folder / token).exists():   # the invite used (or redone) removes the file: stop early
+        srv.handle_request()
+    srv.server_close()
+    shutil.rmtree(folder, ignore_errors=True)
 
 
 def cmd_enroll(a) -> None:
@@ -1043,7 +1137,7 @@ def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[st
     cpu_used = cpu_used if cpu_used is not None else {}
     best, best_score = None, -1e9
     for name, n in cfg["nodes"].items():
-        if n.get("pending") or (j.get("want_node") and name != j["want_node"]):
+        if n.get("pending") or (j.get("want_node") and name != j["want_node"]) or (j.get("only") and name not in j["only"]):
             continue
         st = metrics.get(name, {})
         h = node_health(cfg, name, st)
@@ -1054,8 +1148,9 @@ def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[st
             why[name] = "failed this job recently"
             continue
         devs = st.get("devices") or {}
-        have = set(n.get("tags") or []) | {st.get("os", "").lower()}
+        have = set(n.get("tags") or []) | {st.get("os", "").lower()} | OS_TAGS.get(st.get("os", "").lower(), set())
         have |= {f"{k}-device" for k, v in devs.items() if int(v or 0) > 0}
+        have |= set(st.get("caps") or [])   # emulator / simulator / maestro, as the node found them
         if not set(j.get("tags") or []) <= have:
             why[name] = "lacks " + ",".join(sorted(set(j.get("tags") or []) - have))
             continue
@@ -1101,10 +1196,12 @@ def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[st
 def skills_tar(cfg: Dict[str, Any]) -> Tuple[bytes, str]:
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
-        for rel in cfg["skills"].get("paths", SKILL_PATHS):
+        paths = list(cfg["skills"].get("paths", SKILL_PATHS))
+        for rel in paths + [x for x in SKILL_EXTRA if x not in paths]:
             p = HOME / rel
             if p.exists():
-                tar.add(str(p), arcname=rel, filter=lambda ti: None if "/." in ti.name and ti.name.split("/")[-1].startswith(".git") else ti)
+                tar.add(str(p), arcname=rel, filter=lambda ti: None if set(ti.name.split("/")[2:]) & SKILL_SKIP
+                        or ti.name.split("/")[-1].startswith(".git") else ti)
     data = buf.getvalue()
     return data, hashlib.sha256(data).hexdigest()[:16]
 
@@ -1116,10 +1213,18 @@ def push_skills(cfg: Dict[str, Any], name: str, force: bool = False) -> bool:
         return False
     n = Node(name, cfg)
     if n.ctl("recv", "~", input=data, timeout=300).returncode == 0 and n.ctl("skills-hash", h).returncode == 0:
+        n.ctl("relocate", str(HOME), timeout=120)   # paths that name this machine's home → the node's home (best effort)
         st["skills_hash"] = h
         write_json(node_state_path(name), st)
         return True
     return False
+
+
+def dispatch_error_line(text: str) -> str:
+    """The one line of a failed git/ctl output worth showing next to a waiting job: the last error line, kept short."""
+    lines = [ln.strip() for ln in str(text or "").splitlines() if ln.strip()]
+    marked = [ln for ln in lines if any(k in ln for k in ("rejected", "error:", "fatal:", "failed"))]
+    return ((marked or lines)[-1] if lines else "")[:160]
 
 
 def dispatch(cfg: Dict[str, Any], j: Dict[str, Any], name: str) -> bool:
@@ -1137,14 +1242,24 @@ def dispatch(cfg: Dict[str, Any], j: Dict[str, Any], name: str) -> bool:
         alias = n.route()
         bare = n.ctl("repo-init", j["repo_name"]).stdout.decode().strip().splitlines()[-1:]
         if not alias or not bare:
+            j["dispatch_error"] = "no route to the node" if not alias else "the node could not prepare the repository"
             return False
-        push = git(j["repo"], "push", "-q", "--no-verify", node_git_url(alias, bare[0]), f"{j['repo_base']}:refs/scaleout/base/{j['id']}", timeout=3600)
+        refspec = f"{j['repo_base']}:refs/scaleout/base/{j['id']}"
+        push = git(j["repo"], "push", "-q", "--no-verify", node_git_url(alias, bare[0]), refspec, timeout=3600)
+        if push.returncode != 0 and b"shallow update not allowed" in push.stderr:
+            # a `git fetch --depth` somewhere left the requester's repository shallow: every push to a node is refused and the
+            # job would wait forever with no reason shown. Fill in the missing history once and try again.
+            git(j["repo"], "fetch", "-q", "--unshallow", timeout=3600)
+            push = git(j["repo"], "push", "-q", "--no-verify", node_git_url(alias, bare[0]), refspec, timeout=3600)
         if push.returncode != 0:
-            j["history"].append({"t": now(), "event": "push-failed", "node": name, "why": push.stderr.decode()[-300:]})
+            why = push.stderr.decode(errors="replace").strip()
+            j["history"] = (j.get("history") or [])[-20:] + [{"t": now(), "event": "push-failed", "node": name, "why": why[-300:]}]
+            j["dispatch_error"] = "could not send the repository: " + (dispatch_error_line(why) or "git push failed")
             return False
         co = n.ctl("repo-checkout", j["repo_name"], j["repo_base"], timeout=1800)
         wt = co.stdout.decode().strip().splitlines()[-1:] if co.returncode == 0 else []
         if not wt:
+            j["dispatch_error"] = "the node could not check out the work tree: " + (dispatch_error_line(co.stderr.decode(errors="replace")) or "no reason given")
             return False
         j["repo_wt"] = wt[0]
         wd = wt[0] + ("/" + j["repo_sub"] if j.get("repo_sub") else "")
@@ -1208,6 +1323,9 @@ def collect(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[str,
         try:   # Claude Code reports tokens, cost and turns in its JSON answer
             rep = json.loads(out.decode(errors="replace").strip().splitlines()[-1])
             j.update(report_usage(rep))
+            if rep.get("session_id"):   # the context a fresh agent loads before any work: spent only because it ran apart
+                jt = json.loads(n.ctl("job-tokens", str(rep["session_id"]), timeout=60).stdout.decode().strip().splitlines()[-1])
+                j["start_tokens"], j["requests"] = int(jt.get("start") or 0), int(jt.get("requests") or 0)
         except (ValueError, IndexError, AttributeError, TypeError):
             pass
         if s.get("mem_mb") is not None:
@@ -1424,21 +1542,30 @@ def tick(verbose: bool = False) -> None:
                 continue
             why: Dict[str, str] = {}
             name = pick_node(cfg, j, metrics, load, dev_load, planned_gb, cpu_used, why)
-            wait = "" if name else ("; ".join(f"{k}: {v}" for k, v in sorted(why.items())) or "no nodes")
-            if wait != j.get("wait", ""):
-                j["wait"] = wait
+            if not name:
+                wait = "; ".join(f"{k}: {v}" for k, v in sorted(why.items())) or "no nodes"
+                if wait != j.get("wait", ""):
+                    j["wait"] = wait
+                    save_job(j)
+                continue
+            j.pop("dispatch_error", None)
+            if not dispatch(cfg, j, name):
+                # a node had room but the hand-over failed: say why, or the job sits in the queue with nothing shown
+                wait = f"{name}: {j.pop('dispatch_error', '') or 'could not hand the job over'}"
+                if wait != j.get("wait", ""):
+                    j["wait"] = wait
                 save_job(j)
-            if name and dispatch(cfg, j, name):
-                j.pop("wait", None)
-                load[name] = load.get(name, 0) + 1
-                cpu_used[name] = cpu_used.get(name, 0) + job_cpu(j)
-                planned_gb[name] = planned_gb.get(name, 0.0) + job_mem_gb(j, name)
-                for t in j.get("tags") or []:
-                    if t in DEVICE_TAGS:
-                        dev_load[(name, t)] = dev_load.get((name, t), 0) + 1
-                save_job(j)
-                if verbose:
-                    say(f"dispatched {j['id']} -> {name}")
+                continue
+            j.pop("wait", None)
+            load[name] = load.get(name, 0) + 1
+            cpu_used[name] = cpu_used.get(name, 0) + job_cpu(j)
+            planned_gb[name] = planned_gb.get(name, 0.0) + job_mem_gb(j, name)
+            for t in j.get("tags") or []:
+                if t in DEVICE_TAGS:
+                    dev_load[(name, t)] = dev_load.get((name, t), 0) + 1
+            save_job(j)
+            if verbose:
+                say(f"dispatched {j['id']} -> {name}")
         maintain(cfg, metrics)
 
 
@@ -1588,13 +1715,65 @@ def cmd_cancel(a) -> None:
     say("cancelled")
 
 
+DIRECT_DIR = STATE_DIR / "direct"   # heavy commands sessions ran on this machine (agents/claude/direct-run.py)
+
+
+def direct_runs(keep_days: int = 7) -> List[Dict[str, Any]]:
+    """Heavy builds and tests a Claude Code session ran here itself, as jobs: status running / done / failed / cancelled /
+    lost (no end was recorded). A command sent to the background ends when its output file says `[exited with code N]`."""
+    out: List[Dict[str, Any]] = []
+    for p in sorted(DIRECT_DIR.glob("*.json")) if DIRECT_DIR.exists() else []:
+        r = read_json(p, None)
+        if not isinstance(r, dict) or "started" not in r:
+            continue
+        st, started = r.get("status", "running"), float(r["started"])
+        if st != "running" and float(r.get("finished") or started) < now() - keep_days * 86400:
+            p.unlink(missing_ok=True)
+            continue
+        if st == "running" and r.get("background"):
+            f = None
+            if r.get("task") and r.get("session"):
+                for root in {"/tmp", "/private/tmp", os.environ.get("TMPDIR", "/tmp")}:
+                    hit = list(Path(root).glob(f"claude-*/*/{r['session']}/tasks/{r['task']}.output"))
+                    if hit:
+                        f = hit[0]
+                        break
+            tail = ""
+            if f:
+                try:
+                    with open(f, "rb") as fh:
+                        fh.seek(max(0, f.stat().st_size - 200))
+                        tail = fh.read().decode(errors="replace")
+                except OSError:
+                    pass
+            m = re.search(r"\[exited with code (\d+)\]\s*$", tail)
+            if m:
+                st = "done" if m.group(1) == "0" else "failed"
+                r.update(status=st, finished=f.stat().st_mtime)
+                write_json(p, r)
+            elif (f is None and now() - started > 3600) or now() - started > 86400:
+                st = "lost"
+        elif st == "running" and now() - started > 15 * 60:   # a foreground command stops at 10 min: its end was not seen
+            st = "lost"
+        out.append({"id": "s-" + str(r.get("id", p.stem))[-10:], "node": LOCAL, "status": st, "direct": True,
+                    "created": started, "dispatched_at": started, "finished_at": r.get("finished") if st != "running" else None,
+                    "what": r.get("what") or r.get("cmd", ""), "cwd": r.get("cwd", ""), "session": r.get("session", "")})
+    return out
+
+
 def cmd_jobs(a) -> None:
-    jobs = all_jobs()[-a.limit:]
+    cfg = load_cfg()
+    jobs = sorted(all_jobs() + direct_runs(), key=lambda j: j.get("created", 0))[-a.limit:]
     if not jobs:
         say("no jobs")
+    nw = name_w(cfg, 16)
     for j in jobs:
         age = time.strftime("%m-%d %H:%M", time.localtime(j.get("created", 0)))
-        say(f"{j['id']}  {j['status']:<10} {j.get('node') or '-':<14} tries={j.get('attempts', 0)}  {age}"
+        where = pad(label_of(cfg, j["node"]) if j.get("node") else "-", nw)
+        if j.get("direct"):   # run in a session here, not through scaleout
+            say(f"{j['id']:<20} {j['status']:<10} {where}session   {age}  {j.get('what', '')}  ({Path(j.get('cwd') or '.').name})")
+            continue
+        say(f"{j['id']:<20} {j['status']:<10} {where}tries={j.get('attempts', 0)}  {age}"
             + (f"  waits: {j['wait']}" if j.get("status") == "queued" and j.get("wait") else ""))
 
 
@@ -1616,7 +1795,7 @@ def cmd_nodes(a) -> None:
     if not cfg["nodes"]:
         say("no nodes — scaleout add NAME user@host  |  scaleout invite NAME")
     for name, n in cfg["nodes"].items():
-        say(f"{name:<14} {n.get('os', '?'):<8} user={n.get('user', '?')} lan={n.get('lan') or '-'} tunnel={n.get('port') or '-'} "
+        say(f"{pad(label_of(cfg, name), name_w(cfg, 16))} {role_of(cfg, name):<13}{'id=' + name:<18}{n.get('os', '?'):<8} user={n.get('user', '?')} lan={n.get('lan') or '-'} tunnel={n.get('port') or '-'} "
             f"agent={n.get('agent', 'claude')} max={n.get('max_jobs', 2)} tags={','.join(n.get('tags') or []) or '-'}{' (invite pending)' if n.get('pending') else ''}")
 
 
@@ -1626,17 +1805,286 @@ def fmt_devices(st: Dict[str, Any]) -> str:
     return " ".join(parts) or "-"
 
 
+# ── paint: colour and width for the terminal views ───────────────────────────
+PAINT = False   # set by paint_auto(): colour only on a terminal
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+C_ACCENT, C_VIOLET, C_OK, C_WARN, C_BAD, C_DIM, C_FRAME, C_TEXT = 81, 141, 114, 221, 203, 245, 240, 252
+GRASS = [237, 22, 28, 34, 46]          # no tokens → the busiest days
+GRASS_PLAIN = ["·", "░", "▒", "▓", "█"]
+
+
+def paint_auto() -> None:
+    global PAINT
+    PAINT = sys.stdout.isatty() and not os.environ.get("NO_COLOR") and os.environ.get("TERM", "") != "dumb"
+
+
+def c(text: Any, fg: Optional[int] = None, bold: bool = False, dim: bool = False) -> str:
+    text = str(text)
+    if not PAINT or (fg is None and not bold and not dim):
+        return text
+    codes = (["1"] if bold else []) + (["2"] if dim else []) + ([f"38;5;{fg}"] if fg is not None else [])
+    return f"\x1b[{';'.join(codes)}m{text}\x1b[0m"
+
+
+def cw(ch: str) -> int:
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 0 if unicodedata.combining(ch) else 1
+
+
+def vlen(text: str) -> int:
+    """Columns a string takes on screen: colour codes take none, Korean and other wide letters take two."""
+    return sum(cw(ch) for ch in ANSI_RE.sub("", text))
+
+
+def clip(text: str, width: int) -> str:
+    """Cut to `width` columns, keeping colour codes whole."""
+    if vlen(text) <= width:
+        return text
+    out, used, i = [], 0, 0
+    while i < len(text):
+        m = ANSI_RE.match(text, i)
+        if m:
+            out.append(m.group()); i = m.end(); continue
+        w = cw(text[i])
+        if used + w > width - 1:
+            break
+        out.append(text[i]); used += w; i += 1
+    return "".join(out) + "…" + ("\x1b[0m" if PAINT else "")
+
+
+def pad(text: Any, width: int, right: bool = False) -> str:
+    text = clip(str(text), width)
+    gap = " " * max(0, width - vlen(text))
+    return gap + text if right else text + gap
+
+
+def level_color(pct_good: float) -> int:
+    return C_OK if pct_good >= 40 else C_WARN if pct_good >= 20 else C_BAD
+
+
+def meter(pct: float, width: int = 10, color: Optional[int] = None) -> str:
+    pct = max(0.0, min(100.0, float(pct or 0)))
+    full = int(round(pct / 100 * width))
+    return c("█" * full, color if color is not None else C_ACCENT) + c("░" * (width - full), 238)
+
+
+def box(title: str, lines: List[str], width: int, hint: str = "") -> List[str]:
+    """A rounded panel: ╭─ TITLE ───── hint ╮"""
+    inner = width - 4
+    hint_s = f" {hint} " if hint else ""
+    dashes = max(1, width - 5 - vlen(title) - vlen(hint_s))
+    out = [c("╭─ ", C_FRAME) + c(title, C_ACCENT, bold=True) + " " + c("─" * dashes, C_FRAME) + c(hint_s, C_DIM) + c("╮", C_FRAME)]
+    for line in lines:
+        out.append(c("│", C_FRAME) + " " + pad(line, inner) + " " + c("│", C_FRAME))
+    out.append(c("╰" + "─" * (width - 2) + "╯", C_FRAME))
+    return out
+
+
+# ── machine names and roles ──────────────────────────────────────────────────
+def label_of(cfg: Dict[str, Any], name: str) -> str:
+    """The name a person gave this machine (`scaleout rename`), or its id. Orchestrator and node are roles, not names."""
+    n = cfg.get("nodes", {}).get(name) or {}
+    if n.get("label"):
+        return str(n["label"])
+    if name == LOCAL and (cfg.get("orchestrator") or {}).get("label"):
+        return str(cfg["orchestrator"]["label"])
+    return name
+
+
+def name_w(cfg: Dict[str, Any], least: int = 22) -> int:
+    """Width of the name column: the longest machine name and a clear gap."""
+    return max([least] + [vlen(label_of(cfg, n)) + 4 for n in list(cfg.get("nodes", {})) + [LOCAL]])
+
+
+def role_of(cfg: Dict[str, Any], name: str) -> str:
+    return "orchestrator" if name == LOCAL or (cfg.get("nodes", {}).get(name) or {}).get("local") else "node"
+
+
+def node_id(cfg: Dict[str, Any], given: str) -> str:
+    """The id behind a name typed on the command line: an id, or a name set with `scaleout rename`."""
+    if given in cfg.get("nodes", {}) or given == LOCAL:
+        return given
+    for n in list(cfg.get("nodes", {})) + [LOCAL]:
+        if label_of(cfg, n) == given:
+            return n
+    return given
+
+
+def cmd_rename(a) -> None:
+    cfg = load_cfg()
+    name = node_id(cfg, a.name)
+    if name != LOCAL and name not in cfg["nodes"]:
+        die(2, f"no machine named '{a.name}' (scaleout nodes)")
+    new = (a.new or "").strip()
+    if new:
+        new = " ".join(new.split())
+        if vlen(new) > 24:
+            die(2, "a name is at most 24 columns wide")
+        for other in list(cfg["nodes"]) + [LOCAL]:
+            if other != name and new in (other, label_of(cfg, other)):
+                die(2, f"'{new}' is already the name of another machine")
+    for holder in ([cfg["nodes"][name]] if name in cfg["nodes"] else []) + ([cfg.setdefault("orchestrator", {})] if name == LOCAL else []):
+        if new and new != name:
+            holder["label"] = new
+        else:
+            holder.pop("label", None)
+    save_cfg(cfg)
+    say(f"{name}: shown as '{label_of(cfg, name)}' ({role_of(cfg, name)}); commands take either name")
+
+
+# ── tokens of every machine, per day ─────────────────────────────────────────
+USAGE_DAYS = STATE_DIR / "usage-days.json"   # {"machines": {id: {"days": {date: tokens}, "ts": read at, "tried": asked at}}}
+
+
+def collect_usage(cfg: Dict[str, Any], max_age: int = 600, only_local: bool = False) -> Dict[str, Any]:
+    """Ask each machine for its daily Claude tokens (all sessions there, not only scaleout jobs): node/unix/usage.py,
+    run here for this machine and through ctl on nodes. A machine that does not answer keeps its last numbers."""
+    data = read_json(USAGE_DAYS, {})
+    mach = data.setdefault("machines", {})
+    targets = [LOCAL] + ([] if only_local else [n for n, v in cfg["nodes"].items()
+                                                if not v.get("local") and not v.get("pending") and v.get("os", "").lower() != "windows"])
+    changed = False
+    for name in targets:
+        ent = mach.setdefault(name, {"days": {}})
+        if now() - ent.get("tried", 0) < max_age:
+            continue
+        ent["tried"] = now(); changed = True
+        try:
+            if name == LOCAL:
+                r = subprocess.run([sys.executable, str(PKG_ROOT / "node" / "unix" / "usage.py")], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   stdin=subprocess.DEVNULL, timeout=120, env={**os.environ, "SCALEOUT_USAGE_CACHE": str(STATE_DIR / "usage-local.json")})
+            else:
+                r = Node(name, cfg).ctl("usage", timeout=90)
+            got = json.loads(r.stdout.decode().strip().splitlines()[-1])
+            days = got["days"]
+        except (subprocess.TimeoutExpired, ValueError, IndexError, KeyError, OSError):
+            continue   # offline, or a node from before this verb: scaleout update
+        if isinstance(days, dict):
+            ent["days"].update(days)
+            ent["ts"], ent["partial"] = now(), bool(got.get("partial"))
+    if changed:
+        write_json(USAGE_DAYS, data)
+    return data
+
+
+def day_tokens(ent: Dict[str, Any], since_day: str = "", output: bool = False) -> int:
+    return sum((v.get("out", 0) if output else tokens_of(v)) for d, v in (ent.get("days") or {}).items() if d >= since_day)
+
+
+def grass_lines(totals: Dict[str, int], weeks: int) -> List[str]:
+    """Days as squares, a column per week (Monday on top), darker to brighter with the tokens of that day."""
+    today = time.localtime()
+    t0 = time.mktime(today[:3] + (12, 0, 0, 0, 0, -1))
+    start = t0 - (today.tm_wday + 7 * (weeks - 1)) * 86400      # the Monday of the first column
+    vals = sorted(v for v in totals.values() if v > 0)
+    cuts = [vals[int(len(vals) * q)] for q in (0.25, 0.5, 0.75)] if vals else [1, 1, 1]
+
+    def level(v: int) -> int:
+        return 0 if v <= 0 else 1 + sum(v > x for x in cuts)
+
+    def cell(lv: int) -> str:
+        return c("■", GRASS[lv]) if PAINT else GRASS_PLAIN[lv]
+
+    head, last, free = [" "] * (weeks * 2 + 2), "", 0
+    for w in range(weeks):
+        mon = time.strftime("%b", time.localtime(start + w * 7 * 86400))
+        if mon != last and w * 2 >= free:
+            head[w * 2:w * 2 + 3] = list(mon)
+            free = w * 2 + 4
+        last = mon
+    months = "".join(head).rstrip()
+    L = ["     " + c(months, C_DIM)]
+    for wd, name in enumerate(("Mon", "", "Wed", "", "Fri", "", "Sun")):
+        row = ""
+        for w in range(weeks):
+            t = start + (w * 7 + wd) * 86400
+            row += (" " if t > t0 else cell(level(totals.get(time.strftime("%Y-%m-%d", time.localtime(t)), 0)))) + " "
+        L.append(c(f"{name:<5}", C_DIM) + row)
+    if vals:
+        best = max(totals, key=lambda d: totals[d])
+        L.append("     " + c("less ", C_DIM) + " ".join(cell(i) for i in range(5)) + c(" more", C_DIM)
+                 + c(f"   busiest {best[5:]} {fmt_tok(totals[best])} · {len(vals)} active days · {fmt_tok(sum(vals) / len(vals))} a day", C_DIM))
+    return L
+
+
+def tokens_lines(cfg: Dict[str, Any], lu: Optional["LocalUsage"], weeks: int = 18, grass: bool = True) -> List[str]:
+    """Tokens of every machine (today, 7 days, 30 days, all it has kept) and the grass of all of them together."""
+    mach = (read_json(USAGE_DAYS, {}).get("machines") or {})
+    day = lambda back: time.strftime("%Y-%m-%d", time.localtime(now() - back * 86400))
+    spans = [("today", day(0)), ("7 days", day(6)), ("30 days", day(29)), ("all", "")]
+    nw = name_w(cfg, 16)
+    L = [c(f"{'MACHINE':<{nw}}{'ROLE':<14}" + "".join(f"{n:>10}" for n, _ in spans) + f"{'since':>8}{'read':>9}", C_DIM)]
+    names = sorted(mach, key=lambda n: (n != LOCAL, n))
+    tot = [0] * len(spans); out = [0] * len(spans); totals: Dict[str, int] = {}
+    for n in names:
+        ent = mach[n]
+        row = [day_tokens(ent, s) for _, s in spans]
+        if not row[3] and n not in cfg.get("nodes", {}) and n != LOCAL:
+            continue
+        tot = [x + y for x, y in zip(tot, row)]
+        out = [x + day_tokens(ent, s, output=True) for x, (_, s) in zip(out, spans)]
+        for d, v in (ent.get("days") or {}).items():
+            totals[d] = totals.get(d, 0) + tokens_of(v)
+        first = min(ent.get("days") or {"": 0})
+        age = now() - ent.get("ts", 0)
+        read = "never" if not ent.get("ts") else "reading…" if ent.get("partial") else "now" if age < 900 else f"{age // 3600}h ago" if age >= 3600 else f"{age // 60}m ago"
+        L.append(pad(c(label_of(cfg, n), C_TEXT, bold=True), nw) + pad(c(role_of(cfg, n), C_VIOLET if role_of(cfg, n) == "orchestrator" else C_DIM), 14)
+                 + "".join(f"{fmt_tok(x) if x else '-':>10}" for x in row) + c(f"{first[5:] or '-':>8}", C_DIM)
+                 + c(f"{read:>9}", C_DIM if read in ("now", "reading…") or "m ago" in read else C_WARN))
+    L.append(pad(c("total", C_ACCENT, bold=True), nw + 14) + "".join(c(f"{fmt_tok(x) if x else '-':>10}", C_ACCENT, bold=True) for x in tot))
+    L.append(c(pad("  output tokens", nw + 14) + "".join(f"{fmt_tok(x) if x else '-':>10}" for x in out), C_DIM))
+    if lu is not None:
+        w5 = lu.window(5 * 3600)
+        L.append(c(f"  {label_of(cfg, LOCAL)}, last 5 h: {fmt_tok(tokens_of(w5))} ({fmt_tok(w5['out'])} output)", C_DIM))
+    if grass:
+        L.append("")
+        L.extend(grass_lines(totals, weeks))
+    per = [job_usage(5 * 3600), job_usage(86400), job_usage(7 * 86400)]
+    nodes = sorted(set().union(*[x.keys() for x in per]))
+    if nodes:
+        L.append("")
+        L.append(c(f"{'SCALEOUT JOBS BY MACHINE':<30}{'5 h':>10}{'today':>10}{'7 days':>10}{'jobs 7d':>9}{'busy 7d':>9}{'$ 7d':>8}{'extra 7d':>10}", C_DIM))
+        ext = [0, 0, 0]   # extra tokens, jobs measured, all tokens of those jobs (7 days)
+        for n in nodes:
+            t = [x.get(n, {}) for x in per]
+            e = t[2].get("extra", 0)
+            ext[0] += e; ext[1] += t[2].get("measured", 0); ext[2] += t[2].get("tokens", 0)
+            L.append(pad(label_of(cfg, n), 30) + "".join(f"{fmt_tok(x.get('tokens', 0)):>10}" for x in t)
+                     + f"{int(t[2].get('jobs', 0)):>9}{t[2].get('busy_s', 0) / 3600:>8.1f}h{t[2].get('cost', 0):>8.2f}"
+                     + c(f"{fmt_tok(e) if t[2].get('measured') else '-':>10}", C_WARN if e else C_DIM))
+        if ext[1]:
+            L.append(c(f"  extra = tokens spent only because a job ran as its own agent: the context it loaded before any work "
+                       f"(system prompt, tools, CLAUDE.md, the task). 7 days: {fmt_tok(ext[0])} over {ext[1]} measured jobs, "
+                       f"{ext[0] * 100 / max(1, ext[2]):.1f}% of their tokens. Files it re-read are counted as work, and what this "
+                       f"session saved by not reading build logs is not subtracted.", C_DIM))
+    return L
+
+
+OS_NAMES = {"darwin": "macOS", "linux": "Linux", "windows": "Windows"}
+OS_TAGS = {"darwin": {"mac", "macos"}, "linux": {"linux"}, "windows": {"windows", "win"}}   # what --tags may say for an OS
+ARCH_NAMES = {"aarch64": "arm64", "x86_64": "x64", "amd64": "x64"}
+
+
+def fmt_os(st: Dict[str, Any], node: Optional[Dict[str, Any]] = None) -> str:
+    """'macOS arm64', 'Linux x64', 'Windows x64': what a job has to run on (iOS work needs macOS, bash scripts not Windows)."""
+    o = str(st.get("os") or (node or {}).get("os") or "").strip()
+    if not o:
+        return "?"
+    arch = str(st.get("arch") or "").strip().lower()
+    return (OS_NAMES.get(o.lower(), o) + " " + ARCH_NAMES.get(arch, arch)).strip()
+
+
 def cmd_status(a) -> None:
     cfg = load_cfg()
     names = a.names or None
     metrics = refresh_metrics(cfg, names, max_age=0)
     say(f"orchestrator {socket.gethostname().split('.')[0]} · agent-scaleout {VERSION}")
-    say(f"{'node':<14}{'state':<12}{'route':<8}{'mem free':>9}{'disk free':>11}{'load':>8}{'jobs':>7}  {'devices':<9}agents")
+    nw = name_w(cfg, 16)
+    say(f"{'machine':<{nw}}{'role':<14}{'os':<14}{'state':<12}{'route':<8}{'mem free':>9}{'disk free':>11}{'load':>8}{'jobs':>7}  {'devices':<9}agents")
     for name in sorted(metrics):
         st = metrics[name]
         h = node_health(cfg, name, st)
         route = "-" if not st.get("online") else ("local" if cfg["nodes"].get(name, {}).get("local") else "lan" if str(st.get("route", "")).endswith("-lan") else "tunnel")
-        say(f"{name:<14}{h:<12}{route:<8}{str(st.get('mem_free_pct', '-')) + '%':>9}{str(st.get('disk_free_gb', '-')) + 'GB':>11}"
+        say(f"{pad(label_of(cfg, name), nw)}{role_of(cfg, name):<14}{fmt_os(st, cfg['nodes'].get(name)):<14}{pad(c(h, C_OK if h == 'ok' else C_WARN), 12)}{route:<8}{str(st.get('mem_free_pct', '-')) + '%':>9}{str(st.get('disk_free_gb', '-')) + 'GB':>11}"
             f"{str(st.get('load', '-')):>8}{str(st.get('running', 0)) + '+' + str(st.get('queued', 0)):>7}  {fmt_devices(st):<9}{','.join(st.get('agents') or []) or '-'}")
     q = [j for j in all_jobs() if j.get("status") in ("queued", "dispatched", "running")]
     say(f"queue: {sum(1 for j in q if j['status'] == 'queued')} waiting · {sum(1 for j in q if j['status'] != 'queued')} running")
@@ -1737,6 +2185,10 @@ def cmd_daemon(a) -> None:
         except Exception as e:  # keep running whatever happens
             say(f"tick error: {e}")
         DAEMON_ALIVE.touch()
+        try:
+            collect_usage(load_cfg())   # each machine at most every 10 min
+        except Exception as e:
+            say(f"usage error: {e}")
         time.sleep(a.interval)
 
 
@@ -1803,7 +2255,7 @@ def cmd_runner(a) -> None:
     if a.action == "add":
         st = refresh_metrics(cfg, [a.name], max_age=0).get(a.name, {})
         labels = a.labels or ",".join(["scaleout", a.name, str(st.get("os", "")).lower(), str(st.get("arch", ""))])
-        r = n.ctl("runner-install", url, gh_token(scope, "registration-token"), rname, labels, timeout=900)
+        r = n.ctl("runner-install", url, gh_token(scope, "registration-token"), rname, labels, *([a.group] if a.group else []), timeout=900)
     else:
         r = n.ctl("runner-remove", rname, gh_token(scope, "remove-token"), timeout=300)
     print((r.stdout + r.stderr).decode().strip())
@@ -1879,31 +2331,36 @@ def run_bench(names: List[str], apply: bool = False, quiet_table: bool = False) 
     full.append({"t": now(), "nodes": cur, "total": total})
     write_json(STATE_DIR / "bench.json", full[-200:])
     if not quiet_table:
-        say(f"{'node':<14}{'model':<30}{'mem':>5}{'cores':>6}{'1-core':>8}{'all':>7}{'jobs':>6}{'score':>7}{'price':>11}{'per 10k':>9}")
+        nw = name_w(cfg, 16)
+        say(f"{'machine':<{nw}}{'model':<30}{'mem':>5}{'cores':>6}{'1-core':>8}{'all':>7}{'jobs':>6}{'score':>7}{'price':>11}{'per 10k':>9}")
         for name in sorted(cur):
             v = cur[name]
-            say(f"{name:<14}{str(v.get('model', ''))[:29]:<30}{str(v.get('mem_gb', '?')) + 'G':>5}{str(v.get('cpus', '?')):>6}"
+            say(f"{pad(label_of(cfg, name), nw)}{str(v.get('model', ''))[:29]:<30}{str(v.get('mem_gb', '?')) + 'G':>5}{str(v.get('cpus', '?')):>6}"
                 f"{v['single_x']:>7.2f}x{v['multi_x']:>6.2f}x{v['slots']:>6}{v['score']:>7}"
                 f"{(format(v['price'], ',') if v.get('price') else '-'):>11}{per10k(v['score'], v.get('price')):>9}")
     for name in names:
         if name in cur and name not in prev:
             v = cur[name]
             paid = f" for {v['price']:,} -> {per10k(v['score'], v['price'])} points per 10k" if v.get("price") else ""
-            say(f"  {name} added {v['score']} points{paid}")
+            say(f"  {label_of(cfg, name)} added {v['score']} points{paid}")
     x = f" ({total / before:.2f}x)" if before else ""
     say(f"pool score {total}  (was {before}, {total - before:+d}{x}) · 100 = one M1 8GB Mac mini doing one mobile job")
 
 
-def run_load(cfg: Dict[str, Any], jobs: int, max_s: int) -> None:
-    names = [n for n, v in cfg["nodes"].items() if not v.get("pending") and v.get("os", "").lower() != "windows"]
+def run_load(cfg: Dict[str, Any], jobs: int, max_s: int, only: Optional[List[str]] = None) -> None:
+    names = [n for n, v in cfg["nodes"].items() if not v.get("pending") and v.get("os", "").lower() != "windows" and (not only or n in only)]
+    if only and not names:
+        die(E_USAGE, "none of those machines can take load test jobs")
     slots = sum(int(cfg["nodes"][n].get("max_jobs", 2)) for n in names)
     jobs = jobs or max(4, 3 * slots)
-    say(f"load test: {jobs} synthetic build jobs (~2.5 GB, 4 busy cores, 512 MB written each) on {len(names)} node(s), {slots} slot(s)")
+    say(f"load test: {jobs} synthetic build jobs (~2.5 GB, 4 busy cores, 512 MB written each) on {', '.join(label_of(cfg, n) for n in names)} · {slots} slot(s)")
     ids = []
     for _ in range(jobs):
         jid = submit_job(cfg, "load test", agent="bench", timeout=20)
         j = load_job(jid)
         j["bench"] = True
+        if only:
+            j["only"] = names   # these machines only
         save_job(j)
         ids.append(jid)
     start = time.time()
@@ -1936,7 +2393,7 @@ def run_load(cfg: Dict[str, Any], jobs: int, max_s: int) -> None:
     done = sum(len(v) for v in per.values())
     score = int(round(done * REF_LOAD_S / wall * 100)) if wall else 0
     for n in sorted(per):
-        say(f"  {n:<14}{len(per[n]):>3} jobs · avg {sum(per[n]) / len(per[n]) / 1000:.0f}s each")
+        say(f"  {pad(label_of(cfg, n), 22)}{len(per[n]):>3} jobs · avg {sum(per[n]) / len(per[n]) / 1000:.0f}s each")
     say(f"{done}/{jobs} done in {wall / 60:.1f} min · {done / wall * 3600:.0f} jobs/hour")
     hist = bench_history()
     last = next((h["load"] for h in reversed(hist) if "load" in h), None)
@@ -1958,7 +2415,7 @@ def cmd_bench(a) -> None:
                 say(f"{t}  pool  score {h['total']:>5}  " + " ".join(f"{k}={v['score']}" for k, v in sorted(h["nodes"].items())))
         return
     if a.load:
-        return run_load(cfg, a.jobs, a.max)
+        return run_load(cfg, a.jobs, a.max, a.names or None)
     if a.self_:
         r = run(["bash", str(PKG_ROOT / "node" / "unix" / "ctl.sh"), "bench"], timeout=600)
         b = json.loads(r.stdout.decode().strip().splitlines()[-1])
@@ -2057,6 +2514,10 @@ def local_toolchain() -> Dict[str, str]:
     fv = HOME / "fvm" / "versions"
     flutter = " ".join(sorted(p.name for p in fv.iterdir() if re.fullmatch(r"\d+\.\d+\.\d+", p.name))) if fv.is_dir() else ""
     plat = HOME / "Library" / "Android" / "sdk" / "platforms"
+    # the Java Android builds run on here (Flutter's jdk-dir, else Android Studio's JBR): Gradle refuses one newer than it knows
+    jdk = re.search(r'"jdk-dir"\s*:\s*"([^"]+)"', (HOME / ".config" / "flutter" / "settings").read_text()) if (HOME / ".config" / "flutter" / "settings").exists() else None
+    java = Path(jdk.group(1)) / "bin" / "java" if jdk else Path("/Applications/Android Studio.app/Contents/jbr/Contents/Home/bin/java")
+    jv = re.search(r'version "(\d+)', run([str(java), "-version"], timeout=30).stderr.decode()) if java.exists() else None
     return {
         "FLUTTER": flutter,
         "POD": out(["pod", "--version"]),
@@ -2064,6 +2525,7 @@ def local_toolchain() -> Dict[str, str]:
         "NODE_MAJOR": re.sub(r"^v(\d+).*", r"\1", out(["node", "--version"])),
         "XCODE": re.sub(r"^Xcode ", "", out(["xcodebuild", "-version"]).splitlines()[0] if out(["xcodebuild", "-version"]) else ""),
         "ANDROID": " ".join(sorted(p.name for p in plat.iterdir())) if plat.is_dir() else "",
+        "JAVA_MAJOR": jv.group(1) if jv else "",
     }
 
 
@@ -2121,17 +2583,18 @@ def cmd_claude_setup(a) -> None:
     cfg = json.loads(sp.read_text()) if sp.exists() else {}
     if sp.exists():
         shutil.copy(sp, sp.with_suffix(".json.scaleout-bak"))
-    pre = cfg.setdefault("hooks", {}).setdefault("PreToolUse", [])
-    pre[:] = [e for e in pre if not any("offload-hook.sh" in h.get("command", "") for h in e.get("hooks", []))]
-    if not a.remove:
-        pre.append({"matcher": "Bash", "hooks": [{"type": "command", "timeout": 10,
-                                                  "command": f'[ ! -x "{hook}" ] || "{hook}"'}]})
-    if not pre:
-        cfg["hooks"].pop("PreToolUse")
+    post = SHARE / "agents" / "claude" / "post-hook.sh"
+    for event, script in (("PreToolUse", hook), ("PostToolUse", post), ("PostToolUseFailure", post)):
+        hs = cfg.setdefault("hooks", {}).setdefault(event, [])
+        hs[:] = [e for e in hs if not any(script.name in h.get("command", "") for h in e.get("hooks", []))]
+        if not a.remove:   # PostToolUse*: closes the record of a heavy command a session ran here (the queue shows it)
+            hs.append({"matcher": "Bash", "hooks": [{"type": "command", "timeout": 10, "command": f'[ ! -x "{script}" ] || "{script}"'}]})
+        if not hs:
+            cfg["hooks"].pop(event)
     if not cfg["hooks"]:
         cfg.pop("hooks")
     sp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
-    say(f"{'removed' if a.remove else 'installed'} the low-memory offload hook {'from' if a.remove else 'in'} {sp}"
+    say(f"{'removed' if a.remove else 'installed'} the low-memory offload hook and the queue's record of heavy commands run here {'from' if a.remove else 'in'} {sp}"
         + ("" if a.remove else "  (threshold: MIN_FREE in ~/.config/scaleout/hook.conf, default 25 %)"))
     if not a.remove:
         (claude / "agents").mkdir(exist_ok=True)
@@ -2362,7 +2825,9 @@ def job_usage(seconds: int) -> Dict[str, Dict[str, float]]:
     for j in all_jobs():
         if j.get("bench") or not j.get("node") or j.get("finished_at", 0) < since:
             continue
-        p = per.setdefault(j["node"], {"jobs": 0, "tokens": 0, "cost": 0.0, "busy_s": 0, "failed": 0})
+        p = per.setdefault(j["node"], {"jobs": 0, "tokens": 0, "cost": 0.0, "busy_s": 0, "failed": 0, "extra": 0, "measured": 0})
+        if j.get("start_tokens"):
+            p["extra"] += int(j["start_tokens"]); p["measured"] += 1
         p["jobs"] += 1
         p["failed"] += j.get("status") == "failed"
         p["tokens"] += tokens_of(j.get("usage") or {})
@@ -2403,23 +2868,6 @@ def bar(pct: float, width: int = 10) -> str:
     pct = max(0.0, min(100.0, pct))
     full = int(pct / 100 * width)
     return "█" * full + "░" * (width - full)
-
-
-def usage_lines(lu: "LocalUsage") -> List[str]:
-    lines = [f"{'CLAUDE TOKENS':<30}{'5 h':>10}{'today':>10}{'7 days':>10}"]
-    w = [lu.window(5 * 3600), lu.window(int(now() - time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1)))), lu.window(7 * 86400)]
-    lines.append(f"{'this machine, all sessions':<30}" + "".join(f"{fmt_tok(tokens_of(x)):>10}" for x in w))
-    lines.append(f"{'  output tokens':<30}" + "".join(f"{fmt_tok(x['out']):>10}" for x in w))
-    per = [job_usage(5 * 3600), job_usage(86400), job_usage(7 * 86400)]
-    nodes = sorted(set().union(*[p.keys() for p in per]))
-    if nodes:
-        lines.append("")
-        lines.append(f"{'WORK DONE BY NODES (jobs)':<30}{'5 h':>10}{'today':>10}{'7 days':>10}{'jobs 7d':>9}{'busy 7d':>9}{'$ 7d':>8}")
-        for n in nodes:
-            t = [p.get(n, {}) for p in per]
-            lines.append(f"{n:<30}" + "".join(f"{fmt_tok(x.get('tokens', 0)):>10}" for x in t)
-                         + f"{int(t[2].get('jobs', 0)):>9}{t[2].get('busy_s', 0) / 3600:>8.1f}h{t[2].get('cost', 0):>8.2f}")
-    return lines
 
 
 def merge_intervals(iv: List[Tuple[float, float]]) -> float:
@@ -2492,10 +2940,11 @@ def productivity_lines(jobs: List[Dict[str, Any]]) -> List[str]:
         sw = [float(r["orch"].get("swap_gb") or 0) for r in rows]
         mf = [100 - int(r["orch"].get("mem_free_pct") or 0) for r in rows]
         cp = int(rows[-1]["orch"].get("cpus") or 8)
-        L.append(f"{'THIS MACHINE, last 6 h':<30}load {spark(ld, max(max(ld), cp * 2))} {ld[-1]:.0f}/{cp}"
+        ld, sw, mf = [v[::-5][::-1] for v in (ld, sw, mf)]   # a point per 25 minutes, the newest kept
+        L.append(f"{'  this machine, last 6 h':<26}load {spark(ld, max(max(ld), cp * 2))} {ld[-1]:.0f}/{cp}"
                  f"   swap {spark(sw, max(max(sw), 1))} {sw[-1]:.0f}G   mem used {spark(mf, 100)} {mf[-1]}%")
     else:
-        L.append(f"{'THIS MACHINE, last 6 h':<30}(history starts now, every 5 min)")
+        L.append(f"{'  this machine, last 6 h':<30}(history starts now, every 5 min)")
     return L
 
 
@@ -2578,94 +3027,143 @@ def cmd_report(a) -> None:
 
 
 def cmd_usage(a) -> None:
+    cfg = load_cfg()
     lu = LocalUsage()
     lu.refresh()
     lu.last_save = 0
     lu.refresh()
-    print("\n".join(usage_lines(lu)))
+    collect_usage(cfg, max_age=0 if a.refresh else 600)
+    width = max(60, min(shutil.get_terminal_size((110, 40)).columns, 118))
+    print("\n".join(box("CLAUDE TOKENS", tokens_lines(cfg, lu, weeks=a.weeks or max(8, min(26, (width - 10) // 2))), width,
+                        "every session on each machine")))
 
 
-def top_lines(cfg: Dict[str, Any], lu: "LocalUsage", interval: int) -> List[str]:
+JOB_MARKS = {"done": ("✔", C_OK), "failed": ("✖", C_BAD), "cancelled": ("⊘", C_DIM), "running": ("●", C_ACCENT), "lost": ("?", C_WARN),
+             "dispatched": ("●", C_ACCENT), "queued": ("◌", C_WARN)}
+
+
+def top_lines(cfg: Dict[str, Any], lu: "LocalUsage", interval: int, width: int = 110) -> List[str]:
+    """The dashboard as panels. Reads only what the daemon has already gathered (no SSH), so it is cheap to redraw."""
+    width = max(72, min(width, 118))
     L: List[str] = []
-    L.append(f"agent-scaleout {VERSION} · {time.strftime('%H:%M:%S')} · every {interval}s · q quit")
-    L.append("")
-    L.append(f"{'MACHINE':<14}{'STATE':<11}{'MEM free':<17}{'SWAP':>6}{'DISK free':>11}{'LOAD/CPU':>10}{'JOBS':>6}  DEVICES")
+    L.append(c(" ◆ agent-scaleout", C_VIOLET, bold=True) + c(f" {VERSION}", C_DIM) + "   " + c(time.strftime("%H:%M:%S"), C_TEXT, bold=True)
+             + c(f"   refresh {interval}s · q quit", C_DIM))
+    # machines
     me = local_metrics()
     local = {n for n, v in cfg["nodes"].items() if v.get("local")}
+    nw = name_w(cfg)
+    rows = [c(f"{'MACHINE':<{nw}}{'ROLE':<14}{'OS':<12}{'STATE':<9}{'MEM free':<14}{'SWAP':>6}{'DISK':>6}{'LOAD/CPU':>13}{'JOBS':>6}  DEVICES", C_DIM)]
+
+    def machine(name: str, role: str, os_s: str, h: str, st: Dict[str, Any], swap: str) -> str:
+        free = float(st.get("mem_free_pct") or 0)
+        cpus = int(st.get("cpus") or 1)
+        load = float(st.get("load") or 0)
+        lc = C_OK if load < cpus else C_WARN if load < cpus * 2 else C_BAD
+        dot = c("●", C_OK if h == "ok" else C_BAD if h.startswith(("off", "down", "unreach")) else C_WARN)
+        return (pad(c(name, C_TEXT, bold=True), nw) + pad(c(role, C_VIOLET if role == "orchestrator" else C_DIM), 14) + pad(os_s, 12)
+                + pad(dot + " " + c(h, C_OK if h == "ok" else C_WARN), 9)
+                + meter(free, 8, level_color(free)) + f"{str(int(free)) + '%':>5} " + f"{swap:>6}" + f"{str(st.get('disk_free_gb', '?')) + 'G':>6}"
+                + "  " + meter(min(100, load / (cpus * 2) * 100), 4, lc) + c(f"{load:>4.1f}", lc) + c(f"/{cpus:<2}", C_DIM)
+                + f"{str(st.get('running', 0)) + '+' + str(st.get('queued', 0)):>6}  {fmt_devices(st)}")
+
     if not local:
-        L.append(f"{'orchestrator':<14}{'ok':<11}{bar(me.get('mem_free_pct', 0))} {str(me.get('mem_free_pct', '?')) + '%':>5}"
-             f"{str(me.get('swap_gb', '-')) + 'G':>6}{str(me.get('disk_free_gb', '?')) + 'G':>11}"
-             f"{me['load']:>6.1f}/{me['cpus']:<3}{'-':>6}")
+        rows.append(machine(label_of(cfg, LOCAL), "orchestrator", fmt_os({"os": platform.system(), "arch": platform.machine()}), "ok",
+                            {**me, "running": "-", "queued": "-"}, f"{me.get('swap_gb', '-')}G"))
     for name in sorted(cfg["nodes"], key=lambda x: (x not in local, x)):
         st = read_json(node_state_path(name), {})
         h = node_health(cfg, name, st) if cfg["nodes"][name].get("pending") is not True else "pending"
         age = int(now() - st.get("ts", 0)) if st.get("ts") else None
-        stale = "" if age is None or age < 90 else f" ({age // 60}m old)"
-        label = name
-        swap = f"{me.get('swap_gb', '-')}G" if name in local else "-"
-        L.append(f"{label:<14}{(h + stale)[:10]:<11}{bar(st.get('mem_free_pct', 0))} {str(st.get('mem_free_pct', '?')) + '%':>5}"
-                 f"{swap:>6}{str(st.get('disk_free_gb', '?')) + 'G':>11}"
-                 f"{float(st.get('load', 0) or 0):>6.1f}/{str(st.get('cpus', '?')):<3}"
-                 f"{str(st.get('running', 0)) + '+' + str(st.get('queued', 0)):>6}  {fmt_devices(st)}")
+        if age is not None and age >= 90:
+            h = f"{h} {age // 60}m"
+        rows.append(machine(label_of(cfg, name), role_of(cfg, name), fmt_os(st, cfg["nodes"][name]), h[:7], st,
+                            f"{me.get('swap_gb', '-')}G" if name in local else "-"))
+    L.extend(box("MACHINES", rows, width, f"{len(rows) - 1} in the pool"))
+    # queue
     jobs = all_jobs()
-    active = [j for j in jobs if j.get("status") in ("queued", "dispatched", "running")]
+    direct = direct_runs()
+    every = sorted([j for j in jobs if not j.get("bench")] + direct, key=lambda j: j.get("created", 0))
+    active = [j for j in every if j.get("status") in ("queued", "dispatched", "running")]
     today = time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1))
-    done_today = [j for j in jobs if j.get("finished_at", 0) >= today and not j.get("bench")]
-    L.append("")
-    L.append(f"QUEUE  waiting {sum(1 for j in active if j['status'] == 'queued')} · running {sum(1 for j in active if j['status'] != 'queued')}"
-             f" · finished today {sum(1 for j in done_today if j['status'] == 'done')} · failed today {sum(1 for j in done_today if j['status'] == 'failed')}")
-    recent = [j for j in jobs if not j.get("bench")][-6:]
-    for j in reversed(recent):
+    done_today = [j for j in every if (j.get("finished_at") or 0) >= today]
+    waiting, running = sum(1 for j in active if j["status"] == "queued"), sum(1 for j in active if j["status"] != "queued")
+    ok, bad = sum(1 for j in done_today if j["status"] == "done"), sum(1 for j in done_today if j["status"] == "failed")
+    in_s = sum(1 for j in active if j.get("direct"))
+    rows = [c("◌", C_WARN) + f" waiting {c(waiting, C_WARN if waiting else C_DIM, bold=True)}   " + c("●", C_ACCENT) + f" running {c(running, C_ACCENT if running else C_DIM, bold=True)}"
+            + (c(f" ({in_s} in sessions)", C_DIM) if in_s else "") + "   "
+            + c("✔", C_OK) + f" finished today {c(ok, C_OK if ok else C_DIM, bold=True)}   " + c("✖", C_BAD) + f" failed today {c(bad, C_BAD if bad else C_DIM, bold=True)}"
+            + c(f"   ▸ = run in a session, not through scaleout", C_DIM)]
+    for j in reversed(every[-8:]):
         age = int(now() - (j.get("finished_at") or j.get("dispatched_at") or j.get("created", now())))
-        L.append(f"  {j['id'][-15:]}  {str(j.get('node') or '-'):<10} {j.get('status', ''):<10} {age // 60:>4}m ago"
-                 f"  {fmt_tok(tokens_of(j.get('usage') or {})):>7} tok  {(j.get('tags') and ','.join(j['tags'])) or ''}")
+        ago = f"{age // 86400}d" if age >= 172800 else f"{age // 3600}h" if age >= 7200 else f"{age // 60}m"
+        mark, col = JOB_MARKS.get(j.get("status", ""), ("·", C_DIM))
+        if j.get("direct"):
+            rows.append(c(mark, col) + " " + c("▸ ", C_VIOLET) + c(f"{'session ' + j.get('session', '')[:5]:<13}", C_DIM) + "  " + pad(label_of(cfg, j["node"]), nw + 1)
+                        + pad(c(j.get("status", ""), col), 11) + c(f"{ago:>5} ago", C_DIM) + "  " + c(j.get("what", ""), C_TEXT)
+                        + c(f"  {Path(j.get('cwd') or '.').name}", C_DIM))
+            continue
+        rows.append(c(mark, col) + " " + c(f"{j['id'][-15:]}", C_DIM) + "  " + pad(label_of(cfg, j["node"]) if j.get("node") else "-", nw + 1)
+                    + pad(c(j.get("status", ""), col), 11) + c(f"{ago:>5} ago", C_DIM)
+                    + f"  {fmt_tok(tokens_of(j.get('usage') or {})):>7} tok  " + c((j.get("tags") and ",".join(j["tags"])) or "", C_DIM))
         if j.get("status") == "queued" and j.get("wait"):
-            L.append(f"      waits for room — {j['wait'][:110]}")
-    L.append("")
+            rows.append(c(f"    waits for room: {j['wait']}", C_WARN))
+    L.extend(box("WORK", rows, width, "scaleout jobs and heavy commands run in sessions"))
+    # tokens of every machine, and the days as grass
+    L.extend(box("CLAUDE TOKENS", tokens_lines(cfg, lu, weeks=max(8, min(26, (width - 10) // 2))), width, "every session on each machine"))
+    # what Claude is doing right now
     try:
         cn = claude_now()
         cn["nodes"] = {n: read_json(node_state_path(n), {}) for n in cfg["nodes"] if not cfg["nodes"][n].get("local")}
-        L.extend(claude_now_lines(cn))
-        L.append("")
+        cl = claude_now_lines(cn)
+        head = cl[0].replace("CLAUDE NOW", "", 1).strip() if cl else ""
+        L.extend(box("CLAUDE NOW", [c(head, C_TEXT)] + cl[1:], width))
     except Exception:   # the dashboard never dies on a transcript it cannot read
         pass
-    L.extend(productivity_lines(jobs))
-    L.append("")
-    L.extend(usage_lines(lu))
+    pl = productivity_lines(jobs)
+    if pl:
+        pl[0] = c(pl[0].replace("PRODUCTIVITY", " " * 12, 1), C_DIM)
+        pl = [re.sub("[" + SPARKS + "]+", lambda m: c(m.group(), 67), x) for x in pl]   # the little graphs stay in the background
+    L.extend(box("PRODUCTIVITY", pl, width))
     return L
 
 
 def cmd_top(a) -> None:
-    import curses
     cfg_t = 0.0
     cfg = load_cfg()
     lu = LocalUsage()
 
-    def loop(scr: Any) -> None:
-        nonlocal cfg, cfg_t
-        curses.curs_set(0)
-        scr.timeout(a.interval * 1000)   # sleep in getch between refreshes: no busy loop
+    def frame() -> List[str]:
+        size = shutil.get_terminal_size((110, 40))
+        lu.refresh()
+        return [clip(x, size.columns - 1) for x in top_lines(cfg, lu, a.interval, size.columns - 1)][:max(3, size.lines - 1)]
+
+    if a.once or not sys.stdout.isatty() or not sys.stdin.isatty():
+        lu.refresh()
+        print("\n".join(top_lines(cfg, lu, a.interval, shutil.get_terminal_size((110, 40)).columns - 1)))
+        return
+    import select
+    import termios
+    import tty
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    out = sys.stdout
+    try:
+        tty.setcbreak(fd)
+        out.write("\x1b[?1049h\x1b[?25l")   # the other screen, no cursor
         while True:
             if now() - cfg_t > 30:
                 cfg, cfg_t = load_cfg(), now()
-            lu.refresh()
-            lines = top_lines(cfg, lu, a.interval)
-            scr.erase()
-            hh, ww = scr.getmaxyx()
-            for i, line in enumerate(lines[:hh - 1]):
-                try:
-                    scr.addstr(i, 0, line[:ww - 1], curses.A_BOLD if line[:1].isupper() and line.split()[0].isupper() else 0)
-                except curses.error:
-                    pass
-            scr.refresh()
-            ch = scr.getch()
-            if ch in (ord("q"), ord("Q"), 27):
-                break
-    if a.once or not sys.stdout.isatty():
-        lu.refresh()
-        print("\n".join(top_lines(cfg, lu, a.interval)))
-        return
-    curses.wrapper(loop)
+            out.write("\x1b[H" + "".join(line + "\x1b[K\n" for line in frame()) + "\x1b[J")
+            out.flush()
+            if select.select([fd], [], [], a.interval)[0]:   # sleeps here between redraws: no busy loop
+                ch = os.read(fd, 8)
+                if ch[:1] in (b"q", b"Q", b"\x03") or ch == b"\x1b":
+                    break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        out.write("\x1b[?25h\x1b[?1049l")
+        out.flush()
 
 
 # ── cli ──────────────────────────────────────────────────────────────────────
@@ -2702,7 +3200,13 @@ def main(argv: Optional[List[str]] = None) -> None:
     s.add_argument("name"); s.add_argument("--os", choices=["unix", "windows"], default="unix"); s.add_argument("--hours", type=int, default=24)
     s.add_argument("--no-brew", action="store_true", help="do not install Homebrew on a macOS node")
     s.add_argument("--no-claude", action="store_true", help="do not install Claude Code on the node")
+    s.add_argument("--no-prep", action="store_true", help="Linux: skip the basics (build packages, never sleep, run while logged out)")
+    s.add_argument("--autologin", action="store_true", help="Linux desktop: log in by itself after a restart (GDM)")
+    s.add_argument("--serve", type=int, default=60, metavar="MIN",
+                   help="minutes this machine serves the script on its LAN address, for a short line to type (0: only the long line)")
     node_opts(s); s.set_defaults(fn=cmd_invite)
+    s = sp.add_parser("_serve", help=argparse.SUPPRESS)
+    s.add_argument("folder"); s.add_argument("host"); s.add_argument("port"); s.add_argument("minutes"); s.add_argument("token"); s.set_defaults(fn=cmd_serve)
 
     s = sp.add_parser("_enroll", help=argparse.SUPPRESS); s.add_argument("name"); s.set_defaults(fn=cmd_enroll)
     s = sp.add_parser("remove", help="detach a node and undo its setup"); s.add_argument("name"); s.set_defaults(fn=cmd_remove)
@@ -2763,8 +3267,12 @@ def main(argv: Optional[List[str]] = None) -> None:
     s.add_argument("--remove", action="store_true"); s.set_defaults(fn=cmd_claude_setup)
     s = sp.add_parser("top", help="live dashboard: orchestrator + nodes (memory, disk, load, jobs) and Claude tokens; low CPU")
     s.add_argument("-i", "--interval", type=int, default=5); s.add_argument("--once", action="store_true"); s.set_defaults(fn=cmd_top)
-    s = sp.add_parser("usage", help="Claude tokens: all sessions on this machine, and work done by each node")
+    s = sp.add_parser("usage", help="Claude tokens of every machine (all sessions there), day by day, and the jobs each one ran")
+    s.add_argument("--weeks", type=int, help="weeks of days to draw (default: what fits, up to 26)")
+    s.add_argument("--refresh", action="store_true", help="ask every machine now instead of using numbers up to 10 min old")
     s.set_defaults(fn=cmd_usage)
+    s = sp.add_parser("rename", help="give a machine your own name (orchestrator and node are roles); no new name: back to its id")
+    s.add_argument("name"); s.add_argument("new", nargs="?"); s.set_defaults(fn=cmd_rename)
     s = sp.add_parser("tick", help="run one scheduling round"); s.set_defaults(fn=cmd_tick)
     s = sp.add_parser("daemon", help="schedule forever (installed by install-daemon)"); s.add_argument("--interval", type=int, default=15); s.set_defaults(fn=cmd_daemon)
     s = sp.add_parser("install-daemon", help="run the scheduler in the background (launchd / systemd --user)"); s.set_defaults(fn=cmd_install_daemon)
@@ -2772,9 +3280,18 @@ def main(argv: Optional[List[str]] = None) -> None:
     s = sp.add_parser("runner", help="GitHub Actions self-hosted runners on nodes")
     s.add_argument("action", choices=["add", "remove", "ls"]); s.add_argument("name", nargs="?")
     s.add_argument("--org"); s.add_argument("--repo"); s.add_argument("--labels"); s.add_argument("--runner-name")
+    s.add_argument("--group", help="org runner group to join (default: the org's Default group)")
     s.set_defaults(fn=cmd_runner)
 
     a = p.parse_args(argv)
+    paint_auto()
+    if a.cmd not in ("add", "invite", "_enroll", "init", "rename"):   # a name set with `scaleout rename` works wherever an id does
+        cfg = read_json(CONFIG, {})
+        for attr in ("name", "node"):
+            if isinstance(getattr(a, attr, None), str):
+                setattr(a, attr, node_id(cfg, getattr(a, attr)))
+        if isinstance(getattr(a, "names", None), list):
+            a.names = [node_id(cfg, x) for x in a.names]
     a.fn(a)
 
 

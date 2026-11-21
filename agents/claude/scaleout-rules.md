@@ -2,7 +2,7 @@
 
 This machine is an agent-scaleout orchestrator. Heavy work goes through the scaleout queue: the orchestrator runs it
 itself while it has room (when `scaleout local on`), hands it to a node when it is busy, and keeps it queued when nobody
-has room. `scaleout status` / `scaleout top` show the machines.
+has room. `scaleout status` / `scaleout top` show the machines (name, role, OS); `scaleout usage` shows the Claude tokens of every machine, day by day.
 
 ## Keep here
 - Conversation, planning, reading and editing code, git.
@@ -21,7 +21,13 @@ has room. `scaleout status` / `scaleout top` show the machines.
 - Tags:
   - `ios-device` / `android-device`: a phone is plugged into the node.
   - `emulator`: a node with room for an Android emulator.
-  - `xcode`, `mac`, `linux`: what the node is.
+  - `mac` / `linux` / `windows`: the node's OS. `scaleout status` and `scaleout top` show each machine's OS (`macOS arm64`, `Linux x64`, `Windows x64`).
+  - `xcode`: a Mac with Xcode.
+- Pick the OS by the work, and say it with a tag so the job waits for the right machine:
+  - iOS and macOS work (`xcodebuild`, iOS Simulator, `pod install`, anything that writes `Podfile.lock` or the Xcode project) → `--tags mac` (or `xcode`).
+  - Android, web, backend, tests and research run on any OS; leave the OS tag out.
+  - A job that needs bash scripts or `--repo` does not go to a Windows node.
+  - Results that differ by OS (golden images, native binaries) → tag the OS they must match.
 - Memory decides how many jobs a node runs at once (no fixed limit on simulators or emulators). Pass `--mem <GB>` when a job needs more than usual, e.g. several simulators.
 - Write the task so it stands alone: what to do, which folder, how to check it. The node's agent has not seen this conversation.
 - A job waits in the queue while no machine has room (memory, CPU load, a free phone). `scaleout run`/`wait` print why, and

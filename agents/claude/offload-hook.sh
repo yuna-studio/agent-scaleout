@@ -2,6 +2,7 @@
 # agent-scaleout PreToolUse hook for Claude Code's Bash tool.
 # When this machine is short on memory or overloaded and a healthy node is available, a heavy build/test command is refused here
 # (exit 2: Claude reads the message and sends the work to a node). Every other command passes untouched.
+# A heavy command that does run here is remembered (direct-run.py), so `scaleout top` shows it in the queue.
 #   bypass for one command : put SCALEOUT_LOCAL=1 in it
 #   thresholds             : in ~/.config/scaleout/hook.conf
 #                              MIN_FREE=<percent free memory>   (default 25)
@@ -13,10 +14,16 @@ py="$(command -v python3 || echo /usr/bin/python3)"
 cmd="$(printf '%s' "$input" | "$py" -c 'import json,sys; print(json.load(sys.stdin).get("tool_input",{}).get("command",""))' 2>/dev/null)"
 [ -n "$cmd" ] || exit 0
 [ -n "${SCALEOUT_JOB_ID:-}" ] && exit 0   # already a scaleout job (here or on a node): run it
-case "$cmd" in *SCALEOUT_LOCAL=1*|scaleout\ *|*"| scaleout "*|*"/scaleout "*) exit 0 ;; esac
+case "$cmd" in scaleout\ *|*"| scaleout "*|*"/scaleout "*) exit 0 ;; esac
+case "$cmd" in ssh\ *|*"&& ssh "*|*"; ssh "*) exit 0 ;; esac   # runs on another machine, not here
 
 heavy='(^|[;&|[:space:]/])(flutter (build|test|drive)|dart test|xcodebuild|gradlew[^;&|]*(assemble|build|test|connected|bundle)|maestro test|playwright test|(npm|pnpm) (run )?(test|build|e2e)|yarn (test|build|e2e)|emulator -avd|simctl boot)'
 printf '%s' "$cmd" | grep -Eq "$heavy" || exit 0
+here() {   # it runs on this machine: remember it for the queue (post-hook.sh closes the record), then let it run
+  printf '%s' "$input" | "$py" "$(dirname "$0")/direct-run.py" start >/dev/null 2>&1
+  exit 0
+}
+case "$cmd" in *SCALEOUT_LOCAL=1*) here ;; esac
 
 MIN_FREE=25
 MAX_LOAD_PER_CPU=3
@@ -31,7 +38,7 @@ fi
 why=""
 [ "$free" -lt "$MIN_FREE" ] && why="has only ${free}% memory free"
 [ -z "$why" ] && [ "$load" -ge $((MAX_LOAD_PER_CPU * cpus)) ] && why="is overloaded (load ${load} on ${cpus} cores)"
-[ -n "$why" ] || exit 0
+[ -n "$why" ] || here
 
 # a node the orchestrator saw healthy in the last 3 minutes
 node="$("$py" - "${SCALEOUT_STATE:-$HOME/.local/state/scaleout}/nodes" <<'PY' 2>/dev/null
@@ -49,7 +56,7 @@ for p in sorted(pathlib.Path(sys.argv[1]).glob("*.json")):
         break
 PY
 )"
-[ -n "$node" ] || exit 0
+[ -n "$node" ] || here
 
 cat >&2 <<MSG
 agent-scaleout: this machine ${why}, so heavy builds and tests go to a node (${node} is free).

@@ -1,6 +1,6 @@
 #!/bin/bash
 # GitHub Actions self-hosted runner on a node (macOS / Linux). Called by `ctl runner-install|runner-remove`.
-#   gh-runner.sh install <url> <registration-token> <name> <labels>
+#   gh-runner.sh install <url> <registration-token> <name> <labels> [runner group]
 #   gh-runner.sh remove  <name> <removal-token>
 # Runners live in ~/.scaleout/gh-runners/<name> and run as the node user (launchd on macOS, systemd --user on Linux).
 set -eu
@@ -11,7 +11,7 @@ case "$ARCH" in arm64|aarch64) arch=arm64;; x86_64|amd64) arch=x64;; armv7l) arc
 cmd="${1:-}"; shift || true
 case "$cmd" in
   install)
-    url="$1"; token="$2"; name="$3"; labels="${4:-}"
+    url="$1"; token="$2"; name="$3"; labels="${4:-}"; group="${5:-}"
     d="$R/$name"; mkdir -p "$d"; cd "$d"
     if [ ! -x ./config.sh ]; then
       ver="$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p' | head -1)"
@@ -19,7 +19,7 @@ case "$cmd" in
       curl -fsSL -o runner.tgz "https://github.com/actions/runner/releases/download/v$ver/actions-runner-$os-$arch-$ver.tar.gz"
       tar -xzf runner.tgz && rm -f runner.tgz
     fi
-    ./config.sh --unattended --replace --url "$url" --token "$token" --name "$name" --labels "$labels" --work _work
+    ./config.sh --unattended --replace --url "$url" --token "$token" --name "$name" --labels "$labels" --work _work ${group:+--runnergroup "$group"}
     if [ "$OS" = Darwin ]; then
       ./svc.sh install >/dev/null && ./svc.sh start >/dev/null
     else
