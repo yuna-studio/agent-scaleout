@@ -1,13 +1,14 @@
 #!/bin/bash
 # agent-scaleout PreToolUse hook for Claude Code's Bash tool.
-# When this machine is short on memory or overloaded and a healthy node is available, a heavy build/test command is refused here
-# (exit 2: Claude reads the message and sends the work to a node). Every other command passes untouched.
-# A heavy command that does run here is remembered (direct-run.py), so `scaleout top` shows it in the queue.
-#   bypass for one command : put SCALEOUT_LOCAL=1 in it
-#   thresholds             : in ~/.config/scaleout/hook.conf
-#                              MIN_FREE=<percent free memory>   (default 25)
-#                              MAX_LOAD_PER_CPU=<1-min load / cores> (default 3: e.g. load 24 on 8 cores)
-#   always offload         : MIN_FREE=101
+# While a node in the pool has room, a heavy build/test command is refused here (exit 2: Claude reads the message and sends
+# the work to the pool, where several machines run items at the same time). Every other command passes untouched.
+# A heavy command that does run here is remembered (direct-run.py), so `scaleout top` shows it with the jobs.
+#   bypass for one command : put SCALEOUT_LOCAL=1 in it (a device attached here, a tool only this machine has)
+#   settings               : in ~/.config/scaleout/hook.conf
+#                              OFFLOAD=always    (default) heavy work goes to the pool whenever a node has room
+#                              OFFLOAD=pressure  only when this machine is short:
+#                                MIN_FREE=<percent free memory> (default 25), MAX_LOAD_PER_CPU=<load / cores> (default 3)
+#                              OFFLOAD=off       never refuse
 set -u
 input="$(cat)"
 py="$(command -v python3 || echo /usr/bin/python3)"
@@ -25,9 +26,12 @@ here() {   # it runs on this machine: remember it for the queue (post-hook.sh cl
 }
 case "$cmd" in *SCALEOUT_LOCAL=1*) here ;; esac
 
+OFFLOAD=always
 MIN_FREE=25
 MAX_LOAD_PER_CPU=3
 [ -f "$HOME/.config/scaleout/hook.conf" ] && . "$HOME/.config/scaleout/hook.conf"
+[ "${MIN_FREE:-25}" -gt 100 ] 2>/dev/null && OFFLOAD=always   # the old way to say "always"
+[ "$OFFLOAD" = off ] && here
 if [ "$(uname -s)" = Darwin ]; then
   free="$(sysctl -n kern.memorystatus_level 2>/dev/null || echo 100)"
   load="$(sysctl -n vm.loadavg | awk '{printf "%d", $2}')"; cpus="$(sysctl -n hw.ncpu)"
@@ -36,15 +40,24 @@ else
   load="$(cut -d' ' -f1 /proc/loadavg | cut -d. -f1)"; cpus="$(nproc)"
 fi
 why=""
-[ "$free" -lt "$MIN_FREE" ] && why="has only ${free}% memory free"
-[ -z "$why" ] && [ "$load" -ge $((MAX_LOAD_PER_CPU * cpus)) ] && why="is overloaded (load ${load} on ${cpus} cores)"
-[ -n "$why" ] || here
+if [ "$OFFLOAD" = pressure ]; then
+  [ "$free" -lt "$MIN_FREE" ] && why="this machine has only ${free}% memory free"
+  [ -z "$why" ] && [ "$load" -ge $((MAX_LOAD_PER_CPU * cpus)) ] && why="this machine is overloaded (load ${load} on ${cpus} cores)"
+  [ -n "$why" ] || here
+else
+  why="heavy work runs in the pool, where several machines take items at the same time"
+fi
 
-# a node the orchestrator saw healthy in the last 3 minutes
-node="$("$py" - "${SCALEOUT_STATE:-$HOME/.local/state/scaleout}/nodes" <<'PY' 2>/dev/null
+# nodes the orchestrator saw healthy in the last 3 minutes, the least busy first (its own name from `scaleout rename`)
+node="$("$py" - "${SCALEOUT_STATE:-$HOME/.local/state/scaleout}/nodes" "${SCALEOUT_CONF:-$HOME/.config/scaleout}/config.json" <<'PY' 2>/dev/null
 import json, pathlib, sys, time
+try:
+    nodes = json.loads(pathlib.Path(sys.argv[2]).read_text()).get("nodes", {})
+except Exception:
+    nodes = {}
+free = []
 for p in sorted(pathlib.Path(sys.argv[1]).glob("*.json")):
-    if p.stem == "orchestrator":   # this machine itself
+    if p.stem == "orchestrator" or (nodes.get(p.stem) or {}).get("local"):   # this machine itself
         continue
     try:
         s = json.loads(p.read_text())
@@ -52,16 +65,19 @@ for p in sorted(pathlib.Path(sys.argv[1]).glob("*.json")):
         continue
     if s.get("online") and time.time() - s.get("ts", 0) < 180 and s.get("mem_free_pct", 0) >= 15 \
             and s.get("disk_free_gb", 0) >= 5 and s.get("runner") is not False:
-        print(p.stem)
-        break
+        busy = float(s.get("load") or 0) / max(1, int(s.get("cpus") or 1)) + int(s.get("running") or 0)
+        free.append((busy, (nodes.get(p.stem) or {}).get("label") or p.stem))
+print(", ".join(n for _, n in sorted(free)[:3]))
 PY
 )"
 [ -n "$node" ] || here
 
 cat >&2 <<MSG
-agent-scaleout: this machine ${why}, so heavy builds and tests go to a node (${node} is free).
-Send it as a job instead of running it here:
-  echo "<what to run and how to check it>" | scaleout run --repo <git repo> [--subdir <path>] [--apply]
-or use the scaleout subagent. If it truly must run on this machine (a device attached here), prefix the command with SCALEOUT_LOCAL=1.
+agent-scaleout: ${why} (free now: ${node}).
+Send it as a job instead of running it here. Several independent items: queue them all, keep working, collect:
+  id=\$(echo "<what to run and how to check it>" | scaleout submit --repo <git repo> [--subdir <path>] [--tags mac])
+  … then  scaleout wait \$id   (or one scaleout subagent per item, started in the same message)
+One item you must wait for: echo "<…>" | scaleout run --repo <git repo> [--apply]
+If it truly must run on this machine (a device attached here), prefix the command with SCALEOUT_LOCAL=1.
 MSG
 exit 2

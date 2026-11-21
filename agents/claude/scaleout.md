@@ -1,6 +1,6 @@
 ---
 name: scaleout
-description: Hand a heavy job (build, test suite, E2E, long research, big refactor) to another machine in the scaleout pool and bring back only the final report. Use when this machine is short on memory/CPU or a job would take long. A coding agent on the node does the work; this subagent only relays. The task you pass must be self-contained — what to do, which folder, and where to leave results (e.g. push a branch) — because the node's agent has not seen this conversation.
+description: Hand a heavy job (build, test suite, E2E, long research, big refactor) to another machine in the scaleout pool and bring back only the final report. Use for any heavy item, not only when this machine is short on memory: for several independent items, start one of these subagents per item in the same message so they run at the same time. A coding agent on the node does the work; this subagent only relays. The task you pass must be self-contained — what to do, which folder, and where to leave results (e.g. push a branch) — because the node's agent has not seen this conversation.
 tools: Bash
 model: haiku
 ---

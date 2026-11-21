@@ -8,10 +8,28 @@ has room. `scaleout status` / `scaleout top` show the machines (name, role, OS);
 - Conversation, planning, reading and editing code, git.
 - Quick checks: `dart analyze` / `tsc` on a few files, a single test file, small scripts.
 
-## Send to a node
+## Send to the pool
 - Full builds: `flutter build`, `xcodebuild` (archive, build-for-testing), `./gradlew assemble…`, web production builds.
 - Full test suites, coverage runs, E2E (Maestro, Playwright, iOS Simulator, Android emulator).
 - Long research, large refactors, or anything that will run for many minutes.
+- Send these even when this machine has room: the pool has several machines, and work done here runs one at a time.
+
+## Fire, keep working, collect (do not wait in line)
+Do not run heavy items one after another, waiting on each. Hand them off and carry on:
+1. Split the work into items that do not need each other's results (e.g. Android build · iOS build · unit tests ·
+   E2E per platform · each product). Each item's prompt stands alone.
+2. Queue them all at once, without waiting: `id=$(echo "<item>" | scaleout submit --repo <repo> [--tags …])` per item
+   (submit prints the job id and returns at once). Or start several `scaleout` subagents in one message.
+3. While they run, do the work that does not depend on them: read and edit code, write the next items, update docs.
+4. Collect: `scaleout wait <id>` for each (exit 2 = still running, wait again). Act on each result as it comes;
+   a failed item is fixed and sent again on its own, the others stay.
+Wait for one result first only when the next step really depends on it (e.g. a build that the E2E needs).
+
+An item does not have to stay in this session. Hand off whatever can be written down as a standalone task: heavy or long
+items to the pool (any machine, a separate agent per job), light parallel items (research, reading, drafting) to background
+subagents. Keep in this session only what depends on this conversation: decisions being made now, the user's latest
+corrections, small steps. Handing off costs a little (the receiving agent loads its own context, about 1% of a job's tokens;
+`scaleout usage` shows it as "wasted by scaleout"); running independent items one after another here costs far more time.
 
 ## How
 - Use the `scaleout` subagent, or run it yourself:
