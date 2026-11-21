@@ -2052,10 +2052,9 @@ def tokens_lines(cfg: Dict[str, Any], lu: Optional["LocalUsage"], weeks: int = 1
                      + f"{int(t[2].get('jobs', 0)):>9}{t[2].get('busy_s', 0) / 3600:>8.1f}h{t[2].get('cost', 0):>8.2f}"
                      + c(f"{fmt_tok(e) if t[2].get('measured') else '-':>10}", C_WARN if e else C_DIM))
         if ext[1]:
-            L.append(c(f"  extra = tokens spent only because a job ran as its own agent: the context it loaded before any work "
-                       f"(system prompt, tools, CLAUDE.md, the task). 7 days: {fmt_tok(ext[0])} over {ext[1]} measured jobs, "
-                       f"{ext[0] * 100 / max(1, ext[2]):.1f}% of their tokens. Files it re-read are counted as work, and what this "
-                       f"session saved by not reading build logs is not subtracted.", C_DIM))
+            L.append(c(f"  extra 7d: {fmt_tok(ext[0])} over {ext[1]} jobs = {ext[0] * 100 / max(1, ext[2]):.1f}% of their tokens"
+                       f" — spent only because each ran as its own agent", C_DIM))
+            L.append(c("  = the context a job loads before any work · not counted: files it re-read, logs this session skipped", C_DIM))
     return L
 
 
