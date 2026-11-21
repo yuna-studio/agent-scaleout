@@ -471,7 +471,9 @@ class E2E(unittest.TestCase):
     def test_98d_session_runs(self):
         """A heavy command a session runs here (not through scaleout) is remembered by the hooks and shown with the jobs."""
         hooks = ROOT / "agents/claude"
-        env = dict(os.environ, SCALEOUT_STATE=str(so.STATE_DIR), HOME=str(TMP / "hookhome"))   # no hook.conf, no nodes: it runs here
+        (TMP / "hookhome/.config/scaleout").mkdir(parents=True, exist_ok=True)
+        (TMP / "hookhome/.config/scaleout/hook.conf").write_text("OFFLOAD=pressure\n")   # this machine has room: it runs here
+        env = dict(os.environ, SCALEOUT_STATE=str(so.STATE_DIR), SCALEOUT_CONF=str(so.CONF_DIR), HOME=str(TMP / "hookhome"))
         hook = lambda script, data: subprocess.run(["bash", str(hooks / script)], input=json.dumps(data).encode(), env=env,
                                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode
         pre = lambda tid, cmd, bg=False: hook("offload-hook.sh", {"session_id": "sess1", "cwd": "/p/app", "tool_use_id": tid,
@@ -570,6 +572,25 @@ class E2E(unittest.TestCase):
         self.assertGreaterEqual(per["extra"], 20003)
         self.assertGreaterEqual(per["measured"], 1)
         self.assertIn("wasted 7d", "\n".join(so.tokens_lines(so.load_cfg(), None, weeks=2, grass=False)))
+
+    def test_98i_offload_always(self):
+        """By default a heavy command is sent to the pool whenever a node has room, naming the free machines."""
+        home = TMP / "hookhome2"; home.mkdir(exist_ok=True)
+        env = dict(os.environ, SCALEOUT_STATE=str(so.STATE_DIR), SCALEOUT_CONF=str(so.CONF_DIR), HOME=str(home))
+        for n in ("n1", "n2"):   # healthy and fresh
+            st = so.read_json(so.node_state_path(n), {}); st.update(online=True, ts=so.now(), mem_free_pct=80, disk_free_gb=50, runner=True, load=0.1, cpus=8)
+            so.write_json(so.node_state_path(n), st)
+        cmd = "cd app && " + "flutter" + " test"
+        r = subprocess.run(["bash", str(ROOT / "agents/claude/offload-hook.sh")], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           input=json.dumps({"session_id": "s", "tool_use_id": "toolu_off1", "tool_input": {"command": cmd}}).encode())
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("scaleout submit", r.stderr.decode())
+        self.assertIn("free now:", r.stderr.decode())
+        (home / ".config/scaleout").mkdir(parents=True, exist_ok=True)
+        (home / ".config/scaleout/hook.conf").write_text("OFFLOAD=off\n")
+        r = subprocess.run(["bash", str(ROOT / "agents/claude/offload-hook.sh")], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           input=json.dumps({"session_id": "s", "tool_use_id": "toolu_off2", "tool_input": {"command": cmd}}).encode())
+        self.assertEqual(r.returncode, 0)
 
     def test_98b_claude_now(self):
         """Sessions working now, their running subagents (finished or stale ones left out), names from /rename."""
