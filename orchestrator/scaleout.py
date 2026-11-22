@@ -33,7 +33,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "0.9.3"
+VERSION = "0.9.4"
 HOME = Path.home()
 CONF_DIR = Path(os.environ.get("SCALEOUT_CONF", HOME / ".config" / "scaleout"))
 STATE_DIR = Path(os.environ.get("SCALEOUT_STATE", HOME / ".local" / "state" / "scaleout"))
@@ -3480,7 +3480,7 @@ def efficiency_lines(cfg: Dict[str, Any], jobs: List[Dict[str, Any]], nw: int) -
     for j in jobs:
         if j.get("status") in ("dispatched", "running") and j.get("node"):
             running[j["node"]] = running.get(j["node"], 0) + 1
-    L = [c(f"{'MACHINE':<{nw}}{'JOBS':>9}{'CPU':>7}{'MEM':>7}{'STRAIN':>16}  {'BOTTLENECK':<11}{'SCORE':>7}{'LIVE':>7}", C_DIM)]
+    L = [c(f"{'MACHINE':<{nw}}{'JOBS':>9}{'LOAD':>8}{'MEM':>7}{'STRAIN':>16}  {'BOTTLENECK':<11}{'SCORE':>7}{'LIVE':>7}", C_DIM)]
     tot_score = live_score = 0.0
     for name in sorted(cfg["nodes"], key=lambda x: (not cfg["nodes"][x].get("local"), x)):
         n = cfg["nodes"][name]
@@ -3495,7 +3495,7 @@ def efficiency_lines(cfg: Dict[str, Any], jobs: List[Dict[str, Any]], nw: int) -
         tot_score += score; live_score += live
         col = C_OK if strain < 0.6 else C_WARN if strain < 0.9 else C_BAD
         L.append(pad(c(label_of(cfg, name), C_TEXT, bold=True), nw) + f"{f'{busy}/{cap}':>9}"
-                 + f"{float(st.get('load', 0) or 0) * 100 / cores:>6.0f}%" + f"{gates['memory'] * 100:>6.0f}%"
+                 + f"{float(st.get('load', 0) or 0) / cores:>7.1f}×" + f"{gates['memory'] * 100:>6.0f}%"
                  + "  " + meter(strain * 100, 8, col) + c(f"{strain * 100:>5.0f}%", col)
                  + "  " + pad(c(neck, col if strain >= 0.6 else C_DIM), 11)
                  + c(f"{score:>7.0f}" if score else f"{'-':>7}", C_DIM) + c(f"{live:>7.0f}" if score else f"{'-':>7}", col))
@@ -3569,7 +3569,7 @@ def top_lines(cfg: Dict[str, Any], lu: "LocalUsage", interval: int, width: int =
                             f"{me.get('swap_gb', '-')}G" if name in local else "-"))
     L.extend(box("MACHINES", rows, width, f"{len(rows) - 1} in the pool"))
     try:
-        L.extend(box("EFFICIENCY", efficiency_lines(cfg, all_jobs(), nw), width, "strain = the fullest gate · bottleneck = which one"))
+        L.extend(box("EFFICIENCY", efficiency_lines(cfg, all_jobs(), nw), width, "load = per core (full at 2×) · strain = the fullest gate"))
     except Exception:   # the dashboard never dies on a state file it cannot read
         pass
     # queue

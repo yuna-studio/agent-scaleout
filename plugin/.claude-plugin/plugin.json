@@ -1,7 +1,7 @@
 {
   "name": "scaleout",
   "description": "Send heavy builds, tests and E2E to the scaleout pool and run independent items at the same time: offload hook, the rules every session gets, a relay subagent, /scaleout:status · top · usage.",
-  "version": "0.9.3",
+  "version": "0.9.4",
   "author": { "name": "Yuna Studio" },
   "homepage": "https://github.com/yuna-studio/agent-scaleout",
   "repository": "https://github.com/yuna-studio/agent-scaleout",
