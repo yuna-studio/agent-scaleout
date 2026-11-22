@@ -107,9 +107,11 @@ install_runner_service() {
     echo "SCALEOUT_RUNNER launchd"
   elif has_systemd; then
     mkdir -p "$SU"
-    printf '[Unit]\nDescription=agent-scaleout runner\n[Service]\nType=oneshot\nExecStart=/bin/bash %%h/.scaleout/bin/runner.sh\n' > "$SU/scaleout-runner.service"
+    # no start limit: the path unit starts the service whenever the queue has files, and a limit hit leaves both units failed
+    printf '[Unit]\nDescription=agent-scaleout runner\nStartLimitIntervalSec=0\n[Service]\nType=oneshot\nExecStart=/bin/bash %%h/.scaleout/bin/runner.sh\n' > "$SU/scaleout-runner.service"
     printf '[Unit]\nDescription=agent-scaleout queue watch\n[Path]\nPathExistsGlob=%%h/.scaleout/queue/*\nUnit=scaleout-runner.service\n[Install]\nWantedBy=default.target\n' > "$SU/scaleout-runner.path"
-    systemctl --user daemon-reload && systemctl --user enable --now scaleout-runner.path >/dev/null 2>&1
+    systemctl --user daemon-reload && systemctl --user reset-failed scaleout-runner.service scaleout-runner.path >/dev/null 2>&1
+    systemctl --user enable --now scaleout-runner.path >/dev/null 2>&1
     loginctl enable-linger "$(whoami)" >/dev/null 2>&1 || echo "SCALEOUT_NOTE run once with sudo so the runner works while logged out: sudo loginctl enable-linger $(whoami)"
     echo "SCALEOUT_RUNNER systemd"
   else
@@ -132,7 +134,19 @@ for f in ctl.sh runner.sh setup.sh gh-runner.sh provision.sh usage.py; do
   cp "$PKG/$f" "$dst.new.$$" && chmod 755 "$dst.new.$$" && mv -f "$dst.new.$$" "$dst"
 done
 rm -f "$B/bin/ctl.sh"; chmod 755 "$B/bin/"*
-printf '#!/bin/bash\nnohup /bin/bash "$HOME/.scaleout/bin/runner.sh" >> "$HOME/.scaleout/runner.log" 2>&1 &\n' > "$B/bin/kick"; chmod 755 "$B/bin/kick"
+cat > "$B/bin/kick" <<'KICK'
+#!/bin/bash
+# Start the runner now. With systemd it runs inside its service, never in the SSH session that called us: a runner there
+# holds the queue lock while the path unit's own starts quit at once, until systemd fails both units.
+if command -v systemctl >/dev/null 2>&1 && systemctl --user is-enabled scaleout-runner.path >/dev/null 2>&1; then
+  systemctl --user reset-failed scaleout-runner.service scaleout-runner.path >/dev/null 2>&1
+  systemctl --user start scaleout-runner.path >/dev/null 2>&1
+  systemctl --user start --no-block scaleout-runner.service >/dev/null 2>&1
+  exit 0
+fi
+nohup /bin/bash "$HOME/.scaleout/bin/runner.sh" >> "$HOME/.scaleout/runner.log" 2>&1 &
+KICK
+chmod 755 "$B/bin/kick"
 # agent permissions: keep the user's edited copy
 if [ ! -f "$B/settings/claude.json" ]; then
   [ -f "$PKG/claude-settings.json" ] && cp "$PKG/claude-settings.json" "$B/settings/claude.json"

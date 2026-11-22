@@ -33,7 +33,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "0.9.4"
+VERSION = "0.9.5"
 HOME = Path.home()
 CONF_DIR = Path(os.environ.get("SCALEOUT_CONF", HOME / ".config" / "scaleout"))
 STATE_DIR = Path(os.environ.get("SCALEOUT_STATE", HOME / ".local" / "state" / "scaleout"))
@@ -1326,6 +1326,13 @@ def dispatch(cfg: Dict[str, Any], j: Dict[str, Any], name: str) -> bool:
         except Exception:  # skills are best effort
             pass
     wd = j.get("workdir") or node.get("dir") or "~/scaleout-work"
+    orphans = read_json(STATE_DIR / "orphans.json", [])
+    if [name, j["id"]] in orphans:
+        # the clean-up at the end of the tick would cancel and delete the copy handed over now (the job "vanished" twice
+        # and failed); clear the old one first, before the new one exists
+        n.ctl("cancel", j["id"], timeout=20)
+        n.ctl("rm", j["id"], timeout=20)
+        write_json(STATE_DIR / "orphans.json", [o for o in orphans if o != [name, j["id"]]])
     if j.get("repo"):
         # the orchestrator's own jobs get a copy on its internal disk too (a plain local path, no SSH): under launchd, macOS
         # makes every non-Apple program wait for a privacy prompt on an external disk, even through a work tree's .git link
@@ -1494,6 +1501,8 @@ def requeue(cfg: Dict[str, Any], j: Dict[str, Any], why: str) -> None:
         j.pop("repo_wt", None)
     j["attempts"] = j.get("attempts", 0) + 1
     j["history"].append({"t": now(), "event": "retry", "node": j.get("node"), "why": why})
+    if j.get("node") and why.startswith(("node ", "job vanished", "stalled")):
+        j.setdefault("avoid", {})[j["node"]] = now() + 15 * 60   # it may still be sick: the next try goes to another machine
     if j.get("node"):
         orphans = read_json(STATE_DIR / "orphans.json", [])
         orphans.append([j["node"], j["id"]])
@@ -1600,8 +1609,11 @@ def maintain(cfg: Dict[str, Any], metrics: Dict[str, Dict[str, Any]]) -> None:
                 write_json(STATE_DIR / "tune.json", {"t": now()})
     orphans = read_json(STATE_DIR / "orphans.json", [])
     left = []
+    active = {(j.get("node"), j["id"]) for j in all_jobs() if j.get("status") in ("dispatched", "running")}
     for name, jid in orphans:
         st = metrics.get(name, {})
+        if (name, jid) in active:   # handed back to that node since: the copy there is the live one
+            continue
         if name in cfg["nodes"] and st.get("online"):
             Node(name, cfg).ctl("cancel", jid)
             Node(name, cfg).ctl("rm", jid)

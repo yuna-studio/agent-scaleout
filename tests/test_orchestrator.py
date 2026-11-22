@@ -724,6 +724,67 @@ class E2E(unittest.TestCase):
         finally:
             so.HOME = saved
 
+    def test_98o_job_sent_back_to_the_same_node_is_not_deleted(self):
+        # a job taken from a node (offline) and handed back to it must not be cancelled by the orphan clean-up of that tick
+        cfg = so.load_cfg()
+        for n in ("n1", "n2"):
+            (HOMES[n] / ".local/bin/claude").write_text(STUB)
+        jid = so.submit_job(cfg, "comes back", node="n1")
+        OFFLINE.add("n1")
+        so.tick()
+        j = so.load_job(jid); j.update({"status": "dispatched", "node": "n1", "last_seen": so.now() - 3600}); so.save_job(j)
+        so.tick()   # n1 offline: requeued, the old copy noted as an orphan
+        self.assertIn(["n1", jid], so.read_json(so.STATE_DIR / "orphans.json", []))
+        OFFLINE.discard("n1")
+        so.tick()   # back online: handed to n1 again, the clean-up at the end of the tick must leave it alone
+        self.assertEqual(so.load_job(jid)["status"], "dispatched")
+        self.assertTrue((HOMES["n1"] / ".scaleout/jobs" / jid).exists())
+        for _ in range(6):
+            settle(); so.tick()
+            if so.load_job(jid)["status"] == "done":
+                break
+        j = so.load_job(jid)
+        self.assertEqual(j["status"], "done", j["history"])
+        self.assertFalse(any("vanished" in h.get("why", "") for h in j["history"]), j["history"])
+        # a node that lost a job is tried last for a while
+        k = {"id": "jx", "node": "n2", "history": [], "attempts": 0}
+        so.requeue(so.load_cfg(), k, "job vanished on n2")
+        self.assertGreater(k["avoid"]["n2"], so.now())
+        so.write_json(so.STATE_DIR / "orphans.json", [])
+
+    def test_99e_linux_node_state_and_runner(self):
+        # GNU stat: -f is "file system". The heartbeat age of a running job must still be a number on Linux.
+        h = TMP / "linuxnode"; b = h / ".scaleout"; fb = TMP / "linuxbin"
+        for d in (b / "bin", b / "jobs/jl", b / "queue", fb):
+            d.mkdir(parents=True, exist_ok=True)
+        shutil.copy(ROOT / "node/unix/ctl.sh", b / "bin/ctl")
+        shutil.copy(ROOT / "node/unix/runner.sh", b / "bin/runner.sh")
+        (b / "node.conf").write_text("RUNNER=manual\nDEVICE_SCAN=off\nLINGER_S=0\nKEEP_DEVICES=1\n")
+        (fb / "uname").write_text('#!/bin/bash\ncase "$1" in -m) echo x86_64 ;; -r) echo 6.8 ;; *) echo Linux ;; esac\n')
+        (fb / "stat").write_text('#!/bin/bash\nif [ "$1" = -f ]; then printf \'  File: "%s"\\n    ID: 1 Namelen: 255\\n\' "$3"; exit 1; fi\n'
+                                 'python3 -c \'import os,sys; print(int(os.path.getmtime(sys.argv[1])))\' "$3"\n')
+        for f in (fb / "uname", fb / "stat"):
+            f.chmod(0o755)
+        (b / "jobs/jl/started").write_text("1"); (b / "jobs/jl/heartbeat").write_text("")
+        env = dict(os.environ, HOME=str(h), PATH=f"{fb}:/usr/bin:/bin:/usr/sbin:/sbin")
+        r = subprocess.run(["bash", str(b / "bin/ctl"), "state", "jl"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        s = json.loads(r.stdout.decode().strip().splitlines()[-1])
+        self.assertEqual(s["state"], "running")
+        self.assertLess(s["heartbeat_age"], 60)
+        # a runner started by systemd while another one holds the lock waits for it instead of quitting at once
+        # the holder is a grandchild that init reaps: a child of this test would stay a zombie that `kill -0` still finds
+        holder = subprocess.run(["bash", "-c", "sleep 3 >/dev/null 2>&1 & echo $!"], stdout=subprocess.PIPE).stdout.decode().strip()
+        (b / "runner.lock").mkdir(); (b / "runner.lock/pid").write_text(holder)
+        env2 = dict(os.environ, HOME=str(h))
+        t0 = time.time()
+        subprocess.run(["bash", str(b / "bin/runner.sh")], env=env2, timeout=30)
+        self.assertLess(time.time() - t0, 2)   # outside systemd: quits at once, as before
+        t0 = time.time()
+        subprocess.run(["bash", str(b / "bin/runner.sh")], env=dict(env2, INVOCATION_ID="x"), timeout=30)
+        self.assertGreaterEqual(time.time() - t0, 2)   # under systemd: waits for the holder, then runs and exits
+        self.assertFalse((b / "runner.lock").exists())
+
     def test_99_helpers(self):
         self.assertEqual(so.parse_setup("x\nSCALEOUT_USER bob\nSCALEOUT_AGENTS [\"claude\"]\n")["user"], "bob")
         so.ssh_block_put("scaleout t", "Host scaleout-t\n  Port 1")
