@@ -608,6 +608,28 @@ class E2E(unittest.TestCase):
         self.assertEqual(picks.count("n2"), 1)
         cfg["nodes"]["n1"]["max_jobs"] = cfg["nodes"]["n2"]["max_jobs"] = 1
 
+    def test_98k_cap_is_threads_load_decides(self):
+        """A node takes jobs up to its thread count (load and memory decide), and stops at 2x load; a fixed max_jobs stays the cap."""
+        cfg = so.load_cfg()
+        cfg["nodes"]["n1"]["max_jobs"] = 2; cfg["nodes"]["n1"].pop("max_jobs_fixed", None)
+        st = {"online": True, "ts": so.now(), "mem_free_pct": 90, "mem_total_gb": 128, "disk_free_gb": 50, "load": 1.0, "cpus": 8,
+              "agents": ["claude"], "runner": True}
+        self.assertEqual(so.job_cap("n1", cfg["nodes"]["n1"], st), 8)
+        m = {"n1": dict(st)}
+        load, n = {}, 0
+        while so.pick_node(cfg, {"tags": ["n1"], "agent": "default", "id": f"c{n}"}, m, load, {}, {}, {}, {}) == "n1" and n < 20:
+            load["n1"] = load.get("n1", 0) + 1; n += 1
+        self.assertEqual(n, 8)
+        why = {}
+        m["n1"]["load"] = 17.0
+        keep = cfg["defaults"]["max_load_per_cpu"]; cfg["defaults"]["max_load_per_cpu"] = 2   # the tests run with it off
+        self.assertIsNone(so.pick_node(cfg, {"tags": ["n1"], "agent": "default", "id": "c99"}, m, {}, {}, {}, {}, why))
+        cfg["defaults"]["max_load_per_cpu"] = keep
+        self.assertIn("load 17.0 > 16", why["n1"])
+        cfg["nodes"]["n1"]["max_jobs_fixed"] = True
+        self.assertEqual(so.job_cap("n1", cfg["nodes"]["n1"], st), 2)
+        cfg["nodes"]["n1"]["max_jobs"] = 1; cfg["nodes"]["n1"].pop("max_jobs_fixed", None)
+
     def test_98b_claude_now(self):
         """Sessions working now, their running subagents (finished or stale ones left out), names from /rename."""
         home = TMP / "claude-home"

@@ -33,7 +33,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "0.9.1"
+VERSION = "0.9.2"
 HOME = Path.home()
 CONF_DIR = Path(os.environ.get("SCALEOUT_CONF", HOME / ".config" / "scaleout"))
 STATE_DIR = Path(os.environ.get("SCALEOUT_STATE", HOME / ".local" / "state" / "scaleout"))
@@ -265,6 +265,17 @@ def local_ctl(n: Dict[str, Any], verb: str, *args: str, input: Optional[bytes] =
     if verb == "submit":
         start_local_runner(n)
     return r
+
+
+def job_cap(name: str, node: Dict[str, Any], st: Optional[Dict[str, Any]] = None) -> int:
+    """How many jobs a machine may run at once. max_jobs is its share (it weighs the even spread); the hard cap is its
+    thread count, so load (2× cores) and memory decide when it is full. A machine whose max_jobs was fixed by hand
+    (--max-jobs, `scaleout local on`) keeps it as the hard cap."""
+    share = max(int(node.get("max_jobs", 2) or 2), 1)
+    if node.get("max_jobs_fixed") or node.get("local"):
+        return share
+    st = st if st is not None else read_json(node_state_path(name), {})
+    return max(share, int(st.get("cpus") or 0))
 
 
 def lan_answers(host: str, port: int, timeout: float = 0.6) -> bool:
@@ -790,7 +801,7 @@ def cmd_enroll(a) -> None:
     elif verb == "pkg-windows":
         sys.stdout.buffer.write(node_package("windows"))
     elif verb == "args":
-        args = ["--name", name, "--dir", node.get("dir", "~/scaleout-work"), "--max-jobs", str(node.get("max_jobs", 2)), "--agent", node.get("agent", "claude")]
+        args = ["--name", name, "--dir", node.get("dir", "~/scaleout-work"), "--max-jobs", str(job_cap(name, node)), "--agent", node.get("agent", "claude")]
         if port:
             args += tunnel_args(cfg, port)
         print(" ".join(shlex.quote(x) for x in args))
@@ -1165,8 +1176,9 @@ def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[st
             why[name] = "no agent"
             continue
         busy = load.get(name, 0)
-        if busy >= int(n.get("max_jobs", 2)):
-            why[name] = f"{busy} job(s) running (max {n.get('max_jobs', 2)})"
+        cap = job_cap(name, n, st)
+        if busy >= cap:
+            why[name] = f"{busy} job(s) running (max {cap})"
             continue
         if st.get("mem_total_gb"):
             free_gb = float(st["mem_total_gb"]) * float(st.get("mem_free_pct", 0)) / 100 - planned_gb.get(name, 0.0)
@@ -1182,12 +1194,16 @@ def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[st
         if busy and cpu_used.get(name, 0) + job_cpu(j) > units and float(st.get("load", 0) or 0) >= cores:
             why[name] = f"CPU units full ({cpu_used.get(name, 0)}/{units}, load {float(st.get('load', 0)):.1f})"
             continue       # units full and the cores really busy; a heavy job in a quiet phase (load < cores) leaves room
-        # even use by capacity: the machine least full gets the job. Full = jobs / max_jobs and load / allowed load, so a
-        # 16-thread machine with max_jobs 8 takes about four jobs while a 2-job laptop takes one; memory in use counts a little
+        # even use by capacity, lowest strain first: the job goes to the machine that is least full once it has it.
+        # Full = jobs / its share (max_jobs, so a node with share 8 takes about four jobs for each a share-2 laptop takes),
+        # load / allowed load (2x cores) and memory in use, the job's own memory counted in. Least strained also finishes first.
         jobs_full = (busy + 1) / max(int(n.get("max_jobs", 2)), 1)
         load_full = float(st.get("load", 0) or 0) / limit
+        total_gb = float(st.get("mem_total_gb") or 0)
         mem_used = 1 - float(st.get("mem_free_pct", 0) or 0) / 100
-        score = -100 * (0.6 * jobs_full + 0.3 * load_full + 0.1 * mem_used)
+        if total_gb:
+            mem_used = min(1.0, mem_used + (planned_gb.get(name, 0.0) + job_mem_gb(j, name)) / total_gb)
+        score = -100 * (0.4 * jobs_full + 0.35 * load_full + 0.25 * mem_used)
         score += float(n.get("score_bias", 0))   # the orchestrator has a negative bias: it orchestrates, runs what only it can, and takes overflow
         if score > best_score:
             best, best_score = name, score
@@ -1797,7 +1813,7 @@ def cmd_nodes(a) -> None:
         say("no nodes — scaleout add NAME user@host  |  scaleout invite NAME")
     for name, n in cfg["nodes"].items():
         say(f"{pad(label_of(cfg, name), name_w(cfg, 16))} {role_of(cfg, name):<13}{'id=' + name:<18}{n.get('os', '?'):<8} user={n.get('user', '?')} lan={n.get('lan') or '-'} tunnel={n.get('port') or '-'} "
-            f"agent={n.get('agent', 'claude')} max={n.get('max_jobs', 2)} tags={','.join(n.get('tags') or []) or '-'}{' (invite pending)' if n.get('pending') else ''}")
+            f"agent={n.get('agent', 'claude')} share={n.get('max_jobs', 2)} cap={job_cap(name, n)} tags={','.join(n.get('tags') or []) or '-'}{' (invite pending)' if n.get('pending') else ''}")
 
 
 def fmt_devices(st: Dict[str, Any]) -> str:
@@ -2153,7 +2169,7 @@ def cmd_update(a) -> None:
             r = n.ctl("update", input=node_package("windows"), timeout=300)
         else:
             up = n.shell("mkdir -p ~/.scaleout/pkg && tar -xzf - -C ~/.scaleout/pkg", input=node_package("unix"), timeout=300)
-            args = ["--name", name, "--dir", node.get("dir", "~/scaleout-work"), "--max-jobs", str(node.get("max_jobs", 2)), "--agent", node.get("agent", "claude")]
+            args = ["--name", name, "--dir", node.get("dir", "~/scaleout-work"), "--max-jobs", str(job_cap(name, node)), "--agent", node.get("agent", "claude")]
             if node.get("port"):
                 args += tunnel_args(cfg, node["port"])
             r = n.shell("bash ~/.scaleout/pkg/setup.sh " + " ".join(shlex.quote(x) for x in args), timeout=300) if up.returncode == 0 else up
