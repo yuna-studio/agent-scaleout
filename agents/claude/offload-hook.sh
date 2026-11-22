@@ -76,7 +76,8 @@ cat >&2 <<MSG
 agent-scaleout: ${why} (free now: ${node}).
 Send it as a job instead of running it here. Several independent items: queue them all, keep working, collect:
   id=\$(echo "<what to run and how to check it>" | scaleout submit --repo <git repo> [--subdir <path>] [--tags mac])
-  … then  scaleout wait \$id   (or one scaleout subagent per item, started in the same message)
+  … then  scaleout wait \$id -m 0  with run_in_background (shows in the task list, notifies when done)
+  (or one scaleout subagent per item, started in the same message)
 One item you must wait for: echo "<…>" | scaleout run --repo <git repo> [--apply]
 If it truly must run on this machine (a device attached here), prefix the command with SCALEOUT_LOCAL=1.
 MSG

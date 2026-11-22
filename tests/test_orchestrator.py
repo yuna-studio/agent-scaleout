@@ -473,7 +473,7 @@ class E2E(unittest.TestCase):
         """A heavy command a session runs here (not through scaleout) is remembered by the hooks and shown with the jobs."""
         hooks = ROOT / "agents/claude"
         (TMP / "hookhome/.config/scaleout").mkdir(parents=True, exist_ok=True)
-        (TMP / "hookhome/.config/scaleout/hook.conf").write_text("OFFLOAD=pressure\n")   # this machine has room: it runs here
+        (TMP / "hookhome/.config/scaleout/hook.conf").write_text("OFFLOAD=off\n")   # runs here whatever this machine's load is
         env = dict(os.environ, SCALEOUT_STATE=str(so.STATE_DIR), SCALEOUT_CONF=str(so.CONF_DIR), HOME=str(TMP / "hookhome"))
         hook = lambda script, data: subprocess.run(["bash", str(hooks / script)], input=json.dumps(data).encode(), env=env,
                                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode
@@ -633,6 +633,55 @@ class E2E(unittest.TestCase):
     def test_98l_plugin_version_follows(self):
         """The plugin's version is the scaleout version (it is read in place from the installed package)."""
         self.assertEqual(json.loads((ROOT / "plugin/.claude-plugin/plugin.json").read_text())["version"], so.VERSION)
+
+    def test_98m_agent_limit_moves_job(self):
+        """A job that failed on a node's usage limit or lost login is not a failure: that agent is skipped and the job goes on."""
+        t = so.agent_trouble('"api_error":"usage_limit_reached","result":"You\'ve hit your weekly limit · resets Nov 23 at 12pm"')
+        self.assertEqual(t[0], "usage limit")
+        self.assertEqual(so.agent_trouble("refresh token has expired. Please log out and sign in again.")[0], "signed out")
+        self.assertIsNone(so.agent_trouble("3 tests failed"))
+        so.block_agent("n1", "claude", "usage limit", so.now() + 600)
+        why = {}
+        m = {n: {"online": True, "ts": so.now(), "mem_free_pct": 80, "mem_total_gb": 64, "disk_free_gb": 50, "load": 0.1, "cpus": 8,
+                 "agents": ["claude"], "runner": True} for n in ("n1", "n2")}
+        self.assertEqual(so.pick_node(so.load_cfg(), {"tags": [], "agent": "default", "id": "lim"}, m, {}, {}, {}, {}, why), "n2")
+        self.assertIn("usage limit", why["n1"])
+        so.write_json(so.AGENT_BLOCKS, {})
+        text = "\n".join(so.top_lines(so.load_cfg(), type("U", (), {"window": lambda self, s: {"in": 0, "out": 0, "cache_read": 0, "cache_write": 0, "msgs": 0}})(), 5))
+        self.assertIn("EFFICIENCY", text)
+        self.assertIn("BOTTLENECK", text)
+
+    def test_98n_log_insights_housekeep(self):
+        """A finished job leaves a line in the job log; housekeeping drops old jobs with their results and keeps the log;
+        insights reads the log back."""
+        t0 = so.now() - 10 * 86400
+        j = {"id": "j20200101-000000-aaaa", "status": "done", "rc": 0, "created": t0, "dispatched_at": t0 + 30, "finished_at": t0 + 330,
+             "node": "n1", "tags": ["emulator"], "agent": "default", "history": [{"t": t0, "event": "moved", "why": "claude on n2: usage limit until x", "node": "n2"}],
+             "mem_mb": 3000}
+        so.save_job(j)
+        rows = so.read_jsonl(so.JOB_LOG)
+        mine = [r for r in rows if r["id"] == j["id"]]
+        self.assertEqual(len(mine), 1)
+        self.assertEqual((mine[0]["wait_s"], mine[0]["run_s"]), (30, 300))
+        so.save_job(so.load_job(j["id"]))
+        self.assertEqual(len([r for r in so.read_jsonl(so.JOB_LOG) if r["id"] == j["id"]]), 1)   # logged once
+        res = so.STATE_DIR / "results" / j["id"]
+        res.mkdir(parents=True, exist_ok=True); (res / "shot.png").write_bytes(b"x" * 1000)
+        rec = so.housekeep(so.load_cfg())
+        self.assertGreaterEqual(rec["jobs"], 1)
+        self.assertFalse(so.job_path(j["id"]).exists())
+        self.assertFalse(res.exists())
+        old_row = {"id": "j-old", "t": int(so.now() - 200 * 86400)}
+        with open(so.JOB_LOG, "a") as f:
+            f.write(json.dumps(old_row) + "\n")
+        so.trim_jsonl(so.JOB_LOG, 90)
+        ids = [r["id"] for r in so.read_jsonl(so.JOB_LOG)]
+        self.assertNotIn("j-old", ids)
+        import contextlib, io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            so.cmd_insights(argparse.Namespace(days=30, json=False))
+        self.assertIn("SUGGESTIONS", buf.getvalue())
 
     def test_98b_claude_now(self):
         """Sessions working now, their running subagents (finished or stale ones left out), names from /rename."""
