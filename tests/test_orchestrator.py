@@ -593,6 +593,21 @@ class E2E(unittest.TestCase):
                            input=json.dumps({"session_id": "s", "tool_use_id": "toolu_off2", "tool_input": {"command": cmd}}).encode())
         self.assertEqual(r.returncode, 0)
 
+    def test_98j_even_by_capacity(self):
+        """Jobs go to the machine least full for its size: a node allowed 4 jobs takes about four for each one a 1-job node takes."""
+        cfg = so.load_cfg()
+        cfg["nodes"]["n1"]["max_jobs"], cfg["nodes"]["n2"]["max_jobs"] = 4, 1
+        m = {n: {"online": True, "ts": so.now(), "mem_free_pct": 80, "mem_total_gb": 64, "disk_free_gb": 50, "load": 0.1, "cpus": 16,
+                 "agents": ["claude"], "runner": True} for n in ("n1", "n2")}
+        load, picks = {}, []
+        for k in range(5):
+            j = {"tags": [], "agent": "default", "id": f"e{k}"}
+            n = so.pick_node(cfg, j, m, load, {}, {}, {}, {})
+            picks.append(n); load[n] = load.get(n, 0) + 1
+        self.assertEqual(picks.count("n1"), 4)
+        self.assertEqual(picks.count("n2"), 1)
+        cfg["nodes"]["n1"]["max_jobs"] = cfg["nodes"]["n2"]["max_jobs"] = 1
+
     def test_98b_claude_now(self):
         """Sessions working now, their running subagents (finished or stale ones left out), names from /rename."""
         home = TMP / "claude-home"
