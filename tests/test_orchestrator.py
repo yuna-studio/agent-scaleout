@@ -630,6 +630,10 @@ class E2E(unittest.TestCase):
         self.assertEqual(so.job_cap("n1", cfg["nodes"]["n1"], st), 2)
         cfg["nodes"]["n1"]["max_jobs"] = 1; cfg["nodes"]["n1"].pop("max_jobs_fixed", None)
 
+    def test_98l_plugin_version_follows(self):
+        """The plugin's version is the scaleout version (it is read in place from the installed package)."""
+        self.assertEqual(json.loads((ROOT / "plugin/.claude-plugin/plugin.json").read_text())["version"], so.VERSION)
+
     def test_98b_claude_now(self):
         """Sessions working now, their running subagents (finished or stale ones left out), names from /rename."""
         home = TMP / "claude-home"
