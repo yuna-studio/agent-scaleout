@@ -14,7 +14,13 @@ mkdir -p "$Q" "$J" "$B/work"
 # single instance — the service manager may start us again while we run
 LOCK="$B/runner.lock"
 if ! mkdir "$LOCK" 2>/dev/null; then
-  p="$(cat "$LOCK/pid" 2>/dev/null)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null && exit 0
+  p="$(cat "$LOCK/pid" 2>/dev/null)"
+  if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+    # started by systemd while another runner holds the queue (one started outside the service): quitting at once makes the
+    # path unit start us again and again until systemd gives up on both units, so wait for it and take over
+    [ -n "${INVOCATION_ID:-}" ] || exit 0
+    while kill -0 "$p" 2>/dev/null; do sleep 5; done
+  fi
   rm -rf "$LOCK"; mkdir "$LOCK" || exit 0
 fi
 echo $$ > "$LOCK/pid"; trap 'rm -rf "$LOCK"' EXIT

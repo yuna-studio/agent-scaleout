@@ -58,7 +58,9 @@ runner_ok() {
   if [ "${RUNNER:-}" = manual ]; then echo true; return; fi   # the user starts runner.sh some other way
   if [ "$OS" = Darwin ]; then launchctl print "gui/$(id -u)/dev.scaleout.runner" >/dev/null 2>&1 && echo true || echo false
   else
-    if command -v systemctl >/dev/null 2>&1 && systemctl --user is-enabled scaleout-runner.path >/dev/null 2>&1; then echo true
+    if command -v systemctl >/dev/null 2>&1 && systemctl --user is-enabled scaleout-runner.path >/dev/null 2>&1; then
+      # enabled is not enough: after "start request repeated too quickly" both units stay enabled but failed, and no job starts
+      if systemctl --user is-failed scaleout-runner.path scaleout-runner.service >/dev/null 2>&1; then echo false; else echo true; fi
     elif crontab -l 2>/dev/null | grep -q scaleout; then echo true; else echo false; fi
   fi
 }
@@ -132,14 +134,15 @@ case "$verb" in
     cat > "$d/prompt.md"
     printf 'AGENT=%s\nTIMEOUT_MIN=%s\nWORKDIR=%s\nRESUME=%s\n' "$2" "$3" "$4" "${5:-}" > "$d/meta"
     touch "$B/queue/$jid"
-    [ "$OS" = Darwin ] || "$B/bin/kick" >/dev/null 2>&1 &   # Linux without systemd path units: start the runner now
+    [ "$OS" = Darwin ] || "$B/bin/kick" >/dev/null 2>&1 &   # Linux: start the runner now (its systemd service when there is one)
     echo queued ;;
 
   state)  # state <jid>  -> {"state":..., "rc":..., "heartbeat_age":...}
     d="$B/jobs/$1"
     if [ ! -d "$d" ]; then echo '{"state":"missing"}'; exit 0; fi
     now="$(date +%s)"
-    hb="$(stat -f %m "$d/heartbeat" 2>/dev/null || stat -c %Y "$d/heartbeat" 2>/dev/null || echo "$now")"
+    if [ "$OS" = Darwin ]; then hb="$(stat -f %m "$d/heartbeat" 2>/dev/null)"; else hb="$(stat -c %Y "$d/heartbeat" 2>/dev/null)"; fi
+    case "$hb" in ''|*[!0-9]*) hb="$now" ;; esac   # GNU stat -f means "file system": never let its text reach the arithmetic
     if [ -f "$d/rc" ]; then printf '{"state":"done","rc":%s,"mem_mb":%s,"artifacts":%s,"artifacts_kb":%s}\n' "$(tr -dc '0-9' < "$d/rc")" "$(cat "$d/mem_mb" 2>/dev/null || echo 0)" \
       "$(find "$d/artifacts" -type f 2>/dev/null | wc -l | tr -d ' ')" "$(du -sk "$d/artifacts" 2>/dev/null | cut -f1 || echo 0)"
     elif [ -f "$d/started" ]; then printf '{"state":"running","heartbeat_age":%s}\n' "$((now - hb))"
