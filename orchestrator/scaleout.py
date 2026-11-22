@@ -33,7 +33,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "0.9.2"
+VERSION = "0.9.3"
 HOME = Path.home()
 CONF_DIR = Path(os.environ.get("SCALEOUT_CONF", HOME / ".config" / "scaleout"))
 STATE_DIR = Path(os.environ.get("SCALEOUT_STATE", HOME / ".local" / "state" / "scaleout"))
@@ -62,6 +62,8 @@ DEFAULTS: Dict[str, Any] = {
     "offline_grace_min": 10,     # node unreachable this long -> its jobs are retried elsewhere
     "retries": 2,
     "keep_job_days": 3,
+    "log_days": 90,              # the job log (one line per finished job) for `scaleout insights`
+    "history_days": 30,          # the 5-minute samples
     "metrics_ttl_s": 15,
     "port_base": 2201,
 }
@@ -962,6 +964,45 @@ def local_reap(idle_min: int) -> Optional[str]:
     return note
 
 
+AGENT_BLOCKS = STATE_DIR / "agent-blocks.json"   # {node: {agent: {"until": t, "why": text}}}
+MONTHS = {m: i for i, m in enumerate(["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+
+
+def agent_trouble(text: str) -> Optional[Tuple[str, int]]:
+    """(why, until) when a job's output says its agent cannot work on that machine: a usage limit (until its reset, or an
+    hour) or a lost login (a day: a person has to sign in again). None for an ordinary failure."""
+    low = text.lower()
+    if "usage_limit_reached" in low or "hit your weekly limit" in low or "hit your limit" in low or "rate_limit" in low and "limit" in low:
+        until = now() + 3600
+        m = re.search(r"resets\s+([a-z]{3})[a-z]*\s+(\d{1,2})(?:\s+at)?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)", low)
+        if m and m.group(1) in MONTHS:
+            hour = int(m.group(3)) % 12 + (12 if m.group(5) == "pm" else 0)
+            lt = time.localtime()
+            try:
+                t = time.mktime((lt.tm_year, MONTHS[m.group(1)], int(m.group(2)), hour, int(m.group(4) or 0), 0, 0, 0, -1))
+                if t < now() - 86400:
+                    t = time.mktime((lt.tm_year + 1, MONTHS[m.group(1)], int(m.group(2)), hour, int(m.group(4) or 0), 0, 0, 0, -1))
+                until = int(t) + 120
+            except (OverflowError, ValueError):
+                pass
+        return "usage limit", until
+    if any(x in low for x in ("refresh token has expired", "not logged in", "please run /login", "invalid api key",
+                              "authentication_error", "oauth token has expired", "please log out and sign in again")):
+        return "signed out", now() + 86400
+    return None
+
+
+def agent_blocked(name: str, agent: str) -> Optional[Dict[str, Any]]:
+    b = (read_json(AGENT_BLOCKS, {}).get(name) or {}).get(agent)
+    return b if b and b.get("until", 0) > now() else None
+
+
+def block_agent(name: str, agent: str, why: str, until: int) -> None:
+    data = read_json(AGENT_BLOCKS, {})
+    data.setdefault(name, {})[agent] = {"until": int(until), "why": why}
+    write_json(AGENT_BLOCKS, data)
+
+
 def node_health(cfg: Dict[str, Any], name: str, st: Dict[str, Any]) -> str:
     d = cfg["defaults"]
     if not st.get("online"):
@@ -991,7 +1032,34 @@ def load_job(jid: str) -> Dict[str, Any]:
     return j
 
 
+JOB_LOG = STATE_DIR / "log" / "jobs.jsonl"   # one line per finished job, kept log_days (job files themselves: keep_job_days)
+
+
+def log_job(j: Dict[str, Any]) -> None:
+    node, fin, start = j.get("node"), float(j.get("finished_at") or now()), j.get("dispatched_at")
+    u = j.get("usage") or {}
+    row = {"id": j["id"], "t": int(fin), "node": node, "tags": j.get("tags") or [], "agent": j.get("agent") or "default",
+           "kind": job_kind(j), "repo": bool(j.get("repo")), "status": j.get("status"), "rc": j.get("rc"),
+           "wait_s": int(start - j["created"]) if start and j.get("created") else None,
+           "run_s": int(fin - start) if start else None, "attempts": j.get("attempts", 0),
+           "mem_mb": j.get("mem_mb"), "mem_gb_est": round(job_mem_gb(j, node), 1) if node else None,
+           "tokens": sum(int(u.get(k, 0) or 0) for k in ("in", "out", "cache_read", "cache_write")) or None,
+           "start_tokens": j.get("start_tokens"),
+           "events": [[h.get("event"), (h.get("why") or "")[:100], h.get("node")] for h in j.get("history", [])
+                      if h.get("event") not in ("dispatched", None)],
+           "error": (j.get("error") or "")[:160] or None}
+    JOB_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(JOB_LOG, "a") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
 def save_job(j: Dict[str, Any]) -> None:
+    if j.get("status") in ("done", "failed", "cancelled") and not j.get("logged") and not j.get("bench"):
+        j["logged"] = True
+        try:
+            log_job(j)
+        except Exception:   # the log never stops a job from being saved
+            pass
     write_json(job_path(j["id"]), j)
 
 
@@ -1172,6 +1240,11 @@ def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[st
         if agent not in ("default", "custom", "bench") and agent not in (st.get("agents") or []):
             why[name] = f"no {agent}"
             continue
+        use = n.get("agent", "claude") if agent in ("default",) else agent
+        blk = agent_blocked(name, use) if agent not in ("custom", "bench") else None
+        if blk:
+            why[name] = f"{use} {blk['why']} until {time.strftime('%m-%d %H:%M', time.localtime(blk['until']))}"
+            continue
         if agent == "default" and not st.get("agents"):
             why[name] = "no agent"
             continue
@@ -1348,7 +1421,20 @@ def collect(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[str,
         if s.get("mem_mb") is not None:
             j["mem_mb"] = int(s.get("mem_mb") or 0)
         if rc != 0:
-            (STATE_DIR / "results" / f"{j['id']}.err").write_bytes(n.ctl("err", j["id"], "60").stdout)
+            err = n.ctl("err", j["id"], "60").stdout
+            (STATE_DIR / "results" / f"{j['id']}.err").write_bytes(err)
+            trouble = agent_trouble(out.decode(errors="replace")[-4000:] + "\n" + err.decode(errors="replace")[-4000:])
+            if trouble and j.get("agent") not in ("custom", "bench"):
+                use = cfg["nodes"][name].get("agent", "claude") if (j.get("agent") or "default") == "default" else j["agent"]
+                block_agent(name, use, trouble[0], trouble[1])
+                n.ctl("rm", j["id"])
+                if j.get("repo_wt"):
+                    n.ctl("repo-unlock", j["repo_wt"]); j.pop("repo_wt", None)
+                j.setdefault("avoid", {})[name] = trouble[1]
+                j["history"].append({"t": now(), "event": "moved", "node": name,
+                                     "why": f"{use} on {name}: {trouble[0]} until {time.strftime('%m-%d %H:%M', time.localtime(trouble[1]))}"})
+                j.update({"status": "queued", "node": None})
+                return
         if int(s.get("artifacts", 0) or 0) > 0:
             adir = STATE_DIR / "results" / j["id"]
             if int(s.get("artifacts_kb", 0) or 0) > d.get("max_artifacts_mb", 1024) * 1024:
@@ -1421,8 +1507,9 @@ def requeue(cfg: Dict[str, Any], j: Dict[str, Any], why: str) -> None:
 HISTORY = STATE_DIR / "history.jsonl"
 
 
-def sample_history(metrics: Dict[str, Dict[str, Any]]) -> None:
-    """Every 5 minutes: one line with the orchestrator's and each node's load, memory and running jobs (30 days kept)."""
+def sample_history(metrics: Dict[str, Dict[str, Any]], cfg: Optional[Dict[str, Any]] = None) -> None:
+    """Every 5 minutes: one line with each machine's load, memory, running jobs, strain and bottleneck, and how many jobs
+    wait and why (`scaleout insights` reads it; housekeeping keeps history_days of it)."""
     try:
         last = HISTORY.stat().st_mtime if HISTORY.exists() else 0
     except OSError:
@@ -1433,18 +1520,37 @@ def sample_history(metrics: Dict[str, Dict[str, Any]]) -> None:
     row = {"t": int(now()), "orch": {k: me.get(k) for k in ("load", "cpus", "mem_free_pct", "swap_gb")},
            "nodes": {n: {"load": st.get("load"), "cpus": st.get("cpus"), "mem_free_pct": st.get("mem_free_pct"),
                          "running": st.get("running"), "online": st.get("online")} for n, st in metrics.items()}}
+    if cfg:
+        jobs = all_jobs()
+        running: Dict[str, int] = {}
+        for j in jobs:
+            if j.get("status") in ("dispatched", "running") and j.get("node"):
+                running[j["node"]] = running.get(j["node"], 0) + 1
+        for name, st in metrics.items():
+            if st.get("online") and name in cfg["nodes"]:
+                cap, gates, neck, strain = machine_gates(cfg, name, st, max(running.get(name, 0), int(st.get("running", 0) or 0)))
+                row["nodes"][name].update({"cap": cap, "busy": running.get(name, 0), "strain": round(strain, 3), "neck": neck,
+                                           "gates": {k: round(v, 3) for k, v in gates.items()}})
+        waiting = [j for j in jobs if j.get("status") == "queued" and not j.get("bench")]
+        reasons: Dict[str, int] = {}
+        for j in waiting:
+            for key in wait_reasons(j.get("wait") or ""):
+                reasons[key] = reasons.get(key, 0) + 1
+        row["waiting"], row["reasons"] = len(waiting), reasons
     with open(HISTORY, "a") as f:
         f.write(json.dumps(row) + "\n")
-    if HISTORY.stat().st_size > 8 * 1024 * 1024:   # keep about 30 days
-        lines = HISTORY.read_text().splitlines()[-8640:]
-        HISTORY.write_text("\n".join(lines) + "\n")
 
 
 def maintain(cfg: Dict[str, Any], metrics: Dict[str, Dict[str, Any]]) -> None:
     """Resource recovery and self-healing on nodes."""
     d = cfg["defaults"]
     try:
-        sample_history(metrics)
+        sample_history(metrics, cfg)
+    except Exception:
+        pass
+    try:
+        if now() - read_json(HOUSEKEEP, {}).get("t", 0) > 6 * 3600:
+            housekeep(cfg)
     except Exception:
         pass
     for name, st in metrics.items():
@@ -1454,8 +1560,9 @@ def maintain(cfg: Dict[str, Any], metrics: Dict[str, Dict[str, Any]]) -> None:
         if n.local:
             if (any((local_home() / "queue").iterdir()) if (local_home() / "queue").is_dir() else False):
                 start_local_runner(n.n)   # a job queued just as the runner was leaving
-            if now() - st.get("last_gc", 0) > 6 * 3600:
-                n.ctl("gc", str(d["keep_job_days"]))
+            low = st.get("disk_free_gb", 99) < 2 * d["cleanup_target_disk_gb"]
+            if now() - st.get("last_gc", 0) > (3600 if low else 6 * 3600):
+                n.ctl("gc", "1" if low else str(d["keep_job_days"]))
                 st["last_gc"] = now()
                 write_json(node_state_path(name), st)
             continue
@@ -1611,7 +1718,7 @@ def wait_job(jid: str, max_s: int) -> Tuple[int, str]:
             sys.stderr.flush()
         if j["status"] in ("done", "failed", "cancelled"):
             return job_output(j)
-        if time.time() - start >= max_s:
+        if max_s and time.time() - start >= max_s:
             return E_RUNNING, f"still {j['status']}{' on ' + j['node'] if j.get('node') else ''} — run: scaleout wait {jid}"
         time.sleep(5)
 
@@ -1794,16 +1901,96 @@ def cmd_jobs(a) -> None:
             + (f"  waits: {j['wait']}" if j.get("status") == "queued" and j.get("wait") else ""))
 
 
-def cmd_gc(a) -> None:
-    cfg = load_cfg()
+HOUSEKEEP = STATE_DIR / "housekeep.json"
+
+
+def read_jsonl(p: Path, since: float = 0) -> List[Dict[str, Any]]:
+    out = []
+    try:
+        with open(p) as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if r.get("t", 0) >= since:
+                    out.append(r)
+    except OSError:
+        pass
+    return out
+
+
+def trim_jsonl(p: Path, keep_days: float) -> int:
+    """Drop lines older than keep_days; bytes freed."""
+    if not p.exists():
+        return 0
+    before = p.stat().st_size
+    keep = [json.dumps(r, ensure_ascii=False) for r in read_jsonl(p, now() - keep_days * 86400)]
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text("\n".join(keep) + ("\n" if keep else ""))
+    tmp.replace(p)
+    return max(0, before - p.stat().st_size)
+
+
+def tree_bytes(p: Path) -> int:
+    if p.is_file():
+        return p.stat().st_size
+    return sum(f.stat().st_size for f in p.rglob("*") if f.is_file()) if p.exists() else 0
+
+
+def gc_jobs(cfg: Dict[str, Any]) -> Tuple[int, int]:
+    """Forget finished jobs older than keep_job_days, with their prompt, answer and saved artifacts, and any result or
+    prompt left without a job. The job log keeps one line per job for log_days. (jobs, bytes freed)"""
     cut = now() - cfg["defaults"]["keep_job_days"] * 86400
-    n = 0
+    n = freed = 0
+    known = set()
     for j in all_jobs():
+        known.add(j.get("id"))
+        if j.get("status") in ("done", "failed", "cancelled") and not j.get("logged") and not j.get("bench"):
+            save_job(j)   # finished before the job log existed: log it now
         if j.get("status") in ("done", "failed", "cancelled") and j.get("finished_at", now()) < cut:
-            for p in (job_path(j["id"]), STATE_DIR / "prompts" / f"{j['id']}.md", STATE_DIR / "results" / f"{j['id']}.out", STATE_DIR / "results" / f"{j['id']}.err"):
-                p.unlink(missing_ok=True)
+            for p in (job_path(j["id"]), STATE_DIR / "prompts" / f"{j['id']}.md", STATE_DIR / "results" / f"{j['id']}.out",
+                      STATE_DIR / "results" / f"{j['id']}.err", STATE_DIR / "results" / j["id"]):
+                if p.exists():
+                    freed += tree_bytes(p)
+                    shutil.rmtree(p, ignore_errors=True) if p.is_dir() else p.unlink(missing_ok=True)
+            known.discard(j.get("id"))
             n += 1
-    say(f"removed {n} old jobs")
+    for folder in (STATE_DIR / "results", STATE_DIR / "prompts"):
+        for p in (folder.iterdir() if folder.is_dir() else []):
+            jid = p.name.split(".")[0]
+            if jid.startswith("j") and jid not in known and p.stat().st_mtime < cut:
+                freed += tree_bytes(p)
+                shutil.rmtree(p, ignore_errors=True) if p.is_dir() else p.unlink(missing_ok=True)
+    return n, freed
+
+
+def housekeep(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Every 6 hours (the daemon): old jobs and their results go, logs are trimmed to their days, the daemon log is capped,
+    temporary files go. Nodes clean their own side (ctl gc). Nothing outside scaleout's state folder is touched."""
+    d = cfg["defaults"]
+    jobs, freed = gc_jobs(cfg)
+    freed += trim_jsonl(HISTORY, d.get("history_days", 30))
+    freed += trim_jsonl(JOB_LOG, d.get("log_days", 90))
+    for log in STATE_DIR.glob("*.log"):
+        if log.stat().st_size > 5 * 1024 * 1024:
+            data = log.read_bytes()[-2 * 1024 * 1024:]
+            freed += log.stat().st_size - len(data)
+            log.write_bytes(data)
+    tmp = STATE_DIR / "tmp"
+    for p in (tmp.iterdir() if tmp.is_dir() else []):
+        if p.stat().st_mtime < now() - 86400:
+            freed += tree_bytes(p)
+            shutil.rmtree(p, ignore_errors=True) if p.is_dir() else p.unlink(missing_ok=True)
+    rec = {"t": int(now()), "jobs": jobs, "freed_mb": round(freed / 1048576, 1),
+           "total_freed_mb": round(read_json(HOUSEKEEP, {}).get("total_freed_mb", 0) + freed / 1048576, 1)}
+    write_json(HOUSEKEEP, rec)
+    return rec
+
+
+def cmd_gc(a) -> None:
+    rec = housekeep(load_cfg())
+    say(f"removed {rec['jobs']} old jobs, freed {rec['freed_mb']} MB (logs trimmed, results and artifacts of old jobs gone)")
 
 
 # ── commands: nodes ──────────────────────────────────────────────────────────
@@ -1924,6 +2111,145 @@ def node_id(cfg: Dict[str, Any], given: str) -> str:
         if label_of(cfg, n) == given:
             return n
     return given
+
+
+def pct(x: float) -> str:
+    return f"{x * 100:.0f}%"
+
+
+def cmd_insights(a) -> None:
+    """What the logs say about the last N days: how strained each machine was and by what, why jobs waited and for how
+    long, how much running in parallel saved, failures by cause, and what to change."""
+    cfg = load_cfg()
+    days = max(1, a.days)
+    since = now() - days * 86400
+    rows, jobs = read_jsonl(HISTORY, since), read_jsonl(JOB_LOG, since)
+    if a.json:
+        print(json.dumps({"samples": len(rows), "jobs": jobs[-500:]}, ensure_ascii=False)); return
+    nw = name_w(cfg, 16)
+    say(c(f"scaleout insights · last {days} day(s) · {len(rows)} samples (every 5 min) · {len(jobs)} finished jobs", C_TEXT, bold=True))
+    if not rows and not jobs:
+        say("no log yet: the daemon writes a sample every 5 minutes and a line per finished job"); return
+    tips: List[str] = []
+    waiting_rows = [r for r in rows if r.get("waiting")]
+    say("")
+    say(c(f"{'MACHINE':<{nw}}{'ONLINE':>8}{'AVG':>7}{'BUSY':>7}  {'BOTTLENECK (when busy)':<28}{'IDLE WHILE JOBS WAITED':>24}{'JOBS':>6}{'RUN':>8}{'FAIL':>6}", C_DIM))
+    for r in rows:   # samples from before 0.9.3 have load and memory but no strain: work it out the same way
+        for name, x in (r.get("nodes") or {}).items():
+            if x.get("online") and "strain" not in x and name in cfg["nodes"] and x.get("cpus"):
+                x["cap"], x["gates"], x["neck"], x["strain"] = machine_gates(cfg, name, x, int(x.get("running") or 0))
+    for name in sorted(cfg["nodes"], key=lambda x: (not cfg["nodes"][x].get("local"), x)):
+        samples = [(r.get("nodes") or {}).get(name) or {} for r in rows]
+        on = [x for x in samples if x.get("online")]
+        st = [x for x in on if "strain" in x]
+        avg = sum(x["strain"] for x in st) / len(st) if st else 0
+        busy = [x for x in st if x["strain"] >= 0.9]
+        necks: Dict[str, int] = {}
+        for x in busy:
+            necks[x["neck"]] = necks.get(x["neck"], 0) + 1
+        neck_txt = ", ".join(f"{k} {pct(v / len(busy))}" for k, v in sorted(necks.items(), key=lambda kv: -kv[1])) if busy else "-"
+        idle_w = [((r.get("nodes") or {}).get(name) or {}) for r in waiting_rows]
+        idle_w = [x for x in idle_w if x.get("online") and "strain" in x]
+        idle = sum(1 for x in idle_w if x["strain"] < 0.5) / len(idle_w) if idle_w else 0
+        mine = [j for j in jobs if j.get("node") == name]
+        runs = sorted(j["run_s"] for j in mine if j.get("run_s"))
+        fails = sum(1 for j in mine if j.get("status") == "failed")
+        say(pad(c(label_of(cfg, name), C_TEXT, bold=True), nw) + f"{pct(len(on) / len(samples)) if samples else '-':>8}"
+            + f"{pct(avg) if st else '-':>7}{pct(len(busy) / len(st)) if st else '-':>7}  {neck_txt:<28}"
+            + f"{pct(idle) if idle_w else '-':>24}{len(mine):>6}{fmt_dur(runs[len(runs) // 2]) if runs else '-':>8}{fails:>6}")
+        if busy and len(busy) / max(len(st), 1) >= 0.2:
+            top = max(necks, key=necks.get)
+            if top == "memory":
+                tips.append(f"{label_of(cfg, name)} is often full on memory ({pct(len(busy) / len(st))} of the time): memory decides how many "
+                            "jobs run there. More RAM there, or fewer emulator jobs at once, would let more run.")
+            elif top == "cpu":
+                tips.append(f"{label_of(cfg, name)} is often CPU-bound ({pct(len(busy) / len(st))} of the time): lower its share "
+                            f"(scaleout config --node {name} --max-jobs N) so heavy builds spread to other machines.")
+            else:
+                tips.append(f"{label_of(cfg, name)} often has every job slot taken while load and memory have room: raise its share.")
+        if idle_w and idle >= 0.5 and len(idle_w) >= 6:
+            tips.append(f"{label_of(cfg, name)} sat idle {pct(idle)} of the time jobs were waiting: those jobs could not go there "
+                        "(see the wait reasons below; a `mac` tag on non-iOS work is the usual cause).")
+    say("")
+    waits = sorted(j["wait_s"] for j in jobs if j.get("wait_s") is not None)
+    reasons: Dict[str, int] = {}
+    for r in waiting_rows:
+        for k, v in (r.get("reasons") or {}).items():
+            reasons[k] = reasons.get(k, 0) + v
+    tot = sum(reasons.values())
+    say(c("QUEUE", C_ACCENT, bold=True) + f"  jobs waited before starting: median {fmt_dur(waits[len(waits) // 2]) if waits else '-'}"
+        f" · 90% within {fmt_dur(waits[int(len(waits) * 0.9)]) if waits else '-'} · longest {fmt_dur(waits[-1]) if waits else '-'}"
+        f" · something waited in {pct(len(waiting_rows) / len(rows)) if rows else '-'} of samples")
+    if tot:
+        say("  waits by reason: " + ", ".join(f"{k} {pct(v / tot)}" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])))
+    if waits and waits[int(len(waits) * 0.9)] > 600:
+        top = max(reasons, key=reasons.get) if reasons else "no room"
+        tips.append(f"1 job in 10 waited over {fmt_dur(waits[int(len(waits) * 0.9)])} before starting, mostly on {top}.")
+    if reasons.get("needs a Mac", 0) > tot * 0.3 and tot:
+        tips.append("Many waits were jobs tagged mac/xcode waiting for a Mac: tag only work that needs one (iOS build, simulator, signing).")
+    byday: Dict[str, List[Tuple[float, float]]] = {}
+    for j in jobs:
+        if j.get("run_s"):
+            byday.setdefault(time.strftime("%m-%d", time.localtime(j["t"])), []).append((j["t"] - j["run_s"], j["t"]))
+    if byday:
+        par = []
+        for day, iv in sorted(byday.items()):
+            wall = merge_intervals(iv)
+            par.append(f"{day} {sum(b - x for x, b in iv) / wall:.1f}x" if wall else f"{day} -")
+        say("  running in parallel (job time / wall time): " + " · ".join(par[-7:]))
+    say("")
+    kinds: Dict[str, List[Tuple[float, float]]] = {}
+    for j in jobs:
+        if j.get("mem_mb") and j.get("mem_gb_est"):
+            kinds.setdefault(j.get("kind") or "-", []).append((j["mem_gb_est"], j["mem_mb"] / 1024))
+    if kinds:
+        say(c("MEMORY", C_ACCENT, bold=True) + "  reserved vs used per job: " + " · ".join(
+            f"{k} {sum(e for e, _ in v) / len(v):.1f} GB / {sum(u for _, u in v) / len(v):.1f} GB ({len(v)})" for k, v in sorted(kinds.items())))
+    causes: Dict[str, int] = {}
+    per_node: Dict[Tuple[str, str], int] = {}
+    for j in jobs:
+        for ev, why, node in j.get("events") or []:
+            if ev == "moved":
+                key = "agent limit" if "limit" in why else "signed out" if "signed out" in why else "moved"
+                causes[key] = causes.get(key, 0) + 1
+                per_node[(key, node or "?")] = per_node.get((key, node or "?"), 0) + 1
+            elif ev in ("retry", "push-failed"):
+                causes[ev] = causes.get(ev, 0) + 1
+                per_node[(ev, node or "?")] = per_node.get((ev, node or "?"), 0) + 1
+        if j.get("status") == "failed":
+            causes["failed"] = causes.get("failed", 0) + 1
+        elif j.get("status") == "cancelled":
+            causes["cancelled"] = causes.get("cancelled", 0) + 1
+    if causes:
+        say(c("TROUBLE", C_ACCENT, bold=True) + "  " + " · ".join(f"{k} {v}" for k, v in sorted(causes.items(), key=lambda kv: -kv[1])))
+    for (key, node), v in sorted(per_node.items(), key=lambda kv: -kv[1]):
+        if key == "agent limit":
+            tips.append(f"The agent on {label_of(cfg, node)} hit its usage limit {v} time(s): give that machine another account (ccp) or a smaller share.")
+        elif key == "signed out":
+            tips.append(f"The agent on {label_of(cfg, node)} was signed out {v} time(s): sign it in there, then scaleout unblock {node}.")
+        elif key == "retry" and v >= 3:
+            tips.append(f"Jobs on {label_of(cfg, node)} stalled or were lost {v} times: check its network and runner (scaleout doctor).")
+    hk = read_json(HOUSEKEEP, {})
+    size = sum(tree_bytes(STATE_DIR / x) for x in ("jobs", "results", "prompts", "log")) + tree_bytes(HISTORY)
+    say("")
+    say(c("DISK", C_ACCENT, bold=True) + f"  scaleout's records here: {size / 1048576:.0f} MB · cleaned every 6 h "
+        f"(jobs {cfg['defaults']['keep_job_days']} d, job log {cfg['defaults'].get('log_days', 90)} d, samples {cfg['defaults'].get('history_days', 30)} d)"
+        + (f" · last {time.strftime('%m-%d %H:%M', time.localtime(hk['t']))}, freed {hk.get('freed_mb', 0)} MB (total {hk.get('total_freed_mb', 0)} MB)" if hk.get("t") else ""))
+    say("")
+    say(c("SUGGESTIONS", C_ACCENT, bold=True))
+    for t in tips or ["No clear bottleneck: jobs spread and started without long waits."]:
+        say(f"  • {t}")
+
+
+def cmd_unblock(a) -> None:
+    """Let a node's agent take jobs again (after signing it in, or when its limit reset earlier than read)."""
+    data = read_json(AGENT_BLOCKS, {})
+    name = node_id(load_cfg(), a.name)
+    gone = data.get(name, {}) if not a.agent else {a.agent: (data.get(name) or {}).get(a.agent)}
+    for ag in list(gone):
+        (data.get(name) or {}).pop(ag, None)
+    write_json(AGENT_BLOCKS, data)
+    say(f"{name}: {', '.join(k for k, v in gone.items() if v) or 'nothing was'} skipped; takes jobs again")
 
 
 def cmd_rename(a) -> None:
@@ -2116,6 +2442,11 @@ def cmd_status(a) -> None:
             f"{str(st.get('load', '-')):>8}{str(st.get('running', 0)) + '+' + str(st.get('queued', 0)):>7}  {fmt_devices(st):<9}{','.join(st.get('agents') or []) or '-'}")
     q = [j for j in all_jobs() if j.get("status") in ("queued", "dispatched", "running")]
     say(f"queue: {sum(1 for j in q if j['status'] == 'queued')} waiting · {sum(1 for j in q if j['status'] != 'queued')} running")
+    for name, ags in (read_json(AGENT_BLOCKS, {}) or {}).items():
+        for ag, b in (ags or {}).items():
+            if b.get("until", 0) > now():
+                say(f"  {label_of(cfg, name)}: {ag} skipped ({b.get('why')}) until {time.strftime('%m-%d %H:%M', time.localtime(b['until']))}"
+                    + (f"  — sign in on that machine, then: scaleout unblock {name}" if b.get("why") == "signed out" else ""))
 
 
 def cmd_doctor(a) -> None:
@@ -3118,6 +3449,85 @@ def cmd_usage(a) -> None:
                         "every session on each machine")))
 
 
+def machine_gates(cfg: Dict[str, Any], name: str, st: Dict[str, Any], busy: int) -> Tuple[int, Dict[str, float], str, float]:
+    """(cap, how full each gate is, the fullest gate, its fullness 0..1): jobs / cap, load / (2x cores), memory in use."""
+    cap = job_cap(name, cfg["nodes"].get(name, {}), st)
+    cores = max(int(st.get("cpus", 1) or 1), 1)
+    gates = {"jobs": busy / max(cap, 1),
+             "cpu": float(st.get("load", 0) or 0) / (float(cfg["defaults"].get("max_load_per_cpu", 2) or 2) * cores),
+             "memory": 1 - float(st.get("mem_free_pct", 0) or 0) / 100}
+    neck = max(gates, key=gates.get)
+    return cap, gates, neck, min(1.0, gates[neck])
+
+
+WAIT_WORDS = (("memory", "memory"), ("cpu load", "load "), ("job slots", "job(s) running"), ("needs a Mac", "lacks mac"),
+              ("needs a Mac", "lacks xcode"), ("needs a phone", "phone"), ("agent limit", "usage limit"),
+              ("signed out", "signed out"), ("offline", "offline"), ("disk", "disk"))
+
+
+def wait_reasons(text: str) -> List[str]:
+    low = (text or "").lower()
+    return sorted({key for key, word in WAIT_WORDS if word in low})
+
+
+def efficiency_lines(cfg: Dict[str, Any], jobs: List[Dict[str, Any]], nw: int) -> List[str]:
+    """Live efficiency: per machine how full it is on each gate (jobs / cap, load / 2x cores, memory) and which one binds;
+    its benchmark score scaled by the room it has left (live capacity); the pool's use, why queued jobs wait, how long
+    they waited today and how much running in parallel saved."""
+    d = cfg["defaults"]
+    bench = (bench_history() or [{}])[-1].get("nodes", {})
+    running: Dict[str, int] = {}
+    for j in jobs:
+        if j.get("status") in ("dispatched", "running") and j.get("node"):
+            running[j["node"]] = running.get(j["node"], 0) + 1
+    L = [c(f"{'MACHINE':<{nw}}{'JOBS':>9}{'CPU':>7}{'MEM':>7}{'STRAIN':>16}  {'BOTTLENECK':<11}{'SCORE':>7}{'LIVE':>7}", C_DIM)]
+    tot_score = live_score = 0.0
+    for name in sorted(cfg["nodes"], key=lambda x: (not cfg["nodes"][x].get("local"), x)):
+        n = cfg["nodes"][name]
+        st = read_json(node_state_path(name), {})
+        if not st.get("online"):
+            L.append(pad(label_of(cfg, name), nw) + c("offline", C_BAD)); continue
+        busy = max(running.get(name, 0), int(st.get("running", 0) or 0))
+        cores = max(int(st.get("cpus", 1) or 1), 1)
+        cap, gates, neck, strain = machine_gates(cfg, name, st, busy)
+        score = float((bench.get(name) or {}).get("score") or 0)
+        live = score * (1 - strain)
+        tot_score += score; live_score += live
+        col = C_OK if strain < 0.6 else C_WARN if strain < 0.9 else C_BAD
+        L.append(pad(c(label_of(cfg, name), C_TEXT, bold=True), nw) + f"{f'{busy}/{cap}':>9}"
+                 + f"{float(st.get('load', 0) or 0) * 100 / cores:>6.0f}%" + f"{gates['memory'] * 100:>6.0f}%"
+                 + "  " + meter(strain * 100, 8, col) + c(f"{strain * 100:>5.0f}%", col)
+                 + "  " + pad(c(neck, col if strain >= 0.6 else C_DIM), 11)
+                 + c(f"{score:>7.0f}" if score else f"{'-':>7}", C_DIM) + c(f"{live:>7.0f}" if score else f"{'-':>7}", col))
+    waiting = [j for j in jobs if j.get("status") == "queued" and not j.get("bench")]
+    reasons: Dict[str, int] = {}
+    for j in waiting:
+        for key in wait_reasons(j.get("wait") or ""):
+            reasons[key] = reasons.get(key, 0) + 1
+    today = time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1))
+    started = [j for j in jobs if (j.get("dispatched_at") or 0) >= today and not j.get("bench") and j.get("created")]
+    waits = sorted(j["dispatched_at"] - j["created"] for j in started)
+    iv = [(j["dispatched_at"], j["finished_at"]) for j in jobs if (j.get("finished_at") or 0) >= today and j.get("dispatched_at") and not j.get("bench")]
+    serial, wall = sum(b - x for x, b in iv), merge_intervals(iv)
+    use = (1 - live_score / tot_score) * 100 if tot_score else 0
+    L.append("")
+    L.append(f"  pool in use {c(f'{use:.0f}%', C_ACCENT, bold=True)} · live capacity {c(f'{live_score:.0f}', C_ACCENT, bold=True)} of {tot_score:.0f}"
+             + c("  (live = bench score × room left)", C_DIM))
+    neck_txt = ", ".join(f"{k} {v * 100 // max(len(waiting), 1)}%" for k, v in sorted(reasons.items(), key=lambda x: -x[1])) or "-"
+    line = f"  waiting {len(waiting)}" + (c(f" · held by {neck_txt}", C_WARN) if waiting else "")
+    if waits:
+        line += f" · wait before start today: median {fmt_dur(waits[len(waits) // 2])}, max {fmt_dur(waits[-1])}"
+    line += f" · parallel today {serial / wall:.1f}x" if wall else " · no finished jobs today"
+    L.append(line)
+    L.append(c("  7-day trends, bottlenecks and suggestions: scaleout insights", C_DIM))
+    return L
+
+
+def fmt_dur(sec: float) -> str:
+    sec = int(max(0, sec))
+    return f"{sec // 3600}h{sec % 3600 // 60:02d}m" if sec >= 3600 else f"{sec // 60}m{sec % 60:02d}s" if sec >= 60 else f"{sec}s"
+
+
 JOB_MARKS = {"done": ("✔", C_OK), "failed": ("✖", C_BAD), "cancelled": ("⊘", C_DIM), "running": ("●", C_ACCENT), "lost": ("?", C_WARN),
              "dispatched": ("●", C_ACCENT), "queued": ("◌", C_WARN)}
 
@@ -3158,6 +3568,10 @@ def top_lines(cfg: Dict[str, Any], lu: "LocalUsage", interval: int, width: int =
         rows.append(machine(label_of(cfg, name), role_of(cfg, name), fmt_os(st, cfg["nodes"][name]), h[:7], st,
                             f"{me.get('swap_gb', '-')}G" if name in local else "-"))
     L.extend(box("MACHINES", rows, width, f"{len(rows) - 1} in the pool"))
+    try:
+        L.extend(box("EFFICIENCY", efficiency_lines(cfg, all_jobs(), nw), width, "strain = the fullest gate · bottleneck = which one"))
+    except Exception:   # the dashboard never dies on a state file it cannot read
+        pass
     # queue
     jobs = all_jobs()
     direct = direct_runs()
@@ -3309,14 +3723,14 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     s = sp.add_parser("submit", help="queue a job and print its id"); job_opts(s); s.set_defaults(fn=cmd_submit)
     s = sp.add_parser("run", help="queue a job and wait for its result"); job_opts(s); s.add_argument("-m", "--max", type=int, default=540); s.set_defaults(fn=cmd_run)
-    s = sp.add_parser("wait", help="wait for a job (exit 2 if still running)"); s.add_argument("job"); s.add_argument("-m", "--max", type=int, default=540); s.set_defaults(fn=cmd_wait)
+    s = sp.add_parser("wait", help="wait for a job (exit 2 if still running)"); s.add_argument("job"); s.add_argument("-m", "--max", type=int, default=540, help="seconds, 0 = until it ends (run it in the background)"); s.set_defaults(fn=cmd_wait)
     s = sp.add_parser("result", help="print a finished job's answer"); s.add_argument("job"); s.set_defaults(fn=cmd_result)
     s = sp.add_parser("artifacts", help="screenshots/videos/logs a job saved (paths; --to DIR copies them)")
     s.add_argument("job"); s.add_argument("--to"); s.set_defaults(fn=cmd_artifacts)
     s = sp.add_parser("logs", help="history and stderr of a job"); s.add_argument("job"); s.set_defaults(fn=cmd_logs)
     s = sp.add_parser("cancel", help="cancel a job"); s.add_argument("job"); s.set_defaults(fn=cmd_cancel)
     s = sp.add_parser("jobs", help="recent jobs"); s.add_argument("-n", "--limit", type=int, default=20); s.set_defaults(fn=cmd_jobs)
-    s = sp.add_parser("gc", help="forget old finished jobs on the orchestrator"); s.set_defaults(fn=cmd_gc)
+    s = sp.add_parser("gc", help="clean up now: old jobs, their results and artifacts, logs past their days (the daemon does it every 6 h)"); s.set_defaults(fn=cmd_gc)
 
     s = sp.add_parser("exec", help="run a shell command on a node"); s.add_argument("name"); s.add_argument("command", nargs=argparse.REMAINDER); s.set_defaults(fn=cmd_exec)
     s = sp.add_parser("cleanup", help="reclaim disk on nodes"); s.add_argument("names", nargs="*"); s.add_argument("--aggressive", action="store_true", help="also empty caches under the node's home")
@@ -3351,6 +3765,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     s.add_argument("--weeks", type=int, help="weeks of days to draw (default: what fits, up to 26)")
     s.add_argument("--refresh", action="store_true", help="ask every machine now instead of using numbers up to 10 min old")
     s.set_defaults(fn=cmd_usage)
+    s = sp.add_parser("insights", help="what the logs say: strain and bottleneck per machine, waits, failures, suggestions")
+    s.add_argument("--days", type=int, default=7); s.add_argument("--json", action="store_true"); s.set_defaults(fn=cmd_insights)
+    s = sp.add_parser("unblock", help="let a node's agent take jobs again (after signing it in)")
+    s.add_argument("name"); s.add_argument("agent", nargs="?"); s.set_defaults(fn=cmd_unblock)
     s = sp.add_parser("rename", help="give a machine your own name (orchestrator and node are roles); no new name: back to its id")
     s.add_argument("name"); s.add_argument("new", nargs="?"); s.set_defaults(fn=cmd_rename)
     s = sp.add_parser("tick", help="run one scheduling round"); s.set_defaults(fn=cmd_tick)

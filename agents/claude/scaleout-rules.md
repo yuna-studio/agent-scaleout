@@ -21,8 +21,9 @@ Do not run heavy items one after another, waiting on each. Hand them off and car
 2. Queue them all at once, without waiting: `id=$(echo "<item>" | scaleout submit --repo <repo> [--tags …])` per item
    (submit prints the job id and returns at once). Or start several `scaleout` subagents in one message.
 3. While they run, do the work that does not depend on them: read and edit code, write the next items, update docs.
-4. Collect: `scaleout wait <id>` for each (exit 2 = still running, wait again). Act on each result as it comes;
-   a failed item is fixed and sent again on its own, the others stay.
+4. Collect in the background: for each job start `scaleout wait <id> -m 0` with the Bash tool's run_in_background.
+   Each wait shows in Claude Code's list of background tasks and you are notified when it ends, so no result is missed
+   even after your turn ends. Act on each result as it comes; a failed item is fixed and sent again on its own.
 Wait for one result first only when the next step really depends on it (e.g. a build that the E2E needs).
 
 An item does not have to stay in this session. Hand off whatever can be written down as a standalone task: heavy or long

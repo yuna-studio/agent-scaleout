@@ -236,7 +236,23 @@ scaleout top          # live: orchestrator + nodes (memory, swap, disk, load, jo
                       #   Claude sessions working now with their running subagents, tokens (subagents included)
 scaleout usage        # Claude tokens of every machine (all sessions there): today / 7 / 30 days, the days as grass, jobs per machine
 scaleout rename macbook studio   # your own name for a machine (orchestrator and node are roles); commands take either
+scaleout insights     # last 7 days from the logs: strain and bottleneck per machine, waits and their reasons,
+                      #   parallel speed-up per day, memory reserved vs used, failures by cause, and suggestions
+scaleout unblock pc   # let a node's agent take jobs again after signing it in (a usage limit lifts by itself)
 ```
+`top` has an **EFFICIENCY** panel: per machine how full each gate is (jobs / cap, load / 2× cores, memory), which one
+binds, and its benchmark score scaled by the room it has left (live capacity); then the pool's use, why jobs wait and how
+long they waited today.
+
+**Not lost, not stuck.** A job whose node stops reporting is retried elsewhere; one whose agent hit a usage limit or lost its
+login is moved to another machine and that agent is skipped until the limit resets (`scaleout status` shows it). Claude
+sessions collect with `scaleout wait <id> -m 0` in the background, so every handed-off job shows in Claude Code's task list
+and notifies when it ends.
+
+**Logs that clean themselves.** The daemon samples every machine every 5 minutes and writes one line per finished job
+(`~/.local/state/scaleout/log/jobs.jsonl`). Every 6 hours it drops finished jobs older than `keep_job_days` (3) with their
+answers and artifacts, trims the job log to `log_days` (90) and the samples to `history_days` (30), and caps its own log;
+the orchestrator's idle work trees go sooner when its disk runs low. `scaleout gc` does it now.
 `top` reads only what the daemon already collected (no SSH of its own) and sleeps between refreshes, so it costs almost no
 CPU. Tokens of this machine come from `~/.claude/projects/*/*.jsonl`, read incrementally (only new lines). Work done by a
 node comes from each finished job's own report (tokens, cost, turns, busy time).
