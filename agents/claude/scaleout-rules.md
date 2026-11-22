@@ -44,6 +44,8 @@ corrections, small steps. Handing off costs a little (the receiving agent loads 
 - Pick the OS by the work, and say it with a tag so the job waits for the right machine:
   - iOS and macOS work (`xcodebuild`, iOS Simulator, `pod install`, anything that writes `Podfile.lock` or the Xcode project) → `--tags mac` (or `xcode`).
   - Android, web, backend, tests and research run on any OS; leave the OS tag out.
+  - Flutter app changes: check them on the Android emulator (`--tags emulator`, any OS) unless the change is iOS-only
+    (iOS layout bug, iOS plugin, signing). `mac` is for work only a Mac can do; it keeps the job off every other machine.
   - A job that needs bash scripts or `--repo` does not go to a Windows node.
   - Results that differ by OS (golden images, native binaries) → tag the OS they must match.
 - Memory decides how many jobs a node runs at once (no fixed limit on simulators or emulators). Pass `--mem <GB>` when a job needs more than usual, e.g. several simulators.

@@ -33,7 +33,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "0.9.0"
+VERSION = "0.9.1"
 HOME = Path.home()
 CONF_DIR = Path(os.environ.get("SCALEOUT_CONF", HOME / ".config" / "scaleout"))
 STATE_DIR = Path(os.environ.get("SCALEOUT_STATE", HOME / ".local" / "state" / "scaleout"))
@@ -825,7 +825,7 @@ def cmd_local(a) -> None:
         node.setdefault("tags", ["mac", "xcode"] if darwin and shutil.which("xcodebuild") else [platform.system().lower()])
         node.setdefault("max_jobs", 2)
         node.setdefault("cpu_slots", 2)
-        node.setdefault("score_bias", 20)   # first choice while it has room
+        node["score_bias"] = min(float(node.get("score_bias", -40)), -40)   # last choice: it orchestrates and takes what only it can or overflow
     if a.max_jobs:
         node["max_jobs"] = node["cpu_slots"] = a.max_jobs
     node.pop("dir", None)
@@ -1182,9 +1182,13 @@ def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[st
         if busy and cpu_used.get(name, 0) + job_cpu(j) > units and float(st.get("load", 0) or 0) >= cores:
             why[name] = f"CPU units full ({cpu_used.get(name, 0)}/{units}, load {float(st.get('load', 0)):.1f})"
             continue       # units full and the cores really busy; a heavy job in a quiet phase (load < cores) leaves room
-        score = st.get("mem_free_pct", 0) + min(st.get("disk_free_gb", 0), 50) / 5 - 30 * busy - 10 * float(st.get("load", 0)) / max(int(st.get("cpus", 1)), 1)
-        if float(st.get("load", 0) or 0) < cores:
-            score += float(n.get("score_bias", 0))   # the orchestrator goes first only while it is quiet; busy with CI or sessions, idle nodes win
+        # even use by capacity: the machine least full gets the job. Full = jobs / max_jobs and load / allowed load, so a
+        # 16-thread machine with max_jobs 8 takes about four jobs while a 2-job laptop takes one; memory in use counts a little
+        jobs_full = (busy + 1) / max(int(n.get("max_jobs", 2)), 1)
+        load_full = float(st.get("load", 0) or 0) / limit
+        mem_used = 1 - float(st.get("mem_free_pct", 0) or 0) / 100
+        score = -100 * (0.6 * jobs_full + 0.3 * load_full + 0.1 * mem_used)
+        score += float(n.get("score_bias", 0))   # the orchestrator has a negative bias: it orchestrates, runs what only it can, and takes overflow
         if score > best_score:
             best, best_score = name, score
     return best
