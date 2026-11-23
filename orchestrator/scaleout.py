@@ -3516,7 +3516,8 @@ def cmd_tokens(a) -> None:
         for k, v in tokens_apply(cfg).items():
             say(f"{k}: {v}")
         if a.action == "on":
-            say("new sessions get the rules, notes and ledger; running ones take the hooks at once and the window when they restart")
+            say("new sessions and node jobs get all of it; a session already running loads the new hooks with /reload-plugins"
+                f" and the window with /autocompact {int(tokens_cfg(cfg)['window'])} (or when it is restarted)")
     tc = tokens_cfg(cfg)
     say(f"token saving: {'on' if tc['on'] else 'off'} · auto-compact at {int(tc['window']) // 1000}k"
         f" · forks refused above {int(tc['fork_max']) // 1000}k · auto-tune {'on' if tc['auto'] else 'off'}"

@@ -253,6 +253,8 @@ scaleout tokens on [--window 200k] [--auto]   # off · status (default) · tune
 - **Self-tuning (`--auto`).** Once a day the daemon replays the last 7 days at each window and charges every compaction
   what compactions measurably cost afterwards (context read by requests that re-read a file the session had read before
   it; 2 × window until measured), then moves the window at most 50k toward the cheapest, inside 120k–400k.
+- **When it takes effect.** New sessions and every node job get all of it. A session already running keeps the hooks
+  and window it started with: type `/reload-plugins` (hooks) and `/autocompact 200000` (window) in it, or restart it.
 
 ## Dashboard and Claude usage
 
