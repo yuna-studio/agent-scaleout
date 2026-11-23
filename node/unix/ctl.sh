@@ -180,6 +180,42 @@ case "$verb" in
     echo cancelled ;;
   rm) rm -rf "$B/jobs/$1" "$B/queue/$1" "$B/work/$1"; echo removed ;;
 
+  tokens)  # tokens on <window> | off | status — `scaleout tokens`: Claude's auto-compact window on this machine and the job rules
+    case "${1:-status}" in
+      on|off)
+        win="${2:-250000}"; case "$win" in *[!0-9]*|"") win=250000 ;; esac
+        touch "$B/node.conf"
+        grep -v -E '^(TOKEN_SAVING|COMPACT_WINDOW)=' "$B/node.conf" > "$B/node.conf.tmp" 2>/dev/null || true
+        [ "$1" = on ] && printf 'TOKEN_SAVING=1\nCOMPACT_WINDOW=%s\n' "$win" >> "$B/node.conf.tmp"
+        mv -f "$B/node.conf.tmp" "$B/node.conf"
+        if command -v python3 >/dev/null 2>&1; then
+          python3 - "$HOME/.claude/settings.json" "$1" "$win" <<'PY' || { echo "settings not changed"; exit 1; }
+import json, os, sys
+path, mode, win = sys.argv[1:]
+s = {}
+if os.path.exists(path):
+    try:
+        s = json.load(open(path))
+    except ValueError:
+        sys.exit(1)          # never rewrite a settings file we cannot read
+env = s.setdefault("env", {})
+if mode == "on":
+    env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = win
+else:
+    env.pop("CLAUDE_CODE_AUTO_COMPACT_WINDOW", None)
+if not env:
+    s.pop("env")
+os.makedirs(os.path.dirname(path), exist_ok=True)
+tmp = path + ".scaleout-tmp"
+with open(tmp, "w") as f:
+    f.write(json.dumps(s, indent=2, ensure_ascii=False) + "\n")
+os.replace(tmp, path)
+PY
+        fi
+        [ "$1" = on ] && echo "tokens on $win" || echo "tokens off" ;;
+      *) if [ "${TOKEN_SAVING:-0}" = 1 ]; then echo "on ${COMPACT_WINDOW:-250000}"; else echo off; fi ;;
+    esac ;;
+
   gc)  # gc <days>  — drop finished job folders, and repo work trees idle, older than N days
     days="${1:-3}"; n=0
     for d in "$B"/jobs/*/; do

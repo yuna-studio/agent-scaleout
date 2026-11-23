@@ -71,7 +71,8 @@ agent_cmd() {  # agent_cmd <agent> -> command line that reads the prompt on stdi
   case "$1" in
     claude)  # PERMISSION_MODE=bypass in node.conf: never ask, the deny list in settings still applies
       local pm=""; [ "${PERMISSION_MODE:-}" = bypass ] && pm="--permission-mode bypassPermissions"
-      echo "claude -p --output-format json $pm $s" ;;
+      local tr=""; [ "${TOKEN_SAVING:-0}" = 1 ] && [ -f "$B/bin/token-rules.md" ] && tr="--append-system-prompt \"\$(cat '$B/bin/token-rules.md')\""
+      echo "claude -p --output-format json $pm $s $tr" ;;   # tr: `scaleout tokens on` adds the job rules for small contexts
     codex)  echo 'codex exec --skip-git-repo-check "$(cat)"' ;;
     gemini) echo 'gemini -p "$(cat)"' ;;
     custom) echo "${AGENT_CMD:-cat}" ;;

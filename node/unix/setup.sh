@@ -128,7 +128,7 @@ fi
 [ -n "$NAME" ] || { echo "--name is required" >&2; exit 4; }
 mkdir -p "$B/bin" "$B/queue" "$B/jobs" "$B/work" "$B/settings"; chmod 700 "$B"
 # swap files in (new inode) instead of overwriting: a running runner.sh keeps reading its own copy
-for f in ctl.sh runner.sh setup.sh gh-runner.sh provision.sh usage.py; do
+for f in ctl.sh runner.sh setup.sh gh-runner.sh provision.sh usage.py token-rules.md; do
   [ -f "$PKG/$f" ] || continue
   dst="$B/bin/$f"; [ "$f" = ctl.sh ] && dst="$B/bin/ctl"
   cp "$PKG/$f" "$dst.new.$$" && chmod 755 "$dst.new.$$" && mv -f "$dst.new.$$" "$dst"
