@@ -34,6 +34,26 @@ disk_free_gb() {  # free GB of the disk holding $1 (falls back to $HOME when the
 load1() { if [ "$OS" = Darwin ]; then sysctl -n vm.loadavg | awk '{print $2}'; else cut -d' ' -f1 /proc/loadavg; fi; }
 cpus() { if [ "$OS" = Darwin ]; then sysctl -n hw.ncpu; else nproc; fi; }
 running_jobs() { local n=0 d; for d in "$B"/jobs/*/; do [ -f "$d/started" ] && [ ! -f "$d/rc" ] && n=$((n + 1)); done; echo "$n"; }
+dd_drop() {  # dd_drop <folder>|orphans -> how many Xcode build caches (DerivedData) went
+  # Xcode keeps one build cache per workspace path (4-8 GB for a Flutter app) and never removes it, so every repo work tree
+  # that built for iOS leaves one behind. Drop the caches of workspaces under <folder>, or ("orphans") of workspaces
+  # that no longer exist. A workspace on an external disk that is not mounted right now is not an orphan.
+  local root="${DERIVED_DATA:-$HOME/Library/Developer/Xcode/DerivedData}" d ws vol n=0
+  [ -d "$root" ] && command -v plutil >/dev/null 2>&1 || { echo 0; return; }
+  for d in "$root"/*/; do
+    [ -f "$d/info.plist" ] || continue
+    ws="$(plutil -extract WorkspacePath raw "$d/info.plist" 2>/dev/null)" || continue
+    [ -n "$ws" ] || continue
+    if [ "$1" = orphans ]; then
+      [ -e "$ws" ] && continue
+      case "$ws" in /Volumes/*) vol="/Volumes/$(printf '%s' "$ws" | cut -d/ -f3)"; [ -d "$vol" ] || continue ;; esac
+    else
+      case "$ws" in "$1"/*) ;; *) continue ;; esac
+    fi
+    rm -rf "$d"; n=$((n + 1))
+  done
+  echo "$n"
+}
 idle_wt() {  # idle_wt <work tree> -> takes its lock when no job holds it (a lock older than 12 h was left by a crashed job)
   [ -n "$(find "$1.lock" -maxdepth 0 -mmin +720 2>/dev/null)" ] && rm -rf "$1.lock"
   mkdir "$1.lock" 2>/dev/null
@@ -48,7 +68,7 @@ reclaim_wts() {  # reclaim_wts <free GB wanted> [idle days] -> how many repo wor
       [ -n "$days" ] && [ -n "$(find "$w" -maxdepth 0 -mtime +"$days" 2>/dev/null)" ] || continue
     fi
     idle_wt "$w" || continue                         # a job works in it
-    rm -rf "$w"; rmdir "$w.lock" 2>/dev/null; n=$((n + 1))
+    rm -rf "$w"; dd_drop "$w" >/dev/null; rmdir "$w.lock" 2>/dev/null; n=$((n + 1))
   done
   if [ "$n" -gt 0 ]; then for r in "$B"/repos/*.git; do [ -d "$r" ] && git -C "$r" worktree prune 2>/dev/null; done; fi
   echo "$n"
@@ -166,7 +186,14 @@ case "$verb" in
       [ -f "$d/rc" ] || continue
       if [ -n "$(find "$d/rc" -mtime +"$days" 2>/dev/null)" ]; then rm -rf "$d"; n=$((n + 1)); fi
     done
+    for d in "$B"/jobs/*/; do   # left "running" by a runner that died: no rc, its process gone, nothing written for a day
+      [ -f "$d/started" ] && [ ! -f "$d/rc" ] || continue
+      p="$(cat "$d/pid" 2>/dev/null)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null && continue
+      [ -n "$(find "$d" -maxdepth 1 -mmin -1440 2>/dev/null)" ] && continue
+      rm -rf "$d"; n=$((n + 1))
+    done
     find "$B/work" -mindepth 1 -maxdepth 1 -mtime +"$days" -exec rm -rf {} + 2>/dev/null
+    find "$B/work" -mindepth 1 -maxdepth 1 -name 'load.*' -mmin +120 -exec rm -rf {} + 2>/dev/null   # a killed bench load job
     old="$(date -v-"${days}"d +%Y%m%d 2>/dev/null || date -d "-$days days" +%Y%m%d)"   # job refs of repo copies
     for r in "$B"/repos/*.git; do
       [ -d "$r" ] || continue
@@ -176,7 +203,7 @@ case "$verb" in
       done
       git -C "$r" gc --auto -q 2>/dev/null
     done
-    echo "removed $n, work trees $(reclaim_wts 0 "$days")" ;;
+    echo "removed $n, work trees $(reclaim_wts 0 "$days"), xcode caches $(dd_drop orphans)" ;;
 
   cleanup)  # cleanup [aggressive|deep] [GB wanted, default 20]  — free disk safely; prints GB before -> after
     before="$(disk_free_gb)"; want="${2:-20}"
@@ -212,8 +239,9 @@ case "$verb" in
   loadjob)  # synthetic mobile job for `scaleout bench --load`: holds ~2.5 GB the whole time and alternates
             # "waiting for the model" (sleep) with build bursts on 4 cores, like an agent that edits, builds, tests
     t="$B/work/load.$$"; mkdir -p "$t"; head -c 33554432 /dev/urandom > "$t/r"; touch "$t/hold"
+    trap 'rm -rf "$t"' EXIT; trap 'exit 143' INT TERM HUP   # killed or timed out: the memory holder below ends too
     a="$(ms)"
-    perl -e 'open(F, "<", $ARGV[0]) or exit; local $/; my $r = <F>; my $x = $r x 78; sleep 1 while -e $ARGV[1];' "$t/r" "$t/hold" &
+    perl -e 'open(F, "<", $ARGV[0]) or exit; local $/; my $r = <F>; my $x = $r x 78; my $pp = getppid(); sleep 1 while -e $ARGV[1] && getppid() == $pp;' "$t/r" "$t/hold" &
     hp=$!; phase=0
     while [ "$phase" -lt 3 ]; do
       sleep "${LOAD_WAIT_S:-8}"; w=0; pids=""

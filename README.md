@@ -139,7 +139,7 @@ Write tasks so they stand alone — the node's agent has not seen your conversat
 - **Node control is one script** (`~/.scaleout/bin/ctl`, or `ctl.ps1` on Windows) with verbs such as `metrics`, `submit`, `state`, `result`, `cleanup`. The orchestrator never needs to know a node's OS.
 - **Jobs run inside the node's login session**, started by its service manager whenever the node's queue is non-empty: a LaunchAgent with `QueueDirectories` (macOS), a `systemd --user` path unit (Linux, cron fallback), a scheduled task (Windows). On macOS this matters: an SSH session cannot read the login keychain, so agents look "not logged in" when started over plain SSH.
 - **Heartbeats.** The node runner touches a heartbeat every 10 s and enforces the timeout. A stale heartbeat (default 5 min), a vanished job, or a node offline for 10 min puts the job back in the queue (2 retries by default) and the next try goes to another machine for 15 min; the orphan is cancelled when that node returns, before the job may go back there. A runner unit that systemd gave up on (failed) counts as `runner-down`.
-- **Scheduling score** = free memory % + free disk − 30 × jobs on the node − load per CPU, among nodes that are healthy, have the required tags and agent, and are under their `max_jobs`.
+- **Scheduling** — among nodes that are healthy, have the required tags and agent, and have room (jobs, memory, load, CPU units, disk), the job goes to the one least strained once it has it: jobs ÷ its share (`max_jobs`), load ÷ 2 × cores, memory in use and the part of its free disk the job would fill (the job's own memory and disk counted in). On top: a faster machine (all-core speed from `scaleout bench`) wins a near tie, and Macs are kept for what only a Mac can do — Android work goes to other machines first, any-machine work leans away from Macs, untagged work that reads like iOS leans to Macs. The disk a job fills is guessed by kind: iOS 15 GB heavy / 5 light, Android 10 / 4, other 8 / 2.
 
 ## Resource guard & self-healing
 
@@ -151,6 +151,8 @@ Write tasks so they stand alone — the node's agent has not seen your conversat
 | free disk on a node | `< 8 GB` | node cleanup: old job folders, package caches, then idle repo work trees, least recently used first, until 20 GB is free (`cleanup_target_disk_gb`); below 5 GB also caches under the node's home if that was not enough. At most hourly, every 10 minutes while the node is `disk-full` |
 | finished job folders | 3 days | removed — results are fetched and deleted right away anyway |
 | idle repo work trees | 3 days | removed — they only keep build caches for the next job in the same repo; a running job's tree is never touched |
+| Xcode build caches (DerivedData) | with their work tree | Xcode keeps one per workspace path (4-8 GB for a Flutter app) and never removes it: it goes when its work tree goes, and gc drops the caches of workspaces that no longer exist (not those on an unmounted disk). The orchestrator's own machine gets the same disk cleanup as the nodes |
+| job folder left running | 1 day | no `rc`, its process gone, nothing written for a day (a runner that died): removed, so it stops holding a job slot. A killed `bench --load` job's memory holder ends with it |
 | runner service missing | — | re-registered (`ctl repair`) |
 | free disk when a job starts | `< 2 GB` | job refused (exit 28) instead of filling the disk |
 | free memory when a job starts | `< 12 %` | the node holds the job (never starts a second agent into swap); after 10 min the orchestrator moves it to another node |

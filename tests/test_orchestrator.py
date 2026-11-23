@@ -630,6 +630,42 @@ class E2E(unittest.TestCase):
         self.assertEqual(so.job_cap("n1", cfg["nodes"]["n1"], st), 2)
         cfg["nodes"]["n1"]["max_jobs"] = 1; cfg["nodes"]["n1"].pop("max_jobs_fixed", None)
 
+    def test_98p_platform_speed_and_disk(self):
+        """Android and any-machine work goes to a non-Mac first and iOS work to a Mac; the faster machine wins a tie; a busy
+        node whose disk the job would push under its floor is skipped."""
+        cfg = so.load_cfg()
+        cfg["nodes"] = {"mac": {"max_jobs": 2, "agent": "claude"}, "pc": {"max_jobs": 2, "agent": "claude"}}
+        base = {"online": True, "ts": so.now(), "mem_free_pct": 80, "mem_total_gb": 32, "disk_free_gb": 500, "load": 0.1, "cpus": 8,
+                "agents": ["claude"], "runner": True}
+        m = {"mac": dict(base, os="Darwin", caps=["emulator", "simulator", "ios-simulator"]), "pc": dict(base, os="Linux", caps=["emulator"])}
+        pick = lambda j, load=None, why=None, disk=None: so.pick_node(cfg, j, m, load or {}, {}, {}, {}, why if why is not None else {}, disk)
+        self.assertEqual(pick({"tags": ["emulator"], "agent": "default", "id": "p1"}), "pc")
+        self.assertEqual(pick({"tags": [], "agent": "default", "id": "p2"}), "pc", "any machine: keep the Mac free")
+        (so.STATE_DIR / "prompts").mkdir(parents=True, exist_ok=True)
+        (so.STATE_DIR / "prompts" / "p3.md").write_text("iOS 시뮬레이터에서 xcodebuild test")
+        (so.STATE_DIR / "prompts" / "p4.md").write_text("flutter E2E on the Android emulator and the iOS simulator")
+        (so.STATE_DIR / "prompts" / "p5.md").write_text("안드로이드 에뮬레이터로 maestro")
+        self.assertEqual([so.job_platform({"tags": [], "id": f"p{k}"}) for k in (3, 4, 5)], ["ios", "", "android"])
+        self.assertEqual(so.job_platform({"tags": ["mac"], "id": "p5"}), "ios", "tags win over the prompt")
+        self.assertEqual(pick({"tags": [], "agent": "default", "id": "p3"}), "mac", "untagged iOS work leans to the Mac")
+        self.assertEqual(pick({"tags": [], "agent": "default", "id": "p6"}, load={"pc": 2}), "mac", "the Mac takes overflow")
+        # the faster machine (bench, or its thread count) wins when both are equally free
+        m2 = {"slow": dict(base, os="Linux"), "fast": dict(base, os="Linux", cpus=16)}
+        cfg["nodes"] = {"slow": {"max_jobs": 2, "agent": "claude"}, "fast": {"max_jobs": 2, "agent": "claude"}}
+        self.assertEqual(so.pick_node(cfg, {"tags": [], "agent": "default", "id": "p7"}, m2, {}), "fast")
+        # disk: a heavy job needs ~8 GB on top of the 5 GB floor
+        cfg["nodes"] = {"mac": {"max_jobs": 2, "agent": "claude"}, "pc": {"max_jobs": 8, "agent": "claude"}}
+        cfg["defaults"]["min_free_disk_gb"] = 5   # the shipped floor
+        heavy = {"tags": [], "agent": "default", "id": "p8", "cpu": 2}
+        self.assertEqual(so.job_disk_gb(heavy), 8.0)
+        m["pc"]["disk_free_gb"] = 12
+        why = {}
+        self.assertEqual(pick(heavy, load={"pc": 1}, why=why), "mac")
+        self.assertIn("disk 12 GB free, job needs 8", why["pc"])
+        m["pc"]["disk_free_gb"] = 500
+        self.assertEqual(pick(heavy, load={"pc": 1}, disk={"pc": 490}), "mac", "disk of jobs just handed out counts")
+        self.assertEqual(pick(heavy, load={"pc": 1}), "pc")
+
     def test_98l_plugin_version_follows(self):
         """The plugin's version is the scaleout version (it is read in place from the installed package)."""
         self.assertEqual(json.loads((ROOT / "plugin/.claude-plugin/plugin.json").read_text())["version"], so.VERSION)
@@ -881,6 +917,56 @@ class E2E(unittest.TestCase):
         wl = subprocess.run(["git", "-C", bare, "worktree", "list"], check=True, stdout=subprocess.PIPE).stdout.decode()
         self.assertEqual(wl.count("\n"), 1, wl)
         self.assertEqual(Path(c("repo-checkout", "r", sha)).name, "r-wt1", "the next job makes its work tree again")
+
+    @unittest.skipUnless(sys.platform == "darwin", "Xcode build caches live on macOS (plutil)")
+    def test_99f_gc_drops_xcode_caches_and_dead_jobs(self):
+        """Every work tree that built for iOS leaves a 4-8 GB Xcode cache: it goes with the work tree, and caches of
+        workspaces that are gone go in gc. A job folder left running by a dead runner goes too, and a killed load job."""
+        home = TMP / "dd-home"
+        b = home / ".scaleout"
+        for d in ("bin", "jobs", "work", "repos"):
+            (b / d).mkdir(parents=True)
+        ctl = b / "bin/ctl"
+        shutil.copy(ROOT / "node/unix/ctl.sh", ctl)
+        ctl.chmod(0o755)
+        dd = home / "Library/Developer/Xcode/DerivedData"
+        env = {k: v for k, v in os.environ.items() if k not in ("SCALEOUT_NODE_HOME", "DERIVED_DATA")}
+        env["HOME"] = str(home)
+        c = lambda *a: subprocess.run([str(ctl), *a], env=env, check=True, stdout=subprocess.PIPE).stdout.decode().strip()
+
+        def cache(name: str, ws: str) -> None:
+            (dd / name).mkdir(parents=True)
+            plist = str(dd / name / "info.plist")
+            subprocess.run(["plutil", "-create", "xml1", plist], check=True)
+            subprocess.run(["plutil", "-insert", "WorkspacePath", "-string", ws, plist], check=True)
+        live = home / "proj/ios/Runner.xcworkspace"
+        live.mkdir(parents=True)
+        wt = b / "repos/r-wt1"            # an idle repo work tree, five days old
+        (wt / "ios").mkdir(parents=True)
+        (wt / ".git").write_text("gitdir: nowhere\n")
+        cache("Live", str(live))
+        cache("Gone", str(home / "deleted/ios/Runner.xcworkspace"))
+        cache("Unmounted", "/Volumes/no-such-disk-xyz/app/ios/Runner.xcworkspace")
+        cache("WorkTree", str(wt / "ios/Runner.xcworkspace"))
+        old = time.time() - 5 * 86400
+        os.utime(wt, (old, old))
+        dead, alive = b / "jobs/j-dead", b / "jobs/j-alive"
+        for d, pid in ((dead, "99999999"), (alive, str(os.getpid()))):
+            d.mkdir()
+            (d / "started").write_text("1")
+            (d / "pid").write_text(pid)
+            for p in (d / "started", d / "pid", d):
+                os.utime(p, (old, old))
+        load = b / "work/load.123"
+        load.mkdir()
+        (load / "hold").write_text("")
+        os.utime(load, (time.time() - 3 * 3600,) * 2)
+        out = c("gc", "3")
+        self.assertIn("removed 1, work trees 1, xcode caches 1", out)
+        self.assertEqual(sorted(p.name for p in dd.iterdir()), ["Live", "Unmounted"], "the work tree's cache went with it")
+        self.assertFalse(dead.exists())
+        self.assertTrue(alive.exists(), "never a job whose process still runs")
+        self.assertFalse(load.exists())
 
 
 

@@ -33,7 +33,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "0.9.5"
+VERSION = "0.9.6"
 HOME = Path.home()
 CONF_DIR = Path(os.environ.get("SCALEOUT_CONF", HOME / ".config" / "scaleout"))
 STATE_DIR = Path(os.environ.get("SCALEOUT_STATE", HOME / ".local" / "state" / "scaleout"))
@@ -1159,6 +1159,14 @@ HEAVY_WORDS = re.compile(r"e2e|maestro|emulator|simulator|에뮬|시뮬|xcodebui
                          r"integration_test|전체 테스트|커버리지|coverage", re.I)
 
 
+def job_text(j: Dict[str, Any]) -> str:
+    """The start of the job's prompt (what kind of work it is)."""
+    try:
+        return (STATE_DIR / "prompts" / f"{j['id']}.md").read_text(errors="replace")[:4000]
+    except (OSError, KeyError):
+        return ""
+
+
 def job_cpu(j: Dict[str, Any]) -> int:
     """CPU units a job takes on a node: 2 = heavy (builds, test suites, simulators, emulators), 1 = light.
     A node has as many units as `scaleout bench` measured CPU slots (M1: 2, M4: 3, M4 Pro: 5)."""
@@ -1166,11 +1174,53 @@ def job_cpu(j: Dict[str, Any]) -> int:
         return int(j["cpu"])
     if set(j.get("tags") or []) & HEAVY_TAGS:
         return 2
-    try:
-        text = (STATE_DIR / "prompts" / f"{j['id']}.md").read_text(errors="replace")[:4000]
-    except (OSError, KeyError):
-        text = ""
-    return 2 if HEAVY_WORDS.search(text) else 1
+    return 2 if HEAVY_WORDS.search(job_text(j)) else 1
+
+
+MAC_TAGS = {"mac", "macos", "darwin", "xcode", "simulator", "ios-simulator", "ios-device"}
+ANDROID_TAGS = {"emulator", "android-device"}
+IOS_WORDS = re.compile(r"\bios\b|xcode|testflight|cocoapods|pod install|\.ipa\b|iphone|ipad|시뮬|simulator", re.I)
+ANDROID_WORDS = re.compile(r"android|안드로이드|에뮬|emulator|gradle|\.apk\b|\.aab\b|\badb\b", re.I)
+
+
+def job_platform(j: Dict[str, Any]) -> str:
+    """'ios' = needs a Mac, 'android' = Android work, '' = any machine. Tags decide; untagged jobs are read from the prompt
+    (a prompt that names both, like a Flutter app tested on both, is '')."""
+    tags = set(j.get("tags") or [])
+    if tags & MAC_TAGS:
+        return "ios"
+    if tags & ANDROID_TAGS:
+        return "android"
+    text = job_text(j)
+    ios, android = bool(IOS_WORDS.search(text)), bool(ANDROID_WORDS.search(text))
+    return "ios" if ios and not android else "android" if android and not ios else ""
+
+
+def job_disk_gb(j: Dict[str, Any]) -> float:
+    """Disk a job fills on the node: the work tree with its build output, and on a Mac the Xcode build cache (4-8 GB)."""
+    if j.get("disk_gb"):
+        return float(j["disk_gb"])
+    heavy, plat = job_cpu(j) >= 2, job_platform(j)
+    if plat == "ios":
+        return 15.0 if heavy else 5.0
+    if plat == "android":
+        return 10.0 if heavy else 4.0
+    return 8.0 if heavy else 2.0
+
+
+_PERF: Dict[str, Any] = {"t": 0, "v": {}}
+
+
+def node_perf(name: str, st: Dict[str, Any]) -> float:
+    """All-core speed of a machine, 1.0 = an M1 MacBook: its last `scaleout bench` (multi_x), else a guess from its threads."""
+    if now() - _PERF["t"] > 60:
+        v: Dict[str, float] = {}
+        for h in bench_history():
+            for k, b in (h.get("nodes") or {}).items():
+                if isinstance(b, dict) and b.get("multi_x"):
+                    v[k] = float(b["multi_x"])
+        _PERF.update(t=now(), v=v)
+    return _PERF["v"].get(name) or max(int(st.get("cpus", 1) or 1), 1) / 6.5
 
 
 def job_kind(j: Dict[str, Any]) -> str:
@@ -1205,12 +1255,18 @@ def job_mem_gb(j: Dict[str, Any], node: str) -> float:
 
 def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[str, Any]], load: Dict[str, int],
               dev_load: Optional[Dict[Tuple[str, str], int]] = None, planned_gb: Optional[Dict[str, float]] = None,
-              cpu_used: Optional[Dict[str, int]] = None, why: Optional[Dict[str, str]] = None) -> Optional[str]:
+              cpu_used: Optional[Dict[str, int]] = None, why: Optional[Dict[str, str]] = None,
+              planned_disk: Optional[Dict[str, float]] = None) -> Optional[str]:
     """Best node for a job, or None. `why` collects, per node, the reason it was passed over (shown while a job waits)."""
     why = why if why is not None else {}
     dev_load = dev_load or {}
     planned_gb = planned_gb if planned_gb is not None else {}
     cpu_used = cpu_used if cpu_used is not None else {}
+    planned_disk = planned_disk if planned_disk is not None else {}
+    plat, disk_need = job_platform(j), job_disk_gb(j)
+    min_disk = float(cfg["defaults"].get("min_free_disk_gb", 5))
+    perf = {k: node_perf(k, metrics.get(k, {})) for k in cfg["nodes"]}
+    top_perf = max(perf.values() or [1.0]) or 1.0
     best, best_score = None, -1e9
     for name, n in cfg["nodes"].items():
         if n.get("pending") or (j.get("want_node") and name != j["want_node"]) or (j.get("only") and name not in j["only"]):
@@ -1267,16 +1323,29 @@ def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[st
         if busy and cpu_used.get(name, 0) + job_cpu(j) > units and float(st.get("load", 0) or 0) >= cores:
             why[name] = f"CPU units full ({cpu_used.get(name, 0)}/{units}, load {float(st.get('load', 0)):.1f})"
             continue       # units full and the cores really busy; a heavy job in a quiet phase (load < cores) leaves room
+        disk_room = float(st.get("disk_free_gb", 0) or 0) - planned_disk.get(name, 0.0) - min_disk
+        if busy and disk_room < disk_need:
+            why[name] = f"disk {disk_room + min_disk:.0f} GB free, job needs {disk_need:.0f}"
+            continue       # a work tree and its build caches would push the disk under its floor (an idle node still takes one)
         # even use by capacity, lowest strain first: the job goes to the machine that is least full once it has it.
         # Full = jobs / its share (max_jobs, so a node with share 8 takes about four jobs for each a share-2 laptop takes),
-        # load / allowed load (2x cores) and memory in use, the job's own memory counted in. Least strained also finishes first.
+        # load / allowed load (2x cores), memory in use (the job's own counted in) and the part of the free disk the job fills.
         jobs_full = (busy + 1) / max(int(n.get("max_jobs", 2)), 1)
         load_full = float(st.get("load", 0) or 0) / limit
         total_gb = float(st.get("mem_total_gb") or 0)
         mem_used = 1 - float(st.get("mem_free_pct", 0) or 0) / 100
         if total_gb:
             mem_used = min(1.0, mem_used + (planned_gb.get(name, 0.0) + job_mem_gb(j, name)) / total_gb)
-        score = -100 * (0.4 * jobs_full + 0.35 * load_full + 0.25 * mem_used)
+        disk_used = min(1.0, disk_need / max(disk_room, 1.0))
+        score = -100 * (0.35 * jobs_full + 0.25 * load_full + 0.2 * mem_used + 0.2 * disk_used)
+        score += 15 * perf[name] / top_perf      # a faster machine (all cores, from `scaleout bench`) finishes builds sooner
+        # keep the Macs for what only a Mac can do: Android work goes to other machines first, any-machine work leans
+        # away from Macs, and work that reads like iOS but is untagged leans to Macs
+        mac = st.get("os", "").lower() == "darwin"
+        if mac and plat != "ios":
+            score -= 30 if plat == "android" else 15
+        elif not mac and plat == "ios":
+            score -= 40
         score += float(n.get("score_bias", 0))   # the orchestrator has a negative bias: it orchestrates, runs what only it can, and takes overflow
         if score > best_score:
             best, best_score = name, score
@@ -1574,6 +1643,12 @@ def maintain(cfg: Dict[str, Any], metrics: Dict[str, Dict[str, Any]]) -> None:
                 n.ctl("gc", "1" if low else str(d["keep_job_days"]))
                 st["last_gc"] = now()
                 write_json(node_state_path(name), st)
+            # short of disk here too: the same cleanup the nodes get (idle work trees, Xcode build caches, package caches)
+            if st.get("disk_free_gb", 99) < d["cleanup_below_disk_gb"] and now() - st.get("last_cleanup", 0) > 3600:
+                res = n.ctl("cleanup", "", str(d["cleanup_target_disk_gb"]), timeout=900)
+                st["last_cleanup"] = now()
+                st["cleanup_note"] = res.stdout.decode().strip()[-120:]
+                write_json(node_state_path(name), st)
             continue
         full = st.get("disk_free_gb", 99) < d["min_free_disk_gb"]   # disk-full: jobs wait, so try again sooner
         if st.get("disk_free_gb", 99) < d["cleanup_below_disk_gb"] and now() - st.get("last_cleanup", 0) > (600 if full else 3600):
@@ -1656,6 +1731,7 @@ def tick(verbose: bool = False) -> None:
         load: Dict[str, int] = {}
         dev_load: Dict[Tuple[str, str], int] = {}
         planned_gb: Dict[str, float] = {}
+        planned_disk: Dict[str, float] = {}
         cpu_used: Dict[str, int] = {}
         for j in jobs:
             if j.get("status") in ("dispatched", "running") and j.get("node"):
@@ -1663,6 +1739,9 @@ def tick(verbose: bool = False) -> None:
         for j in jobs:   # jobs handed out in the last 3 minutes may not have grown to their size yet
             if j.get("status") in ("dispatched", "running") and j.get("node") and now() - j.get("dispatched_at", 0) < 180:
                 planned_gb[j["node"]] = planned_gb.get(j["node"], 0.0) + job_mem_gb(j, j["node"])
+        for j in jobs:   # ... and their build output takes longer to land on disk
+            if j.get("status") in ("dispatched", "running") and j.get("node") and now() - j.get("dispatched_at", 0) < 1200:
+                planned_disk[j["node"]] = planned_disk.get(j["node"], 0.0) + job_disk_gb(j)
         for j in jobs:
             if j.get("status") in ("dispatched", "running") and j.get("node"):
                 load[j["node"]] = load.get(j["node"], 0) + 1
@@ -1677,7 +1756,7 @@ def tick(verbose: bool = False) -> None:
             if j.get("status") != "queued":
                 continue
             why: Dict[str, str] = {}
-            name = pick_node(cfg, j, metrics, load, dev_load, planned_gb, cpu_used, why)
+            name = pick_node(cfg, j, metrics, load, dev_load, planned_gb, cpu_used, why, planned_disk)
             if not name:
                 wait = "; ".join(f"{k}: {v}" for k, v in sorted(why.items())) or "no nodes"
                 if wait != j.get("wait", ""):
@@ -1696,6 +1775,7 @@ def tick(verbose: bool = False) -> None:
             load[name] = load.get(name, 0) + 1
             cpu_used[name] = cpu_used.get(name, 0) + job_cpu(j)
             planned_gb[name] = planned_gb.get(name, 0.0) + job_mem_gb(j, name)
+            planned_disk[name] = planned_disk.get(name, 0.0) + job_disk_gb(j)
             for t in j.get("tags") or []:
                 if t in DEVICE_TAGS:
                     dev_load[(name, t)] = dev_load.get((name, t), 0) + 1
