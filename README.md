@@ -159,6 +159,7 @@ Write tasks so they stand alone — the node's agent has not seen your conversat
 | phones attached | — | `android-device` / `ios-device` jobs go only to nodes with a free phone of that kind, one job per phone |
 | CPU load | 1-minute load above `max_load_per_cpu` (2) × cores | no new jobs, busy or idle (the load may be someone else's, e.g. CI); the node runner checks the same before starting one |
 | CPU units | node: `cpu_slots` from `scaleout bench` (M1 2, M4 3, M4 Pro 5); job: 2 for builds, test suites, simulators, emulators (guessed from tags and the task text), else 1, or `--cpu N` | a busy node gets another job only while its units are free, or while its load is below its core count (a heavy job in a quiet phase leaves room) |
+| node too loaded to answer | `ctl metrics` times out, but it answered within `offline_grace_min` | `busy`, not offline: no new job, running jobs stay; offline only when it stays silent past the grace |
 
 Change with `scaleout config KEY VALUE` (e.g. `scaleout config min_free_disk_gb 10`) or per node (`scaleout config --node build-01 max_jobs 1`).
 
@@ -230,6 +231,28 @@ scaleout provision NODE [--dry-run] [--flutter 3.35.6,3.41.9] [--android android
 Installs, without sudo and at this machine's versions: fvm and its Flutter versions, CocoaPods, Node.js, Firebase CLI,
 Android SDK platforms (into an SDK whose licenses were accepted on the node), Java for Android builds. Things that need a
 person are reported, not attempted: Homebrew itself (admin password), Xcode (Apple ID), Android license acceptance.
+
+## Token saving
+Every tool call re-reads the session's whole context from the cache, so tokens ≈ calls × context size, and cache reads
+are usually over 95% of them. Claude Code auto-compacts near the model's full window (~967k on 1M-context models), so a
+long session pays for 500k–1M on every step. One switch, for every session here and on every node:
+```bash
+scaleout tokens on [--window 200k] [--auto]   # off · status (default) · tune
+```
+- **Earlier compaction.** `CLAUDE_CODE_AUTO_COMPACT_WINDOW` goes into Claude Code's user settings here and on each node
+  (`scaleout update` re-applies it to new nodes). `scaleout tokens` replays the last 24 h of requests at 100k–400k and
+  shows the tokens and compactions each would have taken.
+- **Nothing important lost to the summary.** Two files per project folder, kept out of git through the local exclude:
+  `.scaleout/notes.md`, the agent's own notes (it is told to keep them, and reminded once when the context passes 75% of
+  the window), and `.scaleout/ledger.md`, written by a `PreCompact` hook from the transcript with no model call (the
+  user's latest messages word for word, the task list, files changed and read, recent commands, job ids). Right after the
+  compaction a `SessionStart` hook puts both back word for word; a new session in the folder gets the notes.
+- **Working rules** for every new session (one task per session, long output to files, batched calls, verbose work to the
+  pool), and forks are refused from sessions above `--fork-max` (100k): a fork re-reads the parent's whole context on
+  every step. Node jobs get a short version through `--append-system-prompt`.
+- **Self-tuning (`--auto`).** Once a day the daemon replays the last 7 days at each window and charges every compaction
+  what compactions measurably cost afterwards (context read by requests that re-read a file the session had read before
+  it; 2 × window until measured), then moves the window at most 50k toward the cheapest, inside 120k–400k.
 
 ## Dashboard and Claude usage
 

@@ -923,6 +923,100 @@ class E2E(unittest.TestCase):
         self.assertEqual(wl.count("\n"), 1, wl)
         self.assertEqual(Path(c("repo-checkout", "r", sha)).name, "r-wt1", "the next job makes its work tree again")
 
+    def test_99h_slow_metrics_is_busy(self):
+        """A machine that answered a moment ago but is too loaded to finish `ctl metrics` in time is busy, not offline: it
+        takes no new job and keeps its running ones; a node that stays silent past the grace goes offline as before."""
+        cfg = so.load_cfg()
+        cfg["defaults"]["offline_grace_min"] = 10   # the shipped grace (the tests run with a shorter one)
+        name = next(n for n in cfg["nodes"] if n in HOMES)
+        so.refresh_metrics(cfg, [name], max_age=0)
+        keep = so.Node.ctl
+        so.Node.ctl = lambda self, verb, *a, **k: subprocess.CompletedProcess([], 124, b"", b"timeout") if verb == "metrics" else keep(self, verb, *a, **k)
+        try:
+            st = so.refresh_metrics(cfg, [name], max_age=0)[name]
+            self.assertTrue(st["online"], st)
+            self.assertEqual(so.node_health(cfg, name, st), "busy")
+            st["last_ok"] = so.now() - 3600
+            so.write_json(so.node_state_path(name), st)
+            self.assertFalse(so.refresh_metrics(cfg, [name], max_age=0)[name]["online"], "silent past the grace: offline")
+        finally:
+            so.Node.ctl = keep
+        st = so.refresh_metrics(cfg, [name], max_age=0)[name]
+        self.assertEqual(so.node_health(cfg, name, st), "ok", "answers in time again: back to ok")
+
+    def test_99g_token_saving(self):
+        """scaleout tokens: the window goes into Claude's settings here and on the nodes (node.conf too, so jobs get the
+        rules); before a compaction a ledger is taken from the transcript, after it the notes and ledger come back word for
+        word; near the window the agent is told once to write its notes; a fork from a large session is refused; off undoes it."""
+        so.CLAUDE_SETTINGS = TMP / "claude-home/settings.json"
+        so.CLAUDE_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+        so.CLAUDE_SETTINGS.write_text(json.dumps({"model": "opus", "env": {"KEEP": "1"}}))
+        nodes = [n for n in so.load_cfg()["nodes"] if n in HOMES]
+        so.cmd_tokens(argparse.Namespace(action="on", window="150k", auto=None, fork_max=None))
+        s = json.loads(so.CLAUDE_SETTINGS.read_text())
+        self.assertEqual((s["model"], s["env"]), ("opus", {"KEEP": "1", "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "150000"}))
+        for name in nodes:
+            self.assertIn("TOKEN_SAVING=1\nCOMPACT_WINDOW=150000", (HOMES[name] / ".scaleout/node.conf").read_text())
+            self.assertEqual(json.loads((HOMES[name] / ".claude/settings.json").read_text())["env"][so.WINDOW_ENV], "150000")
+        # a session transcript at 150k
+        proj = TMP / "tok-proj"
+        (proj / ".git/info").mkdir(parents=True)
+        tr = TMP / "tok-transcript.jsonl"
+        rows = [{"type": "user", "timestamp": "2026-11-23T01:00:00Z", "message": {"role": "user", "content": "앱 화면 고쳐줘, 버튼은 노랑으로"}},
+                {"type": "assistant", "timestamp": "2026-11-23T01:01:00Z", "message": {"id": "m1", "usage": {"input_tokens": 10, "cache_read_input_tokens": 150000},
+                 "content": [{"type": "tool_use", "name": "Edit", "input": {"file_path": "/p/a.dart"}},
+                             {"type": "tool_use", "name": "Bash", "input": {"command": "scaleout wait j20261123-010203-abcd -m 0"}},
+                             {"type": "tool_use", "name": "TaskCreate", "input": {"subject": "버튼 색 바꾸기"}}]}},
+                {"type": "user", "timestamp": "2026-11-23T01:02:00Z", "message": {"role": "user", "content": [{"type": "tool_result", "content": "ok"}]}}]
+        tr.write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in rows) + "\n")
+        env = dict(os.environ, CLAUDE_PROJECT_DIR=str(proj))
+        hook = lambda ev, payload: subprocess.run([sys.executable, str(ROOT / "orchestrator/scaleout.py"), "hook", ev], env=env,
+                                                  input=json.dumps(payload).encode(), stdout=subprocess.PIPE, check=True).stdout.decode()
+        self.assertEqual(so.transcript_context(str(tr)), 150010)
+        hook("precompact", {"transcript_path": str(tr), "session_id": "s1", "trigger": "auto"})
+        ledger = (proj / ".scaleout/ledger.md").read_text()
+        for x in ("버튼은 노랑으로", "/p/a.dart", "j20261123-010203-abcd", "[pending] 버튼 색 바꾸기", "context 150k"):
+            self.assertIn(x, ledger)
+        self.assertNotIn("tool_result", ledger)
+        self.assertIn(".scaleout/", (proj / ".git/info/exclude").read_text(), "kept out of git without touching .gitignore")
+        notes = proj / ".scaleout/notes.md"
+        notes.write_text("결정: 노랑 버튼 (사용자)\n")
+        ctx = json.loads(hook("session", {"source": "compact", "transcript_path": str(tr)}))["hookSpecificOutput"]["additionalContext"]
+        for x in ("결정: 노랑 버튼", "버튼은 노랑으로", "about 150k", "Restored after compaction"):
+            self.assertIn(x, ctx)
+        fresh = json.loads(hook("session", {"source": "startup"}))["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("결정: 노랑 버튼", fresh)
+        self.assertNotIn("Ledger (", fresh, "a new session gets the notes, not an old ledger")
+        # near the window: told once (notes older than 10 minutes)
+        old = time.time() - 3600
+        os.utime(notes, (old, old))
+        self.assertIn("update", hook("ctx", {"transcript_path": str(tr), "session_id": "s1"}))
+        self.assertEqual(hook("ctx", {"transcript_path": str(tr), "session_id": "s1"}).strip(), "")
+        # forks: refused from a 150k session, other subagents pass
+        deny = json.loads(hook("agent", {"transcript_path": str(tr), "tool_input": {"subagent_type": "fork"}}))
+        self.assertEqual(deny["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(hook("agent", {"transcript_path": str(tr), "tool_input": {"subagent_type": "general-purpose"}}).strip(), "")
+        # replay: compacting at 200k reads less than the real 50k → 550k session, and costs compactions
+        reqs = {"s": [(f"t{i:02d}", 50000 * (i + 1)) for i in range(11)]}
+        real = sum(c for _, c in reqs["s"])
+        tot, comps = so.whatif(reqs, 200000)
+        self.assertLess(tot, real)
+        self.assertGreaterEqual(comps, 2)
+        keep = so._today_requests
+        so._today_requests = lambda days=1.0: reqs
+        try:
+            rec = so.tokens_autotune(so.load_cfg(), apply=False)
+        finally:
+            so._today_requests = keep
+        self.assertTrue(120000 <= rec["to"] <= 200000, rec["to"])   # inside min..max, at most 50k from 150k
+        # off: everything undone, other settings kept
+        so.cmd_tokens(argparse.Namespace(action="off", window=None, auto=None, fork_max=None))
+        self.assertEqual(json.loads(so.CLAUDE_SETTINGS.read_text())["env"], {"KEEP": "1"})
+        for name in nodes:
+            self.assertNotIn("TOKEN_SAVING", (HOMES[name] / ".scaleout/node.conf").read_text())
+        self.assertEqual(hook("agent", {"transcript_path": str(tr), "tool_input": {"subagent_type": "fork"}}).strip(), "")
+        self.assertNotIn("token saving", hook("session", {"source": "startup"}).lower())
+
     @unittest.skipUnless(sys.platform == "darwin", "Xcode build caches live on macOS (plutil)")
     def test_99f_gc_drops_xcode_caches_and_dead_jobs(self):
         """Every work tree that built for iOS leaves a 4-8 GB Xcode cache: it goes with the work tree, and caches of
