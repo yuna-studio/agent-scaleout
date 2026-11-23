@@ -237,24 +237,31 @@ Every tool call re-reads the session's whole context from the cache, so tokens �
 are usually over 95% of them. Claude Code auto-compacts near the model's full window (~967k on 1M-context models), so a
 long session pays for 500k–1M on every step. One switch, for every session here and on every node:
 ```bash
-scaleout tokens on [--window 200k] [--auto]   # off · status (default) · tune
+scaleout tokens on [--window 250k] [--auto]   # off · status (default) · tune
 ```
 - **Earlier compaction.** `CLAUDE_CODE_AUTO_COMPACT_WINDOW` goes into Claude Code's user settings here and on each node
-  (`scaleout update` re-applies it to new nodes). `scaleout tokens` replays the last 24 h of requests at 100k–400k and
-  shows the tokens and compactions each would have taken.
-- **Nothing important lost to the summary.** Two files per project folder, kept out of git through the local exclude:
-  `.scaleout/notes.md`, the agent's own notes (it is told to keep them, and reminded once when the context passes 75% of
-  the window), and `.scaleout/ledger.md`, written by a `PreCompact` hook from the transcript with no model call (the
-  user's latest messages word for word, the task list, files changed and read, recent commands, job ids). Right after the
-  compaction a `SessionStart` hook puts both back word for word; a new session in the folder gets the notes.
+  (`scaleout update` re-applies it to new nodes). Claude Code compacts about 35k below the window, and right after a
+  compaction the context is already about 90k (tools, skills, memory files, the summary, files put back), so a window
+  under 200k makes a session compact again every few steps and costs more than it saves. `scaleout tokens` replays the
+  last 24 h of requests at 150k–400k with what was measured here, and warns when the window is too small.
+- **Nothing important lost to the summary.** Each session has two files in its folder (its worktree when it works in one
+  under `.claude/worktrees/`), kept out of git through the local exclude: `.scaleout/notes-<session>.md`, the agent's own
+  notes (it is told to keep them, and reminded once when the context nears the point where Claude Code compacts), and
+  `.scaleout/ledger-<session>.md`, taken from the transcript with no model call (the task list, job ids, the user's latest
+  messages word for word, files changed and read, recent commands). Right after the compaction both go back word for
+  word, each through a `SessionStart` hook of its own: Claude Code takes up to 10,000 characters from one hook and turns a
+  longer text into a 2 KB preview. A new session in the folder is told which notes other sessions left.
 - **Working rules** for every new session (one task per session, long output to files, batched calls, verbose work to the
   pool), and forks are refused from sessions above `--fork-max` (100k): a fork re-reads the parent's whole context on
   every step. Node jobs get a short version through `--append-system-prompt`.
 - **Self-tuning (`--auto`).** Once a day the daemon replays the last 7 days at each window and charges every compaction
-  what compactions measurably cost afterwards (context read by requests that re-read a file the session had read before
-  it; 2 × window until measured), then moves the window at most 50k toward the cheapest, inside 120k–400k.
-- **When it takes effect.** New sessions and every node job get all of it. A session already running keeps the hooks
-  and window it started with: type `/reload-plugins` (hooks) and `/autocompact 200000` (window) in it, or restart it.
+  what it costs, in cache reads at API prices: reading the context once more, writing the summary, putting the new context
+  in the cache, and re-reading files the session had read before it (measured in the transcripts; assumed until three
+  compactions are). It moves the window at most 50k a day toward the cheapest (within 3%, the one that compacts least),
+  never under the context right after a compaction + 105k (at least 200k), up to 400k, and raises it when sessions compact
+  again within 25 requests.
+- **When it takes effect.** Running sessions take the window at once (Claude Code re-reads its settings). New hooks come
+  with a new session, a restart or `/reload-plugins`; a session without them still gets its ledger and the reminder.
 
 ## Dashboard and Claude usage
 

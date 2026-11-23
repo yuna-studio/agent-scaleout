@@ -33,7 +33,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "0.9.7"
+VERSION = "0.9.8"
 HOME = Path.home()
 CONF_DIR = Path(os.environ.get("SCALEOUT_CONF", HOME / ".config" / "scaleout"))
 STATE_DIR = Path(os.environ.get("SCALEOUT_STATE", HOME / ".local" / "state" / "scaleout"))
@@ -3032,9 +3032,15 @@ def cmd_provision(a) -> None:
 # it (the agent's notes + a ledger taken from the transcript just before), and can tune the window from what it measures.
 CLAUDE_SETTINGS = HOME / ".claude" / "settings.json"
 WINDOW_ENV = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
-TOKENS_DEFAULT: Dict[str, Any] = {"on": False, "window": 200000, "auto": False, "fork_max": 100000,
-                                  "min": 120000, "max": 400000}
+TOKENS_DEFAULT: Dict[str, Any] = {"on": False, "window": 250000, "auto": False, "fork_max": 100000,
+                                  "min": 200000, "max": 400000}
 TOKENS_DIR = STATE_DIR / "tokens"
+RESERVE = 35000              # Claude Code compacts this far below the window (it keeps room for the answer and the summary)
+POST, POST_WRITE = 92000, 58000   # until measured: the context right after a compaction (tools, skills, memory, summary, files put back) and the part of it written to the cache anew
+SUMMARY_OUT = 8000           # tokens a summary takes to write
+W_OUT, W_WRITE = 50, 20      # an output token and a cache write in cache reads (API prices: 5x and 2x input; a cache read is 0.1x)
+HOOK_MAX = 9500              # Claude Code takes up to 10,000 characters from one hook; a longer text reaches the session as a 2 KB preview
+LEDGER_MAX = 9000
 NOTES_DIR = ".scaleout"
 JOB_ID_RE = re.compile(r"\bj\d{8}-\d{6}-[0-9a-f]{4}\b")
 
@@ -3100,9 +3106,10 @@ def transcript_context(path: str) -> int:
     return 0
 
 
-def notes_paths(project: str) -> Tuple[Path, Path]:
-    d = Path(project or ".") / NOTES_DIR
-    return d / "notes.md", d / "ledger.md"
+def notes_paths(project: str, sid: str = "") -> Tuple[Path, Path]:
+    """Each session has its own notes and ledger: several sessions often work in one folder."""
+    d, s = Path(project or ".") / NOTES_DIR, re.sub(r"[^A-Za-z0-9]", "", sid or "")[:8]
+    return (d / f"notes-{s}.md", d / f"ledger-{s}.md") if s else (d / "notes.md", d / "ledger.md")
 
 
 def keep_out_of_git(project: str) -> None:
@@ -3135,7 +3142,8 @@ def keep_out_of_git(project: str) -> None:
 
 
 HARNESS_TEXT = ("<command-", "<local-command", "<system-reminder>", "<task-notification>", "[Request interrupted", "Caveat:",
-                "<bash-", "[SYSTEM NOTIFICATION")
+                "<bash-", "[SYSTEM NOTIFICATION", "<cross-session", "<agent-message", "<teammate-message",
+                "This session is being continued from a previous conversation", "Stop hook feedback")
 REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 
 
@@ -3155,7 +3163,7 @@ def _user_text(msg: Dict[str, Any]) -> str:
 
 def _entry_user_text(d: Dict[str, Any]) -> str:
     """The user's words in a transcript line: a typed message, or one sent while the agent was working (queued_command)."""
-    if d.get("type") == "user" and not d.get("isMeta"):
+    if d.get("type") == "user" and not d.get("isMeta") and not d.get("isCompactSummary") and not d.get("isSidechain"):
         return _user_text(d.get("message") or {})
     a = d.get("attachment") if d.get("type") == "attachment" else None
     if isinstance(a, dict) and a.get("type") == "queued_command" and (a.get("origin") or {}).get("kind", "human") == "human":
@@ -3164,9 +3172,26 @@ def _entry_user_text(d: Dict[str, Any]) -> str:
     return ""
 
 
-def build_ledger(transcript: str, ctx: int = 0) -> str:
-    """A ledger of the session taken from its transcript, no model call: the user's latest messages word for word, the
-    task list, files changed and read, recent commands and scaleout job ids."""
+def _fit(lines: List[str], limit: int) -> List[str]:
+    """The latest lines that fit in `limit` characters, in their order."""
+    out, n = [], 0
+    for x in reversed(lines):
+        x = x if len(x) <= limit else x[:limit - 1] + "…"
+        if n + len(x) + 1 > limit:
+            break
+        out.append(x)
+        n += len(x) + 1
+    return out[::-1]
+
+
+def build_ledger(transcript: str, ctx: int = 0, project: str = "") -> str:
+    """A ledger of the session taken from its transcript, no model call: the task list, job ids, the user's latest messages
+    word for word, files changed and read, recent commands. Each part has its share, so all of it fits in one hook."""
+    def short(path: str) -> str:
+        for root, to in ((str(project).rstrip("/") + "/" if project else "", ""), (str(HOME) + "/", "~/")):
+            if root and path.startswith(root):
+                return to + path[len(root):]
+        return path
     users: List[str] = []
     edits: Dict[str, int] = {}
     reads: List[str] = []
@@ -3192,7 +3217,7 @@ def build_ledger(transcript: str, ctx: int = 0) -> str:
                     ts = time.strftime("%m-%d %H:%M", time.localtime(time.mktime(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")) - time.timezone))
                 except ValueError:
                     ts = ts[:16]
-                users.append(f"({ts}) {t[:700]}")
+                users.append("- (" + ts + ") " + re.sub(r"\n\s*\n+", "\n", t)[:600])
             if d.get("type") != "assistant" or not isinstance(msg.get("content"), list):
                 continue
             for b in msg["content"]:
@@ -3224,26 +3249,21 @@ def build_ledger(transcript: str, ctx: int = 0) -> str:
                             tasks[k][0] = str(inp["subject"])
                         if inp.get("status"):
                             tasks[k][1] = str(inp["status"])
-    out = [f"# Ledger — written automatically before compaction ({time.strftime('%Y-%m-%d %H:%M')}"
+    out = [f"# Ledger — taken automatically from the transcript ({time.strftime('%Y-%m-%d %H:%M')}"
            + (f", context {ctx // 1000}k" if ctx else "") + ")", ""]
-    if users:
-        out += ["## The user's latest messages (oldest first, word for word)"] + [f"- {u}" for u in users[-12:]] + [""]
     live = [t for t in tasks if t[1] != "deleted"]
-    if todos or live:
-        out.append("## Task list")
-        out += [f"- [{t.get('status', '?')}] {t.get('content') or t.get('subject') or ''}" for t in todos if isinstance(t, dict)]
-        out += [f"- [{s}] {subj}" for subj, s in live[-20:]]
-        out.append("")
-    if edits:
-        out += ["## Files changed (most recent last)"] + [f"- {p}" + (f" ×{n}" if n > 1 else "") for p, n in list(edits.items())[-25:]] + [""]
-    if reads:
-        out += ["## Files read recently"] + [f"- {p}" for p in reads[-15:]] + [""]
-    if cmds:
-        out += ["## Recent commands (oldest first)"] + [f"- `{c}`" for c in cmds[-12:]] + [""]
-    if jobs:
-        out += ["## scaleout jobs mentioned"] + [f"- {j}" for j in jobs[-10:]] + [""]
-    text = "\n".join(out)
-    return text[:14000]
+    todo = [f"- [{t.get('status', '?')}] {t.get('content') or t.get('subject') or ''}" for t in todos if isinstance(t, dict)] \
+        + [f"- [{s}] {subj}" for subj, s in live if s != "completed"]
+    done = [f"- [completed] {subj}" for subj, s in live if s == "completed"]
+    for title, lines in (("Task list", _fit(done, 400) + _fit(todo, 1400)),
+                         ("scaleout jobs mentioned", _fit([f"- {j}" for j in jobs[-10:]], 400)),
+                         ("The user's latest messages (oldest first, word for word)", _fit(users[-15:], 3600)),
+                         ("Files changed (most recent last)", _fit([f"- {short(p)}" + (f" ×{n}" if n > 1 else "") for p, n in edits.items()][-25:], 1200)),
+                         ("Recent commands (oldest first)", _fit([f"- `{c}`" for c in cmds[-12:]], 1200)),
+                         ("Files read recently", _fit([f"- {short(p)}" for p in reads[-12:]], 600))):
+        if lines:
+            out += [f"## {title}"] + lines + [""]
+    return "\n".join(out)[:LEDGER_MAX]
 
 
 def _hook_input() -> Dict[str, Any]:
@@ -3254,32 +3274,116 @@ def _hook_input() -> Dict[str, Any]:
 
 
 def _project_of(h: Dict[str, Any]) -> str:
-    return os.environ.get("CLAUDE_PROJECT_DIR") or h.get("cwd") or os.getcwd()
+    """The session's folder; inside a worktree under .claude/worktrees/ that worktree (a session there may not write outside it)."""
+    m = re.match(r"(.+?/\.claude/worktrees/[^/]+)(?:/|$)", str(h.get("cwd") or ""))
+    return m.group(1) if m else os.environ.get("CLAUDE_PROJECT_DIR") or h.get("cwd") or os.getcwd()
 
 
-def token_rules(t: Dict[str, Any], project: str) -> str:
-    base = SHARE / "agents" / "claude"
-    f = base / "token-rules.md" if (base / "token-rules.md").exists() else PKG_ROOT / "agents" / "claude" / "token-rules.md"
+def _session_file(h: Dict[str, Any], kind: int) -> Optional[Path]:
+    """This session's notes (kind 0) or ledger (1), the newest one when it moved between a folder and its worktree."""
+    roots = {_project_of(h), os.environ.get("CLAUDE_PROJECT_DIR") or "", h.get("cwd") or ""} - {""}
+    found = [f for f in (notes_paths(r, h.get("session_id", ""))[kind] for r in roots) if f.exists() and f.stat().st_size]
+    return max(found, key=lambda f: f.stat().st_mtime) if found else None
+
+
+def _wrote(transcript: str, path: Path) -> bool:
+    """Whether this session wrote that file (its own Edit or Write calls)."""
+    try:
+        with open(transcript, errors="replace") as fh:
+            for line in fh:
+                if path.name not in line or '"tool_use"' not in line:
+                    continue
+                try:
+                    blocks = (json.loads(line).get("message") or {}).get("content")
+                except (ValueError, AttributeError):
+                    continue
+                for b in blocks if isinstance(blocks, list) else []:
+                    if isinstance(b, dict) and b.get("name") in ("Edit", "Write") and (b.get("input") or {}).get("file_path") == str(path):
+                        return True
+    except (OSError, TypeError):
+        pass
+    return False
+
+
+def _cap(text: str, limit: int, path: Path) -> str:
+    return text if len(text) <= limit else text[:limit - len(str(path)) - 60].rstrip() + f"\n\n(cut here: the rest is in {path} — read it)"
+
+
+def _first_line(f: Path) -> str:
+    try:
+        return next((x.strip("# ").strip() for x in f.read_text(errors="replace").splitlines() if x.strip()), "")[:120]
+    except OSError:
+        return ""
+
+
+def agents_dir() -> Path:
+    """agents/claude of this package (a checkout or the installed copy)."""
+    d = PKG_ROOT / "agents" / "claude"
+    return d if d.is_dir() else SHARE / "agents" / "claude"
+
+
+def token_rules(t: Dict[str, Any], project: str, sid: str = "") -> str:
+    f = agents_dir() / "token-rules.md"
     if not f.exists():
         return ""
-    notes, ledger = notes_paths(project)
-    return (f.read_text().replace("{window_k}", str(int(t["window"]) // 1000)).replace("{fork_k}", str(int(t["fork_max"]) // 1000))
+    notes, ledger = notes_paths(project, sid)
+    return (f.read_text().replace("{at_k}", str((int(t["window"]) - RESERVE) // 1000)).replace("{fork_k}", str(int(t["fork_max"]) // 1000))
             .replace("{notes}", str(notes)).replace("{ledger}", str(ledger)))
 
 
-def restore_context(project: str, source: str) -> str:
-    """What goes back into a session after compaction (notes + ledger), or into a new session here (notes)."""
-    notes, ledger = notes_paths(project)
-    parts = []
-    if notes.exists() and notes.stat().st_size:
-        parts.append(f"## Your notes ({notes}, kept by you, word for word)\n\n" + notes.read_text(errors="replace")[:12000])
-    if source in ("compact", "resume") and ledger.exists() and ledger.stat().st_size:
-        parts.append(f"## Ledger ({ledger}, written just before the compaction)\n\n" + ledger.read_text(errors="replace")[:12000])
-    if not parts:
+def notes_context(h: Dict[str, Any]) -> str:
+    """After a compaction: this session's notes, word for word. In a new session: where other sessions left theirs (not their text)."""
+    project, source = _project_of(h), h.get("source", "startup")
+    if source == "compact":
+        f = _session_file(h, 0)
+        if f is None:   # notes of versions before 0.9.8 were one file per folder: this session's only if it wrote it
+            old = notes_paths(project)[0]
+            f = old if old.exists() and _wrote(h.get("transcript_path") or "", old) else None
+        if f is None:
+            return ""
+        head = f"# Your notes, restored after the compaction ({f}): trust them over the summary where they differ\n\n"
+        return head + _cap(f.read_text(errors="replace"), HOOK_MAX - len(head), f)
+    if source not in ("startup", "clear"):
         return ""
-    head = ("# Restored after compaction: trust these over the summary where they differ" if source == "compact"
-            else "# Notes from earlier sessions in this folder")
-    return head + "\n\n" + "\n\n".join(parts)
+    d = Path(project) / NOTES_DIR
+    own = notes_paths(project, h.get("session_id", ""))[0].name
+    recent = sorted((f for f in d.glob("notes*.md") if f.name != own and f.stat().st_size and now() - f.stat().st_mtime < 14 * 86400),
+                    key=lambda f: f.stat().st_mtime, reverse=True)[:3] if d.is_dir() else []
+    if not recent:
+        return ""
+    return "\n".join(["# Notes other sessions left in this folder (read one only to continue that session's work; it is not yours to edit)"]
+                     + [f"- {f} ({time.strftime('%m-%d %H:%M', time.localtime(f.stat().st_mtime))}): {_first_line(f)}" for f in recent])
+
+
+def ledger_context(h: Dict[str, Any]) -> str:
+    """After a compaction: the ledger. Taken now when no PreCompact hook took it (a session older than that hook)."""
+    if h.get("source") != "compact":
+        return ""
+    f = _session_file(h, 1)
+    if f is None or now() - f.stat().st_mtime > 600:
+        f = write_ledger(h)
+        if f is None:
+            return ""
+    head = f"# Ledger of this session before the compaction ({f})\n\n"
+    return head + _cap(f.read_text(errors="replace"), HOOK_MAX - len(head), f)
+
+
+def write_ledger(h: Dict[str, Any]) -> Optional[Path]:
+    project, tp = _project_of(h), h.get("transcript_path") or ""
+    ctx = transcript_context(tp)
+    text = build_ledger(tp, ctx, project)
+    _log_tokens("compactions.jsonl", {"t": int(now()), "session": h.get("session_id", ""), "transcript": tp, "project": project,
+                                      "ctx": ctx, "trigger": h.get("trigger") or h.get("source") or "", "window": tokens_cfg(load_cfg())["window"]})
+    if not text:
+        return None
+    f = notes_paths(project, h.get("session_id", ""))[1]
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(text + "\n")
+    keep_out_of_git(project)
+    for old in f.parent.glob("ledger*.md"):
+        if now() - old.stat().st_mtime > 14 * 86400:
+            old.unlink()
+    return f
 
 
 def _log_tokens(name: str, rec: Dict[str, Any]) -> None:
@@ -3288,25 +3392,22 @@ def _log_tokens(name: str, rec: Dict[str, Any]) -> None:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
-def hook_tokens(event: str) -> None:
-    """precompact · ctx · agent: the token saving hooks (they do nothing while `scaleout tokens` is off)."""
+def hook_tokens(event: str, h: Optional[Dict[str, Any]] = None) -> None:
+    """precompact · notes · ledger · ctx · agent: the token saving hooks (they do nothing while `scaleout tokens` is off)."""
     if not CONFIG.exists():
-        sys.exit(0)
+        return
     t = tokens_cfg(load_cfg())
     if not t["on"]:
-        sys.exit(0)
-    h = _hook_input()
+        return
+    h = _hook_input() if h is None else h
     project, tp = _project_of(h), h.get("transcript_path") or ""
-    if event == "precompact":   # full context is still there: take the ledger now
-        ctx = transcript_context(tp)
-        text = build_ledger(tp, ctx)
+    if event in ("notes", "ledger"):
+        text = notes_context(h) if event == "notes" else ledger_context(h)
         if text:
-            _, ledger = notes_paths(project)
-            ledger.parent.mkdir(parents=True, exist_ok=True)
-            ledger.write_text(text + "\n")
-            keep_out_of_git(project)
-        _log_tokens("compactions.jsonl", {"t": int(now()), "session": h.get("session_id", ""), "transcript": tp,
-                                          "project": project, "ctx": ctx, "trigger": h.get("trigger", ""), "window": t["window"]})
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}, ensure_ascii=False))
+        return
+    if event == "precompact":   # full context is still there: take the ledger now
+        write_ledger(h)
         return
     if event == "agent":        # a fork re-reads this whole context on every step
         if (h.get("tool_input") or {}).get("subagent_type") != "fork":
@@ -3321,22 +3422,28 @@ def hook_tokens(event: str) -> None:
         return
     if event == "ctx":          # near the window: have the agent write its notes while it still has everything
         ctx, win = transcript_context(tp), int(t["window"])
-        if ctx < 0.75 * win:
+        at = win - RESERVE   # where Claude Code really compacts
+        if ctx < 0.85 * at:
             return
         sid = re.sub(r"[^A-Za-z0-9-]", "", h.get("session_id", "")) or "x"
         f = TOKENS_DIR / "nudge" / f"{sid}.json"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        lock = open(f.with_suffix(".lock"), "w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return   # the other hook of the same call is on it
         last = read_json(f, {})
-        notes, _ = notes_paths(project)
+        notes, _ = notes_paths(project, h.get("session_id", ""))
         fresh = notes.exists() and now() - notes.stat().st_mtime < 600
         if fresh or (last.get("ctx", 0) and last["ctx"] <= ctx and now() - last.get("t", 0) < 1800):
             return   # notes just written, or already told since the last compaction
-        f.parent.mkdir(parents=True, exist_ok=True)
         write_json(f, {"t": int(now()), "ctx": ctx})
         keep_out_of_git(project)
-        msg = (f"[token saving] Context is {ctx // 1000}k of the {win // 1000}k auto-compact window. Before it compacts, update "
-               f"{notes} now: goal, decisions and why, done, next steps, key paths and commands, and the user's corrections in "
+        msg = (f"[token saving] Context is {ctx // 1000}k and Claude Code compacts at about {at // 1000}k. Before it does, write "
+               f"{notes} (this session's notes) now: goal, decisions and why, done, next steps, key paths and commands, and the user's corrections in "
                "their words. Replace stale lines; keep it short. It is put back word for word after the compaction.")
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": msg}}))
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": h.get("hook_event_name") or "PostToolUse", "additionalContext": msg}}))
 
 
 def _today_requests(days: float = 1.0) -> Dict[str, List[Tuple[str, int]]]:
@@ -3378,100 +3485,127 @@ def _today_requests(days: float = 1.0) -> Dict[str, List[Tuple[str, int]]]:
     return out
 
 
-def whatif(reqs: Dict[str, List[Tuple[str, int]]], window: int, summary: int = 30000) -> Tuple[float, int]:
+def whatif(reqs: Dict[str, List[Tuple[str, int]]], window: int, post: int = POST) -> Tuple[float, int]:
     """Tokens the same requests would have read with auto-compaction at `window`, and how many compactions that takes.
-    Each request keeps the growth it really had; past the window the context falls back to the start + a summary."""
-    total, comps = 0.0, 0
+    Each request keeps the growth it really had; where Claude Code compacts (RESERVE below the window) the context is read
+    once more for the summary and falls back to `post`, what is there right after a compaction."""
+    total, comps, at = 0.0, 0, window - RESERVE
     for v in reqs.values():
-        if not v:
-            continue
-        base, sim, prev = min(50000, v[0][1]), None, None
+        sim = prev = None
         for _, c in v:
-            if sim is None or c < prev:          # first request, or the session itself compacted or cleared
-                sim = min(c, window)
+            if sim is None or c < 0.7 * prev:    # first request, or the session itself compacted or cleared
+                sim = min(c, at)
             else:
-                sim += c - prev
-                if sim > window:
-                    sim, comps = base + summary + (sim - window), comps + 1
+                grow = c - prev
+                sim = max(0, sim + grow)
+                if sim > at:
+                    comps, total = comps + 1, total + at
+                    sim = min(post, c) + max(0, grow)
             prev = c
             total += sim
     return total, comps
 
 
-def rediscovery_cost(days: int = 7) -> Optional[float]:
-    """Tokens a compaction cost afterwards, measured: in the 40 requests after each compaction, the context read by those
-    that re-read a file the session had read before it (learning again what the summary dropped). None until measured."""
-    costs = []
-    for line in (TOKENS_DIR / "compactions.jsonl").read_text().splitlines() if (TOKENS_DIR / "compactions.jsonl").exists() else []:
+def compaction_stats(days: int = 7) -> List[Dict[str, Any]]:
+    """What followed each recorded compaction, measured in its transcript: the context and cache write of the next request,
+    the requests until the next compaction, and the context read by those (first 40) that re-read a file read before it."""
+    f = TOKENS_DIR / "compactions.jsonl"
+    evs: Dict[str, List[Dict[str, Any]]] = {}
+    for line in f.read_text().splitlines() if f.exists() else []:
         try:
             ev = json.loads(line)
         except ValueError:
             continue
-        if ev.get("t", 0) < now() - days * 86400 or not ev.get("transcript"):
-            continue
-        before, after, cost, n = set(), 0, 0, 0
+        if ev.get("t", 0) >= now() - days * 86400 and ev.get("transcript"):
+            evs.setdefault(ev["transcript"], []).append(ev)
+    out: List[Dict[str, Any]] = []
+    for tp, es in evs.items():
+        es.sort(key=lambda e: e["t"])
+        reqs: List[Dict[str, Any]] = []
         try:
-            fh = open(ev["transcript"], errors="replace")
+            fh = open(tp, errors="replace")
         except OSError:
             continue
         with fh:
-            for line2 in fh:
+            for line in fh:
+                if '"usage"' not in line:
+                    continue
                 try:
-                    d = json.loads(line2)
+                    d = json.loads(line)
+                    tsec = time.mktime(time.strptime(d.get("timestamp", "")[:19], "%Y-%m-%dT%H:%M:%S")) - time.timezone
                 except ValueError:
                     continue
-                ts = d.get("timestamp", "")
-                try:
-                    tsec = time.mktime(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")) - time.timezone if ts else 0
-                except ValueError:
-                    tsec = 0
                 m = d.get("message") or {}
-                if d.get("type") != "assistant" or not isinstance(m.get("content"), list):
+                u = m.get("usage") or {}
+                if d.get("isSidechain") or not _usage_tokens(u):
                     continue
-                paths = [(b.get("input") or {}).get("file_path") for b in m["content"]
-                         if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Read"]
-                if tsec and tsec < ev["t"]:
-                    before.update(p for p in paths if p)
-                elif tsec >= ev["t"] and after < 40:
-                    after += 1
-                    if any(p in before for p in paths if p):
-                        cost += _usage_tokens(m.get("usage") or {})
-                        n += 1
-        if after:
-            costs.append(cost)
-    return sum(costs) / len(costs) if costs else None
+                paths = {(b.get("input") or {}).get("file_path") for b in m.get("content") or []
+                         if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Read"} - {None} if isinstance(m.get("content"), list) else set()
+                if reqs and m.get("id") and reqs[-1]["id"] == m["id"]:
+                    reqs[-1]["paths"] |= paths     # one request, written as several lines
+                    continue
+                reqs.append({"t": tsec, "id": m.get("id"), "ctx": _usage_tokens(u), "write": int(u.get("cache_creation_input_tokens", 0) or 0), "paths": paths})
+        for i, e in enumerate(es):
+            end = es[i + 1]["t"] if i + 1 < len(es) else None
+            seg = [r for r in reqs if r["t"] >= e["t"] and (end is None or r["t"] < end)]
+            if not seg or seg[0]["ctx"] > 0.95 * (e.get("ctx") or 1e9):
+                continue      # nothing ran after it, or it did not compact (cancelled, failed, retried)
+            before = set().union(*[r["paths"] for r in reqs if r["t"] < e["t"]]) if reqs else set()
+            out.append({"t": e["t"], "session": e.get("session", ""), "window": int(e.get("window") or 0), "ctx": e.get("ctx", 0), "post": seg[0]["ctx"],
+                        "write": seg[0]["write"], "requests": len(seg), "open": end is None,
+                        "reread": sum(r["ctx"] for r in seg[:40] if r["paths"] & before)})
+    return out
+
+
+def _median(v: List[float]) -> float:
+    v = sorted(v)
+    return v[len(v) // 2] if v else 0
+
+
+def compaction_cost(st: List[Dict[str, Any]], window: int) -> Dict[str, int]:
+    """What a compaction costs besides the reading `whatif` counts, in cache reads: writing the summary, putting the new
+    context in the cache, and reading again what the summary dropped (2 x window until measured)."""
+    m = len(st) >= 3
+    post, write = (int(_median([e["post"] for e in st])), int(_median([e["write"] for e in st]))) if m else (POST, POST_WRITE)
+    reread = int(sum(e["reread"] for e in st) / len(st)) if m else None
+    return {"post": post, "write": write, "reread": reread if reread is not None else 2 * window, "measured": len(st) if m else 0,
+            "cost": SUMMARY_OUT * W_OUT + write * W_WRITE + (reread if reread is not None else 2 * window)}
+
+
+def window_floor(t: Dict[str, Any], post: int) -> int:
+    """The smallest window worth having: below it a session compacts again a few steps after a compaction."""
+    return max(int(t["min"]), -(-(post + RESERVE + 70000) // 10000) * 10000)
 
 
 def tokens_autotune(cfg: Dict[str, Any], apply: bool = True) -> Dict[str, Any]:
-    """Pick the window that reads the fewest tokens: replay the last 7 days of requests at each window, and charge every
-    compaction what compactions measurably cost afterwards (re-reading what the summary dropped; 2 x window until measured).
-    Moves at most 50k a day, inside min..max."""
+    """Pick the window that costs the least (within 3%, the one that compacts least): replay the last 7 days of requests at
+    each window and charge every compaction what compactions measurably cost (compaction_cost). Never under window_floor; at most 50k a day otherwise; up when
+    sessions compact again within a few steps."""
     t = tokens_cfg(cfg)
-    reqs = _today_requests(7)
-    cost = rediscovery_cost()
-    cur, lo, hi = int(t["window"]), int(t["min"]), int(t["max"])
+    reqs, st = _today_requests(7), compaction_stats(7)
+    cur = int(t["window"])
+    cc = compaction_cost(st, cur)
+    lo = window_floor(t, cc["post"])
+    hi = max(lo, int(t["max"]))
     rows = []
-    for w in range(lo, hi + 1, 20000):
-        tot, comps = whatif(reqs, w)
-        charge = comps * (cost if cost is not None else 2 * w)
-        rows.append((tot + charge, w, tot, comps))
-    if not rows:
-        return {"window": cur, "changed": False}
-    best = min(rows)[1]
-    new = max(lo, min(hi, max(cur - 50000, min(cur + 50000, best))))
-    new = int(round(new / 10000) * 10000)
-    rec = {"t": int(now()), "from": cur, "to": new, "best": best, "measured_cost": cost,
-           "rows": [{"window": w, "tokens": int(tot), "compactions": c} for _, w, tot, c in rows]}
+    for w in range(lo, hi + 1, 10000):
+        tot, comps = whatif(reqs, w, cc["post"])
+        rows.append((tot + comps * cc["cost"], w, tot, comps))
+    best = max(r[1] for r in rows if r[0] <= 1.03 * min(rows)[0])   # about as cheap as the cheapest, with the fewest compactions
+    gaps = [e["requests"] for e in st if e["window"] == cur and not e["open"]]
+    thrash = len(gaps) >= 3 and _median(gaps) < 25
+    want = max(best, cur + 50000) if thrash else best
+    new = int(round(max(lo, min(hi, max(cur - 50000, min(cur + 50000, want)))) / 10000) * 10000)
+    rec = {"t": int(now()), "from": cur, "to": new, "best": best, "floor": lo, "post": cc["post"], "cost": cc["cost"], "measured": cc["measured"],
+           "gap": _median(gaps) if gaps else None, "rows": [{"window": w, "cost": int(x), "tokens": int(tot), "compactions": c} for x, w, tot, c in rows]}
     if apply:
         _log_tokens("autotune.jsonl", rec)
+        cfg.setdefault("tokens", {})["last_tune"] = int(now())
         if new != cur:
-            cfg.setdefault("tokens", {})["window"] = new
-            cfg["tokens"]["last_tune"] = int(now())
-            save_cfg(cfg)
+            cfg["tokens"]["window"] = new
+        save_cfg(cfg)
+        if new != cur:
             tokens_apply(cfg)
-        else:
-            cfg.setdefault("tokens", {})["last_tune"] = int(now())
-            save_cfg(cfg)
     rec["changed"] = new != cur
     return rec
 
@@ -3508,35 +3642,41 @@ def cmd_tokens(a) -> None:
         t["on"], changed = a.action == "on", True
     if a.action == "tune":
         rec = tokens_autotune(cfg)
-        say(f"window {rec['from'] // 1000}k -> {rec['to'] // 1000}k (best {rec['best'] // 1000}k; a compaction costs "
-            + (f"{rec['measured_cost'] / 1e3:.0f}k measured)" if rec.get("measured_cost") is not None else "2 x window until measured)"))
+        say(f"window {rec['from'] // 1000}k -> {rec['to'] // 1000}k (best {rec['best'] // 1000}k, never under {rec['floor'] // 1000}k; the context right after"
+            f" a compaction is {rec['post'] // 1000}k and one costs {rec['cost'] / 1e6:.1f}M cache reads, "
+            + (f"measured over {rec['measured']})" if rec["measured"] else "assumed until measured)"))
         return
     if changed:
         save_cfg(cfg)
         for k, v in tokens_apply(cfg).items():
             say(f"{k}: {v}")
         if a.action == "on":
-            say("new sessions and node jobs get all of it; a session already running loads the new hooks with /reload-plugins"
-                f" and the window with /autocompact {int(tokens_cfg(cfg)['window'])} (or when it is restarted)")
+            say("running sessions take the window at once; new hooks come with a new session, a restart or /reload-plugins")
     tc = tokens_cfg(cfg)
     say(f"token saving: {'on' if tc['on'] else 'off'} · auto-compact at {int(tc['window']) // 1000}k"
         f" · forks refused above {int(tc['fork_max']) // 1000}k · auto-tune {'on' if tc['auto'] else 'off'}"
         f" ({int(tc['min']) // 1000}k..{int(tc['max']) // 1000}k)")
     if a.action in ("on", "off") or changed:
+        if tc["on"] and int(tc["window"]) < int(tc["min"]):
+            say(f"! under {int(tc['min']) // 1000}k sessions compact again after a few steps: the context right after a compaction is about"
+                f" {POST // 1000}k, and Claude Code compacts {RESERVE // 1000}k below the window")
         return
-    reqs = _today_requests(1)
+    reqs, st = _today_requests(1), compaction_stats(7)
+    cc = compaction_cost(st, int(tc["window"]))
+    if tc["on"] and int(tc["window"]) < window_floor(tc, cc["post"]):
+        say(f"! {int(tc['window']) // 1000}k is too small here: Claude Code compacts at about {(int(tc['window']) - RESERVE) // 1000}k and the context right after"
+            f" a compaction is already about {cc['post'] // 1000}k — use {window_floor(tc, cc['post']) // 1000}k or more")
     allc = [c for v in reqs.values() for _, c in v]
     if allc:
         big = sum(c for c in allc if c > 200000)
         say(f"last 24 h here: {len(allc):,} requests · {sum(allc) / 1e6:,.0f}M context read · average {sum(allc) / len(allc) / 1e3:.0f}k"
             f" · {big / max(sum(allc), 1) * 100:.0f}% of it in requests above 200k")
         say(f"{'window':>8} {'tokens':>9} {'saved':>6} {'compactions':>12}")
-        for w in (100000, 150000, 200000, 300000, 400000):
-            tot, comps = whatif(reqs, w)
+        for w in (150000, 200000, 250000, 300000, 400000):
+            tot, comps = whatif(reqs, w, cc["post"])
             say(f"{w // 1000:>7}k {tot / 1e6:>8,.0f}M {100 - tot / max(sum(allc), 1) * 100:>5.0f}% {comps:>12}")
-    cost = rediscovery_cost()
-    n = len((TOKENS_DIR / "compactions.jsonl").read_text().splitlines()) if (TOKENS_DIR / "compactions.jsonl").exists() else 0
-    say(f"compactions recorded: {n}" + (f" · re-reading after one costs {cost / 1e3:.0f}k on average" if cost is not None else ""))
+    gaps = [e["requests"] for e in st if not e["open"]]
+    say(f"compactions measured (7 d): {len(st)}" + (f" · context right after one {cc['post'] // 1000}k · {_median(gaps)} requests until the next (median)" if gaps else ""))
     if (TOKENS_DIR / "autotune.jsonl").exists():
         last = json.loads((TOKENS_DIR / "autotune.jsonl").read_text().splitlines()[-1])
         say(f"last auto-tune {time.strftime('%m-%d %H:%M', time.localtime(last['t']))}: {last['from'] // 1000}k -> {last['to'] // 1000}k")
@@ -3548,23 +3688,30 @@ RULES_BEGIN, RULES_END = "<!-- agent-scaleout: offload rules (scaleout claude-se
 
 
 def cmd_hook(a) -> None:
-    """`scaleout hook pre|post|session`: what the Claude Code plugin's hooks run. The logic lives in the installed package
+    """`scaleout hook pre|post|session|notes|ledger|…`: what the Claude Code plugin's hooks run. The logic lives in the installed package
     (agents/claude), so a scaleout update updates the hooks too."""
-    base = SHARE / "agents" / "claude"
-    if not base.is_dir():
-        base = PKG_ROOT / "agents" / "claude"
-    if a.event in ("pre", "post"):
-        script = base / ("offload-hook.sh" if a.event == "pre" else "post-hook.sh")
+    base = agents_dir()
+    if a.event == "pre":
+        script = base / "offload-hook.sh"
         if not script.exists():
             sys.exit(0)   # never get in the way of a command
         os.execv("/bin/bash", ["bash", str(script)])
-    if a.event in ("precompact", "ctx", "agent"):
+    if a.event == "post":      # close the record of a heavy command; then the same nudge as `ctx` (a session older than that hook has only this one)
+        raw, script = sys.stdin.read(), base / "post-hook.sh"
+        try:
+            if script.exists():
+                subprocess.run(["/bin/bash", str(script)], input=raw.encode(), timeout=8, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            hook_tokens("ctx", json.loads(raw or "{}"))
+        except Exception:
+            pass
+        sys.exit(0)
+    if a.event in ("precompact", "notes", "ledger", "ctx", "agent"):
         try:
             hook_tokens(a.event)
         except Exception:   # a hook must never break the session
             pass
         sys.exit(0)
-    if a.event == "session":   # the offload rules (+ token saving: its rules, the notes and ledger) for every new session here
+    if a.event == "session":   # the offload rules (+ the token saving rules) for every new session here; notes and ledger are hooks of their own (HOOK_MAX)
         if not CONFIG.exists():
             sys.exit(0)   # not an orchestrator: nothing to say
         parts = [(base / "scaleout-rules.md").read_text()] if (base / "scaleout-rules.md").exists() else []
@@ -3574,7 +3721,7 @@ def cmd_hook(a) -> None:
                 h = _hook_input()
                 project = _project_of(h)
                 keep_out_of_git(project)
-                parts += [token_rules(t, project), restore_context(project, h.get("source", "startup"))]
+                parts.append(token_rules(t, project, h.get("session_id", "")))
         except Exception:
             pass
         rules = "\n\n".join(p for p in parts if p)
@@ -4412,10 +4559,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     s = sp.add_parser("rename", help="give a machine your own name (orchestrator and node are roles); no new name: back to its id")
     s.add_argument("name"); s.add_argument("new", nargs="?"); s.set_defaults(fn=cmd_rename)
     s = sp.add_parser("tick", help="run one scheduling round"); s.set_defaults(fn=cmd_tick)
-    s = sp.add_parser("hook", help=argparse.SUPPRESS); s.add_argument("event", choices=["pre", "post", "session", "precompact", "ctx", "agent"]); s.set_defaults(fn=cmd_hook)
+    s = sp.add_parser("hook", help=argparse.SUPPRESS); s.add_argument("event", choices=["pre", "post", "session", "notes", "ledger", "precompact", "ctx", "agent"]); s.set_defaults(fn=cmd_hook)
     s = sp.add_parser("tokens", help="token saving for every Claude Code session here and on the nodes: earlier compaction, notes + ledger kept across it, self-tuning window")
     s.add_argument("action", nargs="?", choices=["on", "off", "status", "tune"], default="status")
-    s.add_argument("--window", help="auto-compact at this many tokens (e.g. 200k, at least 100k)")
+    s.add_argument("--window", help="auto-compact window in tokens (e.g. 250k; under 200k sessions compact again after a few steps)")
     s.add_argument("--auto", dest="auto", action="store_true", default=None, help="let the daemon tune the window once a day from what it measures")
     s.add_argument("--no-auto", dest="auto", action="store_false", help="keep the window fixed")
     s.add_argument("--fork-max", help="refuse forked subagents from sessions larger than this (default 100k)")

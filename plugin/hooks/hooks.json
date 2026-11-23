@@ -3,7 +3,11 @@
     "SessionStart": [
       {
         "matcher": "startup|resume|clear|compact",
-        "hooks": [{ "type": "command", "timeout": 15, "command": "S=\"$HOME/.local/bin/scaleout\"; [ -x \"$S\" ] || exit 0; exec \"$S\" hook session" }]
+        "hooks": [
+          { "type": "command", "timeout": 15, "command": "S=\"$HOME/.local/bin/scaleout\"; [ -x \"$S\" ] || exit 0; exec \"$S\" hook session" },
+          { "type": "command", "timeout": 60, "command": "S=\"$HOME/.local/bin/scaleout\"; [ -x \"$S\" ] || exit 0; exec \"$S\" hook notes" },
+          { "type": "command", "timeout": 60, "command": "S=\"$HOME/.local/bin/scaleout\"; [ -x \"$S\" ] || exit 0; exec \"$S\" hook ledger" }
+        ]
       }
     ],
     "PreCompact": [

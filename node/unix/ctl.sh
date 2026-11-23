@@ -183,7 +183,7 @@ case "$verb" in
   tokens)  # tokens on <window> | off | status — `scaleout tokens`: Claude's auto-compact window on this machine and the job rules
     case "${1:-status}" in
       on|off)
-        win="${2:-200000}"; case "$win" in *[!0-9]*|"") win=200000 ;; esac
+        win="${2:-250000}"; case "$win" in *[!0-9]*|"") win=250000 ;; esac
         touch "$B/node.conf"
         grep -v -E '^(TOKEN_SAVING|COMPACT_WINDOW)=' "$B/node.conf" > "$B/node.conf.tmp" 2>/dev/null || true
         [ "$1" = on ] && printf 'TOKEN_SAVING=1\nCOMPACT_WINDOW=%s\n' "$win" >> "$B/node.conf.tmp"
@@ -213,7 +213,7 @@ os.replace(tmp, path)
 PY
         fi
         [ "$1" = on ] && echo "tokens on $win" || echo "tokens off" ;;
-      *) if [ "${TOKEN_SAVING:-0}" = 1 ]; then echo "on ${COMPACT_WINDOW:-200000}"; else echo off; fi ;;
+      *) if [ "${TOKEN_SAVING:-0}" = 1 ]; then echo "on ${COMPACT_WINDOW:-250000}"; else echo off; fi ;;
     esac ;;
 
   gc)  # gc <days>  — drop finished job folders, and repo work trees idle, older than N days

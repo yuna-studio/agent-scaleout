@@ -952,12 +952,12 @@ class E2E(unittest.TestCase):
         so.CLAUDE_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
         so.CLAUDE_SETTINGS.write_text(json.dumps({"model": "opus", "env": {"KEEP": "1"}}))
         nodes = [n for n in so.load_cfg()["nodes"] if n in HOMES]
-        so.cmd_tokens(argparse.Namespace(action="on", window="150k", auto=None, fork_max=None))
+        so.cmd_tokens(argparse.Namespace(action="on", window="250k", auto=None, fork_max=None))
         s = json.loads(so.CLAUDE_SETTINGS.read_text())
-        self.assertEqual((s["model"], s["env"]), ("opus", {"KEEP": "1", "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "150000"}))
+        self.assertEqual((s["model"], s["env"]), ("opus", {"KEEP": "1", "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "250000"}))
         for name in nodes:
-            self.assertIn("TOKEN_SAVING=1\nCOMPACT_WINDOW=150000", (HOMES[name] / ".scaleout/node.conf").read_text())
-            self.assertEqual(json.loads((HOMES[name] / ".claude/settings.json").read_text())["env"][so.WINDOW_ENV], "150000")
+            self.assertIn("TOKEN_SAVING=1\nCOMPACT_WINDOW=250000", (HOMES[name] / ".scaleout/node.conf").read_text())
+            self.assertEqual(json.loads((HOMES[name] / ".claude/settings.json").read_text())["env"][so.WINDOW_ENV], "250000")
         # a session transcript at 150k
         proj = TMP / "tok-proj"
         (proj / ".git/info").mkdir(parents=True)
@@ -967,48 +967,134 @@ class E2E(unittest.TestCase):
                  "content": [{"type": "tool_use", "name": "Edit", "input": {"file_path": "/p/a.dart"}},
                              {"type": "tool_use", "name": "Bash", "input": {"command": "scaleout wait j20261123-010203-abcd -m 0"}},
                              {"type": "tool_use", "name": "TaskCreate", "input": {"subject": "버튼 색 바꾸기"}}]}},
+                {"type": "user", "isCompactSummary": True, "timestamp": "2026-11-23T01:02:00Z", "message": {"role": "user", "content": "1. Primary Request and Intent"}},
                 {"type": "user", "timestamp": "2026-11-23T01:02:00Z", "message": {"role": "user", "content": [{"type": "tool_result", "content": "ok"}]}}]
         tr.write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in rows) + "\n")
         env = dict(os.environ, CLAUDE_PROJECT_DIR=str(proj))
         hook = lambda ev, payload: subprocess.run([sys.executable, str(ROOT / "orchestrator/scaleout.py"), "hook", ev], env=env,
                                                   input=json.dumps(payload).encode(), stdout=subprocess.PIPE, check=True).stdout.decode()
         self.assertEqual(so.transcript_context(str(tr)), 150010)
-        hook("precompact", {"transcript_path": str(tr), "session_id": "s1", "trigger": "auto"})
-        ledger = (proj / ".scaleout/ledger.md").read_text()
+        ses = {"transcript_path": str(tr), "session_id": "s1s1s1s1-0000"}
+        ctx_of = lambda out: json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        hook("precompact", dict(ses, trigger="auto"))
+        ledger = (proj / ".scaleout/ledger-s1s1s1s1.md").read_text()
         for x in ("버튼은 노랑으로", "/p/a.dart", "j20261123-010203-abcd", "[pending] 버튼 색 바꾸기", "context 150k"):
             self.assertIn(x, ledger)
         self.assertNotIn("tool_result", ledger)
+        self.assertNotIn("Primary Request", ledger, "a compaction's summary is not the user's words")
         self.assertIn(".scaleout/", (proj / ".git/info/exclude").read_text(), "kept out of git without touching .gitignore")
-        notes = proj / ".scaleout/notes.md"
+        notes = proj / ".scaleout/notes-s1s1s1s1.md"
         notes.write_text("결정: 노랑 버튼 (사용자)\n")
-        ctx = json.loads(hook("session", {"source": "compact", "transcript_path": str(tr)}))["hookSpecificOutput"]["additionalContext"]
-        for x in ("결정: 노랑 버튼", "버튼은 노랑으로", "about 150k", "Restored after compaction"):
-            self.assertIn(x, ctx)
-        fresh = json.loads(hook("session", {"source": "startup"}))["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("결정: 노랑 버튼", fresh)
-        self.assertNotIn("Ledger (", fresh, "a new session gets the notes, not an old ledger")
-        # near the window: told once (notes older than 10 minutes)
+        # after a compaction each part comes back through a hook of its own, none longer than Claude Code takes from one hook
+        rules = ctx_of(hook("session", dict(ses, source="compact")))
+        for x in (f"{(250000 - so.RESERVE) // 1000}k tokens", str(notes), str(proj / ".scaleout/ledger-s1s1s1s1.md")):
+            self.assertIn(x, rules)
+        self.assertNotIn("결정: 노랑 버튼", rules)
+        self.assertLess(len(rules), so.HOOK_MAX)
+        self.assertIn("결정: 노랑 버튼", ctx_of(hook("notes", dict(ses, source="compact"))))
+        self.assertIn("버튼은 노랑으로", ctx_of(hook("ledger", dict(ses, source="compact"))))
+        notes.write_text("# 긴 노트\n" + "가나다라 " * 4000)
+        big = ctx_of(hook("notes", dict(ses, source="compact")))
+        for x in (rules, big):
+            self.assertLess(len(x), 10000)
+        self.assertIn(f"the rest is in {notes}", big)
+        notes.write_text("결정: 노랑 버튼 (사용자)\n")
+        self.assertEqual(hook("notes", dict(ses, source="resume")).strip(), "", "a resumed conversation still has them")
+        self.assertEqual(hook("ledger", dict(ses, source="resume")).strip(), "")
+        # another session in the same folder: told where they are, never given them, and its own files stay apart
+        other = ctx_of(hook("notes", {"source": "startup", "session_id": "zzzzzzzz-1"}))
+        self.assertIn(str(notes), other)
+        self.assertEqual(other.count("결정: 노랑 버튼"), 1, "its first line only, to recognize it")
+        self.assertEqual(hook("ledger", {"source": "startup", "session_id": "zzzzzzzz-1"}).strip(), "")
+        self.assertEqual(hook("notes", {"source": "compact", "session_id": "zzzzzzzz-1", "transcript_path": str(tr)}).strip(), "")
+        # a session older than the PreCompact hook: its ledger is taken right after the compaction
+        out = ctx_of(hook("ledger", {"source": "compact", "session_id": "oldsess1-1", "transcript_path": str(tr)}))
+        self.assertIn("버튼은 노랑으로", out)
+        # notes.md of earlier versions: only for the session that wrote it
+        legacy = proj / ".scaleout/notes.md"
+        legacy.write_text("예전 노트\n")
+        tr2 = TMP / "tok-transcript2.jsonl"
+        tr2.write_text(json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Write", "input": {"file_path": str(legacy)}}]}}) + "\n")
+        self.assertIn("예전 노트", ctx_of(hook("notes", {"source": "compact", "session_id": "legacy01", "transcript_path": str(tr2)})))
+        self.assertEqual(hook("notes", {"source": "compact", "session_id": "legacy02", "transcript_path": str(tr)}).strip(), "")
+        # in a worktree: its own folder (a session there may not write outside it)
+        wt = proj / ".claude/worktrees/w1/lib"
+        self.assertIn(str(proj / ".claude/worktrees/w1/.scaleout/notes-s1s1s1s1.md"), ctx_of(hook("session", dict(ses, source="startup", cwd=str(wt)))))
+        # a long session: every part has its share and the whole fits
+        tr3 = TMP / "tok-transcript3.jsonl"
+        use = lambda name, inp: {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": name, "input": inp}]}}
+        tr3.write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in
+                                 [{"type": "user", "timestamp": "2026-11-23T01:00:00Z", "message": {"role": "user", "content": f"말 {i} " + "하" * 900}} for i in range(40)]
+                                 + [use("TaskCreate", {"subject": f"할 일 {i} " + "나" * 200}) for i in range(40)]
+                                 + [use("Edit", {"file_path": str(proj) + f"/lib/{'d' * 80}{i}.dart"}) for i in range(60)]
+                                 + [use("Bash", {"command": f"echo {i} " + "x" * 400}) for i in range(40)]) + "\n")
+        text = so.build_ledger(str(tr3), 0, str(proj))
+        self.assertLessEqual(len(text), so.LEDGER_MAX)
+        for x in ("## Task list", "할 일 39", "말 39", "## Files changed", "d59.dart", "## Recent commands", "echo 39"):
+            self.assertIn(x, text)
+        self.assertNotIn(str(proj) + "/lib", text, "paths in the project are short")
+        # near the point where Claude Code compacts (250k - 35k): told once (notes older than 10 minutes), also by the Bash hook
+        rows[1]["message"]["usage"]["cache_read_input_tokens"] = 200000
+        tr.write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in rows) + "\n")
         old = time.time() - 3600
         os.utime(notes, (old, old))
-        self.assertIn("update", hook("ctx", {"transcript_path": str(tr), "session_id": "s1"}))
-        self.assertEqual(hook("ctx", {"transcript_path": str(tr), "session_id": "s1"}).strip(), "")
+        self.assertIn(str(notes), hook("ctx", ses))
+        self.assertEqual(hook("ctx", ses).strip(), "")
+        for f in (so.TOKENS_DIR / "nudge").glob("*.json"):
+            f.unlink()
+        self.assertIn(str(notes), hook("post", dict(ses, hook_event_name="PostToolUse", tool_use_id="t1")), "a session that has only the Bash hook")
+        self.assertEqual(hook("post", dict(ses, tool_use_id="t2")).strip(), "")
         # forks: refused from a 150k session, other subagents pass
         deny = json.loads(hook("agent", {"transcript_path": str(tr), "tool_input": {"subagent_type": "fork"}}))
         self.assertEqual(deny["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertEqual(hook("agent", {"transcript_path": str(tr), "tool_input": {"subagent_type": "general-purpose"}}).strip(), "")
-        # replay: compacting at 200k reads less than the real 50k → 550k session, and costs compactions
-        reqs = {"s": [(f"t{i:02d}", 50000 * (i + 1)) for i in range(11)]}
+        # replay: compacting at 250k reads less than the real 50k → 850k session, and costs compactions
+        reqs = {"s": [(f"t{i:02d}", 50000 * (i + 1)) for i in range(17)]}
         real = sum(c for _, c in reqs["s"])
-        tot, comps = so.whatif(reqs, 200000)
+        tot, comps = so.whatif(reqs, 250000, 92000)
         self.assertLess(tot, real)
         self.assertGreaterEqual(comps, 2)
-        keep = so._today_requests
-        so._today_requests = lambda days=1.0: reqs
+        self.assertGreater(so.whatif(reqs, 150000, 92000)[1], comps)
+        # steps of 2k from a 92k start, as sessions really grow: a window that leaves no room costs more than one that does
+        steps = {"s": [(f"t{i:04d}", 92000 + 2000 * i) for i in range(400)]}
+        cc = so.compaction_cost([], 250000)
+        cost = lambda w: (lambda r: r[0] + r[1] * cc["cost"])(so.whatif(steps, w, cc["post"]))
+        self.assertGreater(cost(150000), cost(250000))
+        keep = so._today_requests, so.compaction_stats
+        so._today_requests = lambda days=1.0: steps
+        ev = lambda n: {"t": 1, "session": "s", "window": 250000, "ctx": 215000, "post": 92000, "write": 58000, "requests": n, "open": False, "reread": 0}
         try:
-            rec = so.tokens_autotune(so.load_cfg(), apply=False)
+            for small in (120000, 150000):   # what an earlier version tuned itself down to: straight back to the floor
+                cfg = so.load_cfg()
+                cfg["tokens"]["window"] = small
+                so.compaction_stats = lambda days=7: []
+                self.assertGreaterEqual(so.tokens_autotune(cfg, apply=False)["to"], 200000)
+            cfg = so.load_cfg()
+            so.compaction_stats = lambda days=7: [ev(60)] * 4
+            calm = so.tokens_autotune(cfg, apply=False)["to"]
+            self.assertTrue(200000 <= calm <= 300000, calm)
+            so.compaction_stats = lambda days=7: [ev(8)] * 4
+            self.assertEqual(so.tokens_autotune(cfg, apply=False)["to"], 300000, "compacting every few steps: up")
+            so.compaction_stats = lambda days=7: [dict(ev(60), post=160000)] * 4
+            self.assertGreaterEqual(so.tokens_autotune(cfg, apply=False)["to"], 270000, "never under what a compaction leaves + room")
         finally:
-            so._today_requests = keep
-        self.assertTrue(120000 <= rec["to"] <= 200000, rec["to"])   # inside min..max, at most 50k from 150k
+            so._today_requests, so.compaction_stats = keep
+        # what followed a compaction, measured in the transcript: retries and cancelled ones do not count
+        tr4 = TMP / "tok-transcript4.jsonl"
+        iso = lambda sec: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(sec))
+        t0 = int(time.time()) - 5000
+        req = lambda t, n, rid, path=None: {"type": "assistant", "timestamp": iso(t), "message": {"id": rid, "usage": {"cache_read_input_tokens": n - 50000, "cache_creation_input_tokens": 50000},
+                                            "content": [{"type": "tool_use", "name": "Read", "input": {"file_path": path}}] if path else []}}
+        tr4.write_text("\n".join(json.dumps(x) for x in [req(t0, 215000, "a", "/p/x"), req(t0 + 100, 90000, "b"), req(t0 + 110, 92000, "c", "/p/x"), req(t0 + 110, 92000, "c"),
+                                                          req(t0 + 210, 88000, "d")]) + "\n")
+        log = so.TOKENS_DIR / "compactions.jsonl"
+        kept = log.read_text()
+        log.write_text("".join(json.dumps({"t": t, "session": "q", "transcript": str(tr4), "ctx": c, "window": 250000}) + "\n"
+                               for t, c in ((t0 + 49, 215000), (t0 + 50, 215000), (t0 + 200, 214000))))
+        st = so.compaction_stats()
+        log.write_text(kept)
+        self.assertEqual([(e["post"], e["write"], e["requests"], e["reread"], e["open"]) for e in st],
+                         [(90000, 50000, 2, 92000, False), (88000, 50000, 1, 0, True)])
         # off: everything undone, other settings kept
         so.cmd_tokens(argparse.Namespace(action="off", window=None, auto=None, fork_max=None))
         self.assertEqual(json.loads(so.CLAUDE_SETTINGS.read_text())["env"], {"KEEP": "1"})
