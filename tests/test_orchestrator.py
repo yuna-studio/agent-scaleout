@@ -990,6 +990,8 @@ class E2E(unittest.TestCase):
         for x in (f"{(250000 - so.RESERVE) // 1000}k tokens", str(notes), str(proj / ".scaleout/ledger-s1s1s1s1.md")):
             self.assertIn(x, rules)
         self.assertNotIn("결정: 노랑 버튼", rules)
+        self.assertIn(f"read them now: {notes}, {proj / '.scaleout/ledger-s1s1s1s1.md'}", rules, "a session without the new hooks reads them itself")
+        self.assertNotIn("read them now", ctx_of(hook("session", dict(ses, source="startup"))))
         self.assertLess(len(rules), so.HOOK_MAX)
         self.assertIn("결정: 노랑 버튼", ctx_of(hook("notes", dict(ses, source="compact"))))
         self.assertIn("버튼은 노랑으로", ctx_of(hook("ledger", dict(ses, source="compact"))))
@@ -1008,8 +1010,11 @@ class E2E(unittest.TestCase):
         self.assertEqual(hook("ledger", {"source": "startup", "session_id": "zzzzzzzz-1"}).strip(), "")
         self.assertEqual(hook("notes", {"source": "compact", "session_id": "zzzzzzzz-1", "transcript_path": str(tr)}).strip(), "")
         # a session older than the PreCompact hook: its ledger is taken right after the compaction
-        out = ctx_of(hook("ledger", {"source": "compact", "session_id": "oldsess1-1", "transcript_path": str(tr)}))
-        self.assertIn("버튼은 노랑으로", out)
+        self.assertIn("ledger-oldsess1.md", ctx_of(hook("session", {"source": "compact", "session_id": "oldsess1-1", "transcript_path": str(tr)})))
+        self.assertIn("버튼은 노랑으로", (proj / ".scaleout/ledger-oldsess1.md").read_text())
+        n = len((so.TOKENS_DIR / "compactions.jsonl").read_text().splitlines())
+        self.assertIn("버튼은 노랑으로", ctx_of(hook("ledger", {"source": "compact", "session_id": "oldsess1-1", "transcript_path": str(tr)})))
+        self.assertEqual(len((so.TOKENS_DIR / "compactions.jsonl").read_text().splitlines()), n, "taken once")
         # notes.md of earlier versions: only for the session that wrote it
         legacy = proj / ".scaleout/notes.md"
         legacy.write_text("예전 노트\n")

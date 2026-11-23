@@ -33,7 +33,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "0.9.8"
+VERSION = "0.9.9"
 HOME = Path.home()
 CONF_DIR = Path(os.environ.get("SCALEOUT_CONF", HOME / ".config" / "scaleout"))
 STATE_DIR = Path(os.environ.get("SCALEOUT_STATE", HOME / ".local" / "state" / "scaleout"))
@@ -3359,13 +3359,20 @@ def ledger_context(h: Dict[str, Any]) -> str:
     """After a compaction: the ledger. Taken now when no PreCompact hook took it (a session older than that hook)."""
     if h.get("source") != "compact":
         return ""
-    f = _session_file(h, 1)
-    if f is None or now() - f.stat().st_mtime > 600:
-        f = write_ledger(h)
-        if f is None:
-            return ""
+    f = fresh_ledger(h)
+    if f is None:
+        return ""
     head = f"# Ledger of this session before the compaction ({f})\n\n"
     return head + _cap(f.read_text(errors="replace"), HOOK_MAX - len(head), f)
+
+
+def fresh_ledger(h: Dict[str, Any]) -> Optional[Path]:
+    """The ledger of the compaction that just ran, taken now when the PreCompact hook did not."""
+    TOKENS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(TOKENS_DIR / "ledger.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)   # the session and ledger hooks of one compaction both ask for it
+        f = _session_file(h, 1)
+        return f if f is not None and now() - f.stat().st_mtime < 600 else write_ledger(h)
 
 
 def write_ledger(h: Dict[str, Any]) -> Optional[Path]:
@@ -3722,6 +3729,11 @@ def cmd_hook(a) -> None:
                 project = _project_of(h)
                 keep_out_of_git(project)
                 parts.append(token_rules(t, project, h.get("session_id", "")))
+                if h.get("source") == "compact":   # a session older than the notes and ledger hooks has only this one
+                    files = [str(f) for f in (_session_file(h, 0), fresh_ledger(h)) if f]
+                    if files:
+                        parts.append("## After this compaction\nYour notes and the ledger come back with it. If you do not see their text in this context"
+                                     " (a session started before scaleout 0.9.8), read them now: " + ", ".join(files))
         except Exception:
             pass
         rules = "\n\n".join(p for p in parts if p)
