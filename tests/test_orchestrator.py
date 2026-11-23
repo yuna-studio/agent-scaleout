@@ -657,13 +657,18 @@ class E2E(unittest.TestCase):
         cfg["nodes"] = {"mac": {"max_jobs": 2, "agent": "claude"}, "pc": {"max_jobs": 8, "agent": "claude"}}
         cfg["defaults"]["min_free_disk_gb"] = 5   # the shipped floor
         heavy = {"tags": [], "agent": "default", "id": "p8", "cpu": 2}
-        self.assertEqual(so.job_disk_gb(heavy), 8.0)
-        m["pc"]["disk_free_gb"] = 12
+        self.assertEqual(so.job_disk_gb(heavy), 4.0)
+        m["pc"]["disk_free_gb"] = 8
         why = {}
         self.assertEqual(pick(heavy, load={"pc": 1}, why=why), "mac")
-        self.assertIn("disk 12 GB free, job needs 8", why["pc"])
+        self.assertIn("disk 8 GB free, job needs 4", why["pc"])
         m["pc"]["disk_free_gb"] = 500
-        self.assertEqual(pick(heavy, load={"pc": 1}, disk={"pc": 490}), "mac", "disk of jobs just handed out counts")
+        self.assertEqual(pick(heavy, load={"pc": 1}, disk={"pc": 492}), "mac", "disk of jobs just handed out counts")
+        # a 22 GB laptop running one emulator job still takes a second one
+        emu = {"tags": ["emulator"], "agent": "default", "id": "p9"}
+        m["pc"]["disk_free_gb"] = 22
+        self.assertEqual(so.pick_node(cfg, emu, m, {"pc": 1}, {}, {}, {}, {}, {"pc": so.job_disk_gb(emu)}), "pc")
+        m["pc"]["disk_free_gb"] = 500
         self.assertEqual(pick(heavy, load={"pc": 1}), "pc")
 
     def test_98l_plugin_version_follows(self):

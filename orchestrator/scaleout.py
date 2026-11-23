@@ -1202,10 +1202,10 @@ def job_disk_gb(j: Dict[str, Any]) -> float:
         return float(j["disk_gb"])
     heavy, plat = job_cpu(j) >= 2, job_platform(j)
     if plat == "ios":
-        return 15.0 if heavy else 5.0
+        return 10.0 if heavy else 3.0
     if plat == "android":
-        return 10.0 if heavy else 4.0
-    return 8.0 if heavy else 2.0
+        return 6.0 if heavy else 2.0
+    return 4.0 if heavy else 1.0
 
 
 _PERF: Dict[str, Any] = {"t": 0, "v": {}}
@@ -1740,7 +1740,7 @@ def tick(verbose: bool = False) -> None:
             if j.get("status") in ("dispatched", "running") and j.get("node") and now() - j.get("dispatched_at", 0) < 180:
                 planned_gb[j["node"]] = planned_gb.get(j["node"], 0.0) + job_mem_gb(j, j["node"])
         for j in jobs:   # ... and their build output takes longer to land on disk
-            if j.get("status") in ("dispatched", "running") and j.get("node") and now() - j.get("dispatched_at", 0) < 1200:
+            if j.get("status") in ("dispatched", "running") and j.get("node") and now() - j.get("dispatched_at", 0) < 600:
                 planned_disk[j["node"]] = planned_disk.get(j["node"], 0.0) + job_disk_gb(j)
         for j in jobs:
             if j.get("status") in ("dispatched", "running") and j.get("node"):
