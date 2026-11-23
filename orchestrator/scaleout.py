@@ -12,6 +12,7 @@ Python 3.9+ standard library only. Nodes need nothing but SSH and a shell (macOS
 from __future__ import annotations
 
 import argparse
+import calendar
 import base64
 import fcntl
 import hashlib
@@ -3032,11 +3033,11 @@ def cmd_provision(a) -> None:
 # it (the agent's notes + a ledger taken from the transcript just before), and can tune the window from what it measures.
 CLAUDE_SETTINGS = HOME / ".claude" / "settings.json"
 WINDOW_ENV = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
-TOKENS_DEFAULT: Dict[str, Any] = {"on": False, "window": 250000, "auto": False, "fork_max": 100000,
+TOKENS_DEFAULT: Dict[str, Any] = {"on": False, "window": 300000, "auto": False, "fork_max": 100000,
                                   "min": 200000, "max": 400000}
 TOKENS_DIR = STATE_DIR / "tokens"
 RESERVE = 35000              # Claude Code compacts this far below the window (it keeps room for the answer and the summary)
-POST, POST_WRITE = 92000, 58000   # until measured: the context right after a compaction (tools, skills, memory, summary, files put back) and the part of it written to the cache anew
+POST, POST_WRITE = 124000, 90000   # until measured: the context right after a compaction (tools, skills, memory, summary, files put back, and what came after a summary taken in advance) and the part of it written to the cache anew
 SUMMARY_OUT = 8000           # tokens a summary takes to write
 W_OUT, W_WRITE = 50, 20      # an output token and a cache write in cache reads (API prices: 5x and 2x input; a cache read is 0.1x)
 HOOK_MAX = 9500              # Claude Code takes up to 10,000 characters from one hook; a longer text reaches the session as a 2 KB preview
@@ -3280,8 +3281,16 @@ def _project_of(h: Dict[str, Any]) -> str:
 
 
 def _session_file(h: Dict[str, Any], kind: int) -> Optional[Path]:
-    """This session's notes (kind 0) or ledger (1), the newest one when it moved between a folder and its worktree."""
+    """This session's notes (kind 0) or ledger (1), the newest one when it moved between a folder and its worktrees."""
     roots = {_project_of(h), os.environ.get("CLAUDE_PROJECT_DIR") or "", h.get("cwd") or ""} - {""}
+    f = TOKENS_DIR / "compactions.jsonl"      # and the folders its earlier compactions were in: the working folder changes
+    for line in f.read_text().splitlines() if f.exists() and h.get("session_id") else []:
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if ev.get("session") == h["session_id"] and ev.get("project"):
+            roots.add(ev["project"])
     found = [f for f in (notes_paths(r, h.get("session_id", ""))[kind] for r in roots) if f.exists() and f.stat().st_size]
     return max(found, key=lambda f: f.stat().st_mtime) if found else None
 
@@ -3514,8 +3523,10 @@ def whatif(reqs: Dict[str, List[Tuple[str, int]]], window: int, post: int = POST
 
 
 def compaction_stats(days: int = 7) -> List[Dict[str, Any]]:
-    """What followed each recorded compaction, measured in its transcript: the context and cache write of the next request,
-    the requests until the next compaction, and the context read by those (first 40) that re-read a file read before it."""
+    """What followed each compaction of the sessions in compactions.jsonl, measured in their transcripts: the context and cache
+    write of the next request, the requests until the next compaction, and the context read by those (first 40) that re-read a
+    file read before it. The compactions are the transcript's own compact_boundary lines: from a 250k window up Claude Code calls
+    the PreCompact hook ahead of time (it takes the summary in advance), sometimes twice for one compaction."""
     f = TOKENS_DIR / "compactions.jsonl"
     evs: Dict[str, List[Dict[str, Any]]] = {}
     for line in f.read_text().splitlines() if f.exists() else []:
@@ -3529,18 +3540,22 @@ def compaction_stats(days: int = 7) -> List[Dict[str, Any]]:
     for tp, es in evs.items():
         es.sort(key=lambda e: e["t"])
         reqs: List[Dict[str, Any]] = []
+        bounds: List[Tuple[float, int, int]] = []   # time, context before it, requests before it
         try:
             fh = open(tp, errors="replace")
         except OSError:
             continue
         with fh:
             for line in fh:
-                if '"usage"' not in line:
+                if '"usage"' not in line and '"compact_boundary"' not in line:
                     continue
                 try:
                     d = json.loads(line)
-                    tsec = time.mktime(time.strptime(d.get("timestamp", "")[:19], "%Y-%m-%dT%H:%M:%S")) - time.timezone
+                    tsec = calendar.timegm(time.strptime(d.get("timestamp", "")[:19], "%Y-%m-%dT%H:%M:%S"))
                 except ValueError:
+                    continue
+                if d.get("subtype") == "compact_boundary":
+                    bounds.append((tsec, int((d.get("compactMetadata") or {}).get("preTokens") or 0), len(reqs)))
                     continue
                 m = d.get("message") or {}
                 u = m.get("usage") or {}
@@ -3552,13 +3567,14 @@ def compaction_stats(days: int = 7) -> List[Dict[str, Any]]:
                     reqs[-1]["paths"] |= paths     # one request, written as several lines
                     continue
                 reqs.append({"t": tsec, "id": m.get("id"), "ctx": _usage_tokens(u), "write": int(u.get("cache_creation_input_tokens", 0) or 0), "paths": paths})
-        for i, e in enumerate(es):
-            end = es[i + 1]["t"] if i + 1 < len(es) else None
-            seg = [r for r in reqs if r["t"] >= e["t"] and (end is None or r["t"] < end)]
-            if not seg or seg[0]["ctx"] > 0.95 * (e.get("ctx") or 1e9):
-                continue      # nothing ran after it, or it did not compact (cancelled, failed, retried)
-            before = set().union(*[r["paths"] for r in reqs if r["t"] < e["t"]]) if reqs else set()
-            out.append({"t": e["t"], "session": e.get("session", ""), "window": int(e.get("window") or 0), "ctx": e.get("ctx", 0), "post": seg[0]["ctx"],
+        for i, (t, pre, n) in enumerate(bounds):
+            end = bounds[i + 1][2] if i + 1 < len(bounds) else None
+            seg = reqs[n:end]
+            e = next((e for e in reversed(es) if t - 900 <= e["t"] <= t + 5), None)   # the hook that announced it
+            if not seg or e is None:
+                continue      # nothing ran after it, or it was before token saving
+            before = set().union(*[r["paths"] for r in reqs[:n]])
+            out.append({"t": int(t), "session": e.get("session", ""), "window": int(e.get("window") or 0), "ctx": pre, "post": seg[0]["ctx"],
                         "write": seg[0]["write"], "requests": len(seg), "open": end is None,
                         "reread": sum(r["ctx"] for r in seg[:40] if r["paths"] & before)})
     return out
@@ -3571,7 +3587,9 @@ def _median(v: List[float]) -> float:
 
 def compaction_cost(st: List[Dict[str, Any]], window: int) -> Dict[str, int]:
     """What a compaction costs besides the reading `whatif` counts, in cache reads: writing the summary, putting the new
-    context in the cache, and reading again what the summary dropped (2 x window until measured)."""
+    context in the cache, and reading again what the summary dropped (2 x window until measured). Only compactions at about this
+    window count: how much is left right after one depends on it."""
+    st = [e for e in st if abs(e["window"] - window) <= 50000]
     m = len(st) >= 3
     post, write = (int(_median([e["post"] for e in st])), int(_median([e["write"] for e in st]))) if m else (POST, POST_WRITE)
     reread = int(sum(e["reread"] for e in st) / len(st)) if m else None

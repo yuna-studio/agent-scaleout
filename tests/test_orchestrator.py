@@ -1084,22 +1084,26 @@ class E2E(unittest.TestCase):
             self.assertGreaterEqual(so.tokens_autotune(cfg, apply=False)["to"], 270000, "never under what a compaction leaves + room")
         finally:
             so._today_requests, so.compaction_stats = keep
-        # what followed a compaction, measured in the transcript: retries and cancelled ones do not count
+        # what followed a compaction, measured from the transcript's own boundaries: a hook called ahead of time or twice does not count
         tr4 = TMP / "tok-transcript4.jsonl"
         iso = lambda sec: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(sec))
         t0 = int(time.time()) - 5000
         req = lambda t, n, rid, path=None: {"type": "assistant", "timestamp": iso(t), "message": {"id": rid, "usage": {"cache_read_input_tokens": n - 50000, "cache_creation_input_tokens": 50000},
                                             "content": [{"type": "tool_use", "name": "Read", "input": {"file_path": path}}] if path else []}}
-        tr4.write_text("\n".join(json.dumps(x) for x in [req(t0, 215000, "a", "/p/x"), req(t0 + 100, 90000, "b"), req(t0 + 110, 92000, "c", "/p/x"), req(t0 + 110, 92000, "c"),
-                                                          req(t0 + 210, 88000, "d")]) + "\n")
+        bound = lambda t, pre: {"type": "system", "subtype": "compact_boundary", "timestamp": iso(t), "compactMetadata": {"trigger": "auto", "preTokens": pre}}
+        tr4.write_text("\n".join(json.dumps(x) for x in [req(t0, 192000, "a", "/p/x"), req(t0 + 60, 215000, "a2"), bound(t0 + 99, 218000), req(t0 + 100, 90000, "b"),
+                                                          req(t0 + 110, 92000, "c", "/p/x"), req(t0 + 110, 92000, "c"), bound(t0 + 205, 216000), req(t0 + 210, 88000, "d")]) + "\n")
         log = so.TOKENS_DIR / "compactions.jsonl"
         kept = log.read_text()
         log.write_text("".join(json.dumps({"t": t, "session": "q", "transcript": str(tr4), "ctx": c, "window": 250000}) + "\n"
                                for t, c in ((t0 + 49, 215000), (t0 + 50, 215000), (t0 + 200, 214000))))
         st = so.compaction_stats()
         log.write_text(kept)
-        self.assertEqual([(e["post"], e["write"], e["requests"], e["reread"], e["open"]) for e in st],
-                         [(90000, 50000, 2, 92000, False), (88000, 50000, 1, 0, True)])
+        self.assertEqual([(e["ctx"], e["post"], e["write"], e["requests"], e["reread"], e["open"]) for e in st],
+                         [(218000, 90000, 50000, 2, 92000, False), (216000, 88000, 50000, 1, 0, True)])
+        self.assertEqual(so.compaction_cost([dict(ev(60), window=150000)] * 4, 250000)["measured"], 0, "what a far smaller window left says nothing about this one")
+        # the working folder changed since: the notes of the worktree are still found
+        self.assertIn("결정: 노랑 버튼", ctx_of(hook("notes", dict(ses, source="compact", cwd=str(TMP)))))
         # off: everything undone, other settings kept
         so.cmd_tokens(argparse.Namespace(action="off", window=None, auto=None, fork_max=None))
         self.assertEqual(json.loads(so.CLAUDE_SETTINGS.read_text())["env"], {"KEEP": "1"})

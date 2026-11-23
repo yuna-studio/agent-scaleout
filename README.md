@@ -237,12 +237,13 @@ Every tool call re-reads the session's whole context from the cache, so tokens �
 are usually over 95% of them. Claude Code auto-compacts near the model's full window (~967k on 1M-context models), so a
 long session pays for 500k–1M on every step. One switch, for every session here and on every node:
 ```bash
-scaleout tokens on [--window 250k] [--auto]   # off · status (default) · tune
+scaleout tokens on [--window 300k] [--auto]   # off · status (default) · tune
 ```
 - **Earlier compaction.** `CLAUDE_CODE_AUTO_COMPACT_WINDOW` goes into Claude Code's user settings here and on each node
   (`scaleout update` re-applies it to new nodes). Claude Code compacts about 35k below the window, and right after a
-  compaction the context is already about 90k (tools, skills, memory files, the summary, files put back), so a window
-  under 200k makes a session compact again every few steps and costs more than it saves. `scaleout tokens` replays the
+  compaction the context is already 90k–130k (tools, skills, memory files, the summary, files put back; from a 250k window
+  up also what was said since a summary taken in advance), so a window under 200k makes a session compact again every few
+  steps and costs more than it saves; 250k–300k cost about the same, and 300k compacts 40% less. `scaleout tokens` replays the
   last 24 h of requests at 150k–400k with what was measured here, and warns when the window is too small.
 - **Nothing important lost to the summary.** Each session has two files in its folder (its worktree when it works in one
   under `.claude/worktrees/`), kept out of git through the local exclude: `.scaleout/notes-<session>.md`, the agent's own
