@@ -81,6 +81,18 @@ agent_cmd() {  # agent_cmd <agent> -> command line that reads the prompt on stdi
   esac
 }
 
+skills_off() {  # skills_off <prompt file> -> 0 when the job can run without skills (about 11k tokens of list in every request)
+  # Kept when the task names one of this node's skills, says "skill", or is about documents, charts or pages (built-in skills).
+  [ "${TOKEN_SAVING:-0}" = 1 ] && [ "${JOB_SKILLS:-auto}" = auto ] || return 1
+  grep -qiE '스킬|skill|차트|그래프|대시보드|엑셀|파워포인트|발표 ?자료|chart|dashboard|spreadsheet|artifact page|\.(pdf|pptx|docx|xlsx)' "$1" && return 1
+  local x
+  for x in "$HOME"/.claude/skills/*/; do
+    [ -d "$x" ] || continue
+    x="$(basename "$x")"; [ "$x" = synced ] || ! grep -qF -- "$x" "$1" || return 1
+  done
+  return 0
+}
+
 run_job() {
   local d="$1" agent timeout wd cmd
   agent="$(sed -n 's/^AGENT=//p' "$d/meta")"; [ -n "$agent" ] && [ "$agent" != default ] || agent="$AGENT"
@@ -93,6 +105,11 @@ run_job() {
   # continue an existing Claude Code session (its transcript must be reachable here, e.g. a shared ~/.claude/projects)
   local resume; resume="$(sed -n 's/^RESUME=//p' "$d/meta" | tr -cd 'A-Za-z0-9-')"
   [ -n "$resume" ] && [ "$agent" = claude ] && cmd="$cmd --resume $resume"
+  local model; model="$(sed -n 's/^MODEL=//p' "$d/meta" | tr -cd 'A-Za-z0-9._-')"   # checks run on `check_model`
+  [ -n "$model" ] && [ "$agent" = claude ] && cmd="$cmd --model $model"
+  local effort; effort="$(sed -n 's/^EFFORT=//p' "$d/meta" | tr -cd 'a-z')"
+  [ -n "$effort" ] && [ "$agent" = claude ] && cmd="$cmd --effort $effort"
+  [ -z "$resume" ] && [ "$agent" = claude ] && skills_off "$d/prompt.md" && cmd="$cmd --disable-slash-commands"
   # screenshots, recordings, logs, reports saved here are fetched back to the orchestrator
   mkdir -p "$d/artifacts"; export SCALEOUT_ARTIFACTS="$d/artifacts" SCALEOUT_JOB_ID="$(basename "$d")"
   date +%s > "$d/started"; touch "$d/heartbeat"

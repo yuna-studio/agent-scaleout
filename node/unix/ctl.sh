@@ -149,10 +149,10 @@ case "$verb" in
       "$(j "$OS")" "$(uname -m)" "$(j "$(hostname)")" "$(mem_free_pct)" "$(mem_total_gb)" "$(disk_free_gb "$HOME")" \
       "$(disk_free_gb "${WORK_ROOT:-$HOME}")" "$(load1)" "$(cpus)" "$(running_jobs)" "$(queued_jobs)" "$(runner_ok)" "$(agents)" "$(devices)" "$(claude_now)" "$(caps)" "$(skills_hash)" "$VERSION" ;;
 
-  submit)  # submit <jid> <agent> <timeout_min> <workdir> [resume-session-id]   (prompt on stdin)
+  submit)  # submit <jid> <agent> <timeout_min> <workdir> [resume-session-id] [model] [effort]   (prompt on stdin)
     jid="$1"; d="$B/jobs/$jid"; mkdir -p "$d" "$B/queue"
     cat > "$d/prompt.md"
-    printf 'AGENT=%s\nTIMEOUT_MIN=%s\nWORKDIR=%s\nRESUME=%s\n' "$2" "$3" "$4" "${5:-}" > "$d/meta"
+    printf 'AGENT=%s\nTIMEOUT_MIN=%s\nWORKDIR=%s\nRESUME=%s\nMODEL=%s\nEFFORT=%s\n' "$2" "$3" "$4" "${5:-}" "${6:-}" "${7:-}" > "$d/meta"
     touch "$B/queue/$jid"
     [ "$OS" = Darwin ] || "$B/bin/kick" >/dev/null 2>&1 &   # Linux: start the runner now (its systemd service when there is one)
     echo queued ;;
