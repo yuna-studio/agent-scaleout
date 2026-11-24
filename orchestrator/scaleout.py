@@ -34,7 +34,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "0.9.15"
+VERSION = "0.9.16"
 HOME = Path.home()
 CONF_DIR = Path(os.environ.get("SCALEOUT_CONF", HOME / ".config" / "scaleout"))
 STATE_DIR = Path(os.environ.get("SCALEOUT_STATE", HOME / ".local" / "state" / "scaleout"))
@@ -1493,6 +1493,75 @@ def push_skills(cfg: Dict[str, Any], name: str, force: bool = False) -> bool:
     return False
 
 
+# ── machine guides: how to do things on one machine, told to every job that goes there ───────────────────────────────
+GUIDES = CONF_DIR / "guides"   # <node id>.md, kept on the orchestrator: what it knows about that machine
+GUIDE_NOTE = re.compile(r"<!--\s*(when|needs)\s*:\s*(.*?)\s*-->", re.S | re.I)
+
+
+def guide_text(name: str) -> str:
+    try:
+        return (GUIDES / f"{name}.md").read_text(errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def guide_parts(text: str) -> List[Dict[str, Any]]:
+    """The parts of a guide: what stands before the first '## ' (title ''), then one part per '## ' section. A part may say
+    `<!-- when: word|word -->` (only for a task that has one of these words) and `<!-- needs: gpu -->` (only while the
+    machine has that tag; in the first part it holds for the whole guide)."""
+    parts = []
+    for i, block in enumerate(re.split(r"(?m)^## +", text)):
+        notes: Dict[str, List[str]] = {"when": [], "needs": []}
+        for key, val in GUIDE_NOTE.findall(block):
+            notes[key.lower()] += [w.strip().lower() for w in re.split(r"[|,]", val) if w.strip()]
+        block = re.sub(r"\n{3,}", "\n\n", GUIDE_NOTE.sub("", block)).strip()
+        title, body = ("", re.sub(r"\A# .*\n*", "", block)) if i == 0 else (block.split("\n", 1) + [""])[:2]
+        parts.append({"title": title.strip(), "body": body.strip(), **notes})
+    return parts
+
+
+def node_has(cfg: Dict[str, Any], name: str, st: Dict[str, Any]) -> set:
+    """The tags a machine has right now: its own, its OS and what it found it can run."""
+    system = str(st.get("os", "")).lower()
+    return {str(t).lower() for t in (cfg["nodes"].get(name, {}).get("tags") or [])} | {system} | OS_TAGS.get(system, set()) \
+        | {str(t).lower() for t in st.get("caps") or []}
+
+
+def guide_for(cfg: Dict[str, Any], name: str, task: str, st: Dict[str, Any], path: str = "") -> Tuple[str, List[str]]:
+    """What a job with this task text is told about the machine it goes to, and the titles of the sections in it. With the
+    path of the whole guide on that machine, sections the task does not seem to need are only named."""
+    parts = guide_parts(guide_text(name))
+    have, head, low = node_has(cfg, name, st), parts[0], PIN_NOT.sub(" ", task).lower()   # "do not start an emulator" does not ask for one
+    if set(head["needs"]) - have:
+        return "", []
+    asked = [p for p in parts[1:] if not p["when"] or any(re.search(r"(?<![a-z0-9])" + re.escape(w), low) for w in p["when"])]
+    fit = [p for p in parts[1:] if not set(p["needs"]) - have]
+    on = [p for p in fit if p in asked or not path]
+    rest = [p["title"] for p in fit if p not in on]
+    off = [f"{p['title']} (no {', '.join(sorted(set(p['needs']) - have))})" for p in asked if p not in fit]
+    if not (head["body"] or on or rest or off):
+        return "", []
+    out = [f"(agent-scaleout) About the machine you are on, {label_of(cfg, name)}, checked just now. Where the task or a script says "
+           "otherwise for these things, do it this way and say so in your answer."]
+    if head["body"]:
+        out.append(head["body"])
+    out += [f"### {p['title']}\n{p['body']}" for p in on]
+    if off:
+        out.append("Not possible on this machine right now: " + "; ".join(off) + ". Do it the way the task says and report that it was missing.")
+    if rest:
+        out.append(f"Also in {path}, read it before you do one of these: " + ", ".join(rest) + ".")
+    return "\n\n---\n" + "\n\n".join(out) + "\n", [p["title"] for p in on]
+
+
+def push_guide(n: "Node", name: str) -> str:
+    """Put the whole guide on the machine; where it is there, or "" when it could not be put."""
+    if n.local:
+        return str(GUIDES / f"{name}.md")
+    if n.windows or n.ctl("guide", input=guide_text(name).encode(), timeout=30).returncode != 0:
+        return ""
+    return "~/.scaleout/guide.md"
+
+
 def dispatch_error_line(text: str) -> str:
     """The one line of a failed git/ctl output worth showing next to a waiting job: the last error line, kept short."""
     lines = [ln.strip() for ln in str(text or "").splitlines() if ln.strip()]
@@ -1561,6 +1630,16 @@ def dispatch(cfg: Dict[str, Any], j: Dict[str, Any], name: str) -> bool:
     if j.get("agent") != "bench":
         prompt += ("\n\n---\n(agent-scaleout) You are already running as a scaleout job: run builds, tests, simulators and "
                    "emulators here yourself; do not hand the work to scaleout again.\n").encode()
+    if j.get("agent") != "bench" and guide_text(name):
+        try:
+            task = " ".join([(STATE_DIR / "prompts" / f"{j['id']}.md").read_text(errors="replace")]   # the task itself, not what is added to it
+                            + [str(j.get(k) or "") for k in ("repo_name", "repo_sub", "sync", "workdir")])
+            about, titles = guide_for(cfg, name, task, read_json(node_state_path(name), {}), push_guide(n, name))
+            if about:
+                prompt += about.encode()
+                j["guide"] = titles
+        except Exception as e:   # a guide never keeps a job from starting
+            say(f"guide of {name}: {e}")
     if j.get("agent") != "bench":
         prompt += ("\n\n---\n(agent-scaleout) Save every screenshot, screen recording, log or report you produce into the folder "
                    "given by the SCALEOUT_ARTIFACTS environment variable; it is sent back to the requester automatically. "
@@ -2902,6 +2981,59 @@ def clock_time(text: str) -> float:
     return 0.0
 
 
+def guide_rules(cfg: Dict[str, Any]) -> str:
+    """For the sessions on this machine: which machines have a guide and what it is about."""
+    L = []
+    for name in sorted(cfg["nodes"]):
+        parts = guide_parts(guide_text(name))
+        if not parts[0]["body"] and len(parts) == 1:
+            continue
+        have = node_has(cfg, name, read_json(node_state_path(name), {}))
+        tagged = lambda p: p["title"] + (f" (`--tags {','.join(p['needs'])}`{'' if set(p['needs']) <= have else ', not there now'})" if p["needs"] else "")
+        L.append(f"- **{label_of(cfg, name)}** (`{name}`): " + " ".join(parts[0]["body"].split())
+                 + (" Sections: " + ", ".join(tagged(p) for p in parts[1:]) + "." if len(parts) > 1 else ""))
+    return "" if not L else ("## Machines with a guide\nSend work that fits a section to that machine, with the tag named there. scaleout checks the machine and "
+                             "adds the parts that fit to every job it sends there, so do not repeat them in the task. `scaleout guide NODE` prints the "
+                             "whole guide; follow it too when you run something there yourself over ssh.\n" + "\n".join(L))
+
+
+def cmd_guide(a) -> None:
+    """How to do things on one machine: kept here, told to every job that goes there."""
+    cfg = load_cfg()
+    brief = lambda text: f"{len(text)} characters, sections: {', '.join(p['title'] for p in guide_parts(text)[1:]) or '-'}"
+    if not a.node:
+        say("\n".join(f"{k}: {brief(guide_text(k))}" for k in sorted(cfg["nodes"]) if guide_text(k)) or "no machine has a guide")
+        return
+    name = node_id(cfg, a.node)
+    if name not in cfg["nodes"]:
+        die(E_NOT_FOUND, f"no node '{a.node}'")
+    f = GUIDES / f"{name}.md"
+    if a.task is not None:   # what such a job would be told now
+        about, _ = guide_for(cfg, name, a.task, refresh_metrics(cfg, [name], 0).get(name, {}), "~/.scaleout/guide.md")
+        say(about.strip() or f"{name}: nothing is told to such a job")
+        return
+    if not a.off and not a.file:
+        say(guide_text(name) or f"{name}: no guide")
+        return
+    if a.off:
+        if f.exists():
+            f.unlink()
+        say(f"{name}: no guide any more")
+    else:
+        text = (sys.stdin.read() if a.file == "-" else Path(a.file).expanduser().read_text()).strip()
+        if not text:
+            die(E_USAGE, "the guide is empty; `--off` removes one")
+        GUIDES.mkdir(parents=True, exist_ok=True)
+        f.write_text(text + "\n")
+        say(f"{name}: guide saved, {brief(text)}")
+    try:
+        there = push_guide(Node(name, cfg), name)
+    except Exception:
+        there = ""
+    if not there:
+        say("the copy on the machine is not updated now; it is with the next job")
+
+
 def cmd_hold(a) -> None:
     """Give a machine no new job for a while (before a reboot or an update). Jobs it already has go on."""
     cfg = load_cfg()
@@ -4026,6 +4158,14 @@ def cmd_hook(a) -> None:
         except Exception:   # a hook must never break the session
             pass
         sys.exit(0)
+    if a.event == "guides":   # what the orchestrator knows about its machines; a hook of its own (HOOK_MAX)
+        try:
+            text = guide_rules(load_cfg()) if CONFIG.exists() else ""
+            if text:
+                print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text[:HOOK_MAX]}}, ensure_ascii=False))
+        except Exception:
+            pass
+        sys.exit(0)
     if a.event == "session":   # the offload rules (+ the token saving rules) for every new session here; notes and ledger are hooks of their own (HOOK_MAX)
         if not CONFIG.exists():
             sys.exit(0)   # not an orchestrator: nothing to say
@@ -4865,6 +5005,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     s = sp.add_parser("hold", help="give a machine no new jobs for a while (before a reboot): hold NODE [--from TIME] [--until TIME] | hold NODE off")
     s.add_argument("node", nargs="?"); s.add_argument("action", nargs="?", choices=("on", "off"), default="on")
     s.add_argument("--from", dest="start", help="HH:MM or MM-DD HH:MM (default now)"); s.add_argument("--until", help="HH:MM or MM-DD HH:MM (default 2 hours)"); s.set_defaults(fn=cmd_hold)
+    s = sp.add_parser("guide", help="how to do things on one machine, told to every job sent there: guide NODE [-f FILE|-] [--for TEXT] [--off]")
+    s.add_argument("node", nargs="?"); s.add_argument("-f", "--file", help="set it from a file (- = stdin)"); s.add_argument("--for", dest="task", help="show what a job with this text would be told")
+    s.add_argument("--off", action="store_true", help="remove it"); s.set_defaults(fn=cmd_guide)
     s = sp.add_parser("config", help="show/set defaults (or --node NAME settings)"); s.add_argument("key", nargs="?"); s.add_argument("value", nargs="?"); s.add_argument("--node"); s.set_defaults(fn=cmd_config)
 
     s = sp.add_parser("bench", help="score nodes (100 = one M1 8GB Mac mini) and track how the pool grows; --load runs a load test")
@@ -4900,7 +5043,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     s = sp.add_parser("rename", help="give a machine your own name (orchestrator and node are roles); no new name: back to its id")
     s.add_argument("name"); s.add_argument("new", nargs="?"); s.set_defaults(fn=cmd_rename)
     s = sp.add_parser("tick", help="run one scheduling round"); s.set_defaults(fn=cmd_tick)
-    s = sp.add_parser("hook", help=argparse.SUPPRESS); s.add_argument("event", choices=["pre", "post", "session", "notes", "ledger", "precompact", "ctx", "agent"]); s.set_defaults(fn=cmd_hook)
+    s = sp.add_parser("hook", help=argparse.SUPPRESS); s.add_argument("event", choices=["pre", "post", "session", "guides", "notes", "ledger", "precompact", "ctx", "agent"]); s.set_defaults(fn=cmd_hook)
     s = sp.add_parser("tokens", help="token saving for every Claude Code session here and on the nodes: earlier compaction, notes + ledger kept across it, self-tuning window")
     s.add_argument("action", nargs="?", choices=["on", "off", "status", "tune"], default="status")
     s.add_argument("--window", help="auto-compact window in tokens (e.g. 250k; under 200k sessions compact again after a few steps)")

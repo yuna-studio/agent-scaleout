@@ -329,6 +329,31 @@ scaleout tune [--apply]   # max_jobs from the measured CPU slots (the daemon doe
   measured falls back to `(memory - idle use - 1 GB) / p90(memory per job)` once it has 5 finished jobs. Nodes added with
   an explicit `--max-jobs` are never changed.
 
+## Machine guides
+Some things are done differently on one machine: which binary uses its graphics card, how many captures fit at once, a flag
+an emulator needs. Write that down once, on the orchestrator:
+
+```bash
+scaleout guide build-01 -f gpu.md            # save it (`-f -` = stdin, `--off` removes it); kept in ~/.config/scaleout/guides/
+scaleout guide build-01 --for "run the E2E"  # what a job with this text would be told right now
+scaleout guide                               # the machines that have one
+```
+
+````markdown
+GTX 1070 Ti, 8 GB. Rendering goes to the card, not the CPU.
+
+## Android emulator
+<!-- needs: gpu -->
+<!-- when: emulator|apk|e2e -->
+Start it with `-gpu host`.
+````
+
+When a job is handed over, scaleout looks at the machine as it is at that moment and adds to the task: the text before the
+first `##`, and each section whose `when` words are in the task (no `when` = always) and whose `needs` tags the machine has
+right now. A section that fits but whose tag is missing (a broken driver) is named as not possible. The rest is named with the
+path of the whole guide on the machine, `~/.scaleout/guide.md`. New Claude Code sessions on the orchestrator get the first
+paragraph and the section titles, so they know where to send what. Guides are yours: they are not part of this repository.
+
 ## Skills sync
 
 `~/.claude/skills`, `~/.claude/agents` and `~/.claude/commands` on the orchestrator are copied to nodes automatically before a

@@ -852,6 +852,49 @@ class E2E(unittest.TestCase):
         self.assertIn("gpu", m)
         self.assertGreaterEqual(float(m["swap_gb"]), 0)
 
+    def test_99j_machine_guide(self):
+        """A machine's guide: what a job is told depends on the task and on what the machine has at that moment."""
+        cfg = so.load_cfg()
+        text = ("# title\n\nA card.\n\n## Emulator\n<!-- needs: gpu -->\n<!-- when: emulator|apk -->\nUse -gpu host.\n\n"
+                "## Blender\n<!-- when: blender -->\nUse CUDA.\n\n## Always\nBe kind.\n")
+        up, down = {"os": "Linux", "caps": ["gpu"]}, {"os": "Linux", "caps": []}
+        so.GUIDES.mkdir(parents=True, exist_ok=True)
+        f = so.GUIDES / "n1.md"
+        try:
+            self.assertEqual(so.guide_for(cfg, "n1", "x", up), ("", []))
+            f.write_text(text)
+            about, titles = so.guide_for(cfg, "n1", "Build the APK.", up, "~/g.md")
+            self.assertEqual(titles, ["Emulator", "Always"])
+            self.assertIn("A card.", about); self.assertIn("Use -gpu host.", about); self.assertNotIn("<!--", about); self.assertNotIn("# title", about)
+            self.assertNotIn("CUDA", about); self.assertIn("~/g.md, read it before you do one of these: Blender", about)
+            for other in ("Run the tests. Do not start an emulator.", "에뮬레이터 없이 돌린다. Start no emulator: 쓰지 않는다.", "Read the capkapk file."):
+                self.assertEqual(so.guide_for(cfg, "n1", other, up, "~/g.md")[1], ["Always"], other)
+            about, titles = so.guide_for(cfg, "n1", "Build the APK.", down, "~/g.md")
+            self.assertEqual(titles, ["Always"])
+            self.assertIn("Emulator (no gpu)", about); self.assertNotIn("-gpu host", about)
+            self.assertEqual(so.guide_for(cfg, "n1", "Run the unit tests.", up)[1], ["Emulator", "Blender", "Always"], "no copy on the machine: all of it")
+            f.write_text("<!-- needs: gpu -->\nA card.\n")
+            self.assertEqual(so.guide_for(cfg, "n1", "x", down)[0], "")
+            self.assertIn("A card.", so.guide_for(cfg, "n1", "x", up)[0])
+            f.write_text(text)
+            rules = so.guide_rules(cfg)
+            self.assertIn("(`n1`): A card. Sections: Emulator (`--tags gpu`", rules); self.assertNotIn("CUDA", rules)
+            # a real job: its task carries what fits, the whole guide is on the node, the text scaleout adds does not count as the task
+            f.write_text(text.replace("needs: gpu", "needs: n1"))
+            for task, want in (("Build the apk.", True), ("Say hello.", False)):
+                jid = so.submit_job(cfg, task, node="n1", pin=True)
+                so.tick(); settle(); so.tick()
+                j = so.load_job(jid)
+                told = (HOMES["n1"] / ".scaleout/jobs" / jid / "prompt.md").read_text()
+                self.assertEqual(("Use -gpu host." in told, "Be kind." in told), (want, True))
+                self.assertEqual(j["guide"], ["Emulator", "Always"] if want else ["Always"])
+            self.assertIn("Use CUDA.", (HOMES["n1"] / ".scaleout/guide.md").read_text())
+            so.cmd_guide(argparse.Namespace(node="n1", file=None, task=None, off=True))
+            self.assertFalse(f.exists()); self.assertFalse((HOMES["n1"] / ".scaleout/guide.md").exists())
+        finally:
+            if f.exists():
+                f.unlink()
+
     def test_99c_stale_tunnel_freed(self):
         # a node that slept leaves its reverse tunnel's sshd session holding the port: free it after a minute
         cfg = so.load_cfg()

@@ -186,6 +186,10 @@ caps() {   # what this machine can run, as tags a job may ask for: an Android em
 verb="${1:-}"; shift || true
 case "$verb" in
   version) echo "$VERSION" ;;
+  guide)   # the machine's guide on stdin (empty removes it): jobs read it at ~/.scaleout/guide.md
+    cat > "$B/guide.md.new"
+    if [ -s "$B/guide.md.new" ]; then mv -f "$B/guide.md.new" "$B/guide.md"; else rm -f "$B/guide.md.new" "$B/guide.md"; fi
+    echo ok ;;
   metrics)
     printf '{"os":"%s","arch":"%s","host":"%s","mem_free_pct":%s,"mem_total_gb":%s,"swap_gb":%s,"disk_free_gb":%s,"work_free_gb":%s,"load":%s,"cpus":%s,"gpu":%s,"running":%s,"queued":%s,"runner":%s,"agents":%s,"devices":%s,"claude":%s,"caps":%s,"skills_hash":"%s","version":"%s"}\n' \
       "$(j "$OS")" "$(uname -m)" "$(j "$(hostname)")" "$(mem_free_pct)" "$(mem_total_gb)" "$(swap_gb)" "$(disk_free_gb "$HOME")" \
