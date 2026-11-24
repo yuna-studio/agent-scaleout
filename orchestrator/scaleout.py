@@ -1297,7 +1297,7 @@ def job_kind(j: Dict[str, Any]) -> str:
     return ",".join(sorted(t for t in (j.get("tags") or []) if t in DEFAULT_JOB_GB)) or "default"
 
 
-_LEARNED: Dict[str, Any] = {"t": 0, "v": {}}
+_LEARNED: Dict[str, Any] = {"t": 0, "v": {}, "linux": set()}
 
 
 def learned_mem(node: str, kind: str) -> Optional[float]:
@@ -1308,11 +1308,12 @@ def learned_mem(node: str, kind: str) -> Optional[float]:
         since = now() - 14 * 86400
         xj = [x for x in all_jobs() if x.get("status") == "done" and x.get("mem_mb") and x.get("node") and x.get("created", 0) >= since and not x.get("bench")]
         own = {x["node"] for x in xj if x.get("mem_own")}
-        own |= {k for k, nd in load_cfg()["nodes"].items() if nd.get("os") == "Linux"}   # measured there from now on
+        linux = {k for k, nd in load_cfg()["nodes"].items() if nd.get("os") == "Linux"}
+        own |= linux      # measured there from now on
         for x in xj:
             if x.get("mem_own") or x["node"] not in own:
                 v.setdefault((x["node"], job_kind(x)), []).append(x["mem_mb"] / 1024)
-        _LEARNED.update(t=now(), v=v)
+        _LEARNED.update(t=now(), v=v, linux=linux)
     xs = sorted(_LEARNED["v"].get((node, kind), []))
     return xs[min(len(xs) - 1, int(round(0.9 * (len(xs) - 1))))] if len(xs) >= 3 else None
 
@@ -1322,9 +1323,10 @@ def job_mem_gb(j: Dict[str, Any], node: str) -> float:
         return float(j["mem_gb"])
     kind = job_kind(j)
     got = learned_mem(node, kind)
-    if got:
-        return max(1.0, got)
-    return max([DEFAULT_JOB_GB[t] for t in kind.split(",") if t in DEFAULT_JOB_GB] or [DEFAULT_GB])
+    base = max([DEFAULT_JOB_GB[t] for t in kind.split(",") if t in DEFAULT_JOB_GB] or [DEFAULT_GB])
+    if node in _LEARNED["linux"]:   # only what a job's own processes took: jobs differ more than that, so leave room above and below
+        return max(base, got) if got else base + 3.0
+    return max(1.0, got) if got else base
 
 
 def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[str, Any]], load: Dict[str, int],

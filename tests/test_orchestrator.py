@@ -1030,6 +1030,11 @@ class E2E(unittest.TestCase):
                 done(14 * 1024, False)
             so._LEARNED["t"] = 0
             self.assertIsNone(so.learned_mem("n2", "default"), "a Linux node drops the old samples at once")
+            self.assertEqual(so.job_mem_gb({"id": "x", "tags": []}, "n2"), so.DEFAULT_GB + 3)
+            for _ in range(3):
+                done(700, True)
+            so._LEARNED["t"] = 0
+            self.assertEqual(so.job_mem_gb({"id": "x", "tags": []}, "n2"), so.DEFAULT_GB, "never below the default")
         finally:
             for i in ids:
                 (so.STATE_DIR / "jobs" / f"{i}.json").unlink()
