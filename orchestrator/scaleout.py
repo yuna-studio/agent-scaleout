@@ -34,7 +34,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "0.9.11"
+VERSION = "0.9.12"
 HOME = Path.home()
 CONF_DIR = Path(os.environ.get("SCALEOUT_CONF", HOME / ".config" / "scaleout"))
 STATE_DIR = Path(os.environ.get("SCALEOUT_STATE", HOME / ".local" / "state" / "scaleout"))
@@ -50,7 +50,8 @@ E_OK, E_JOB_FAILED, E_RUNNING, E_UNREACHABLE, E_USAGE, E_NOT_FOUND = 0, 1, 2, 3,
 DEFAULTS: Dict[str, Any] = {
     "min_free_disk_gb": 5,       # do not dispatch to a node with less free disk
     "min_free_mem_pct": 15,      # ... or less free memory
-    "cleanup_below_disk_gb": 8,  # ask the node to reclaim disk below this
+    "cleanup_below_disk_gb": 12,  # ask the node to reclaim disk below this; above min_free_disk_gb + what a heavy job fills (4),
+                                  # or a node refuses heavy jobs and nothing frees the disk for them
     "cleanup_target_disk_gb": 20,  # ... and to drop idle repo work trees (least recently used first) until this much is free
     "job_timeout_min": 180,
     "check_model": "",           # the model for jobs that only check and report (is_check); empty: the node's own model
@@ -1300,12 +1301,16 @@ _LEARNED: Dict[str, Any] = {"t": 0, "v": {}}
 
 
 def learned_mem(node: str, kind: str) -> Optional[float]:
-    """p90 of the memory recent finished jobs of this kind added on this node (needs 3 samples)."""
+    """p90 of the memory recent finished jobs of this kind took on this node (needs 3 samples). Where a node measures a job's own
+    processes only those samples count: the growth of the whole machine also holds what the jobs beside it took."""
     if now() - _LEARNED["t"] > 60:
         v: Dict[Tuple[str, str], List[float]] = {}
         since = now() - 14 * 86400
-        for x in all_jobs():
-            if x.get("status") == "done" and x.get("mem_mb") and x.get("node") and x.get("created", 0) >= since and not x.get("bench"):
+        xj = [x for x in all_jobs() if x.get("status") == "done" and x.get("mem_mb") and x.get("node") and x.get("created", 0) >= since and not x.get("bench")]
+        own = {x["node"] for x in xj if x.get("mem_own")}
+        own |= {k for k, nd in load_cfg()["nodes"].items() if nd.get("os") == "Linux"}   # measured there from now on
+        for x in xj:
+            if x.get("mem_own") or x["node"] not in own:
                 v.setdefault((x["node"], job_kind(x)), []).append(x["mem_mb"] / 1024)
         _LEARNED.update(t=now(), v=v)
     xs = sorted(_LEARNED["v"].get((node, kind), []))
@@ -1573,6 +1578,8 @@ def collect(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[str,
                 j["check"] = dict(zip(("pass", "fail", "blocked"), map(int, found[-1])))
         if s.get("mem_mb") is not None:
             j["mem_mb"] = int(s.get("mem_mb") or 0)
+        if int(s.get("own_mb") or 0):
+            j["mem_mb"], j["mem_own"] = int(s["own_mb"]), True
         if rc != 0:
             err = n.ctl("err", j["id"], "60").stdout
             (STATE_DIR / "results" / f"{j['id']}.err").write_bytes(err)

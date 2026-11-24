@@ -999,6 +999,47 @@ class E2E(unittest.TestCase):
         self.assertIn('--model $model', (ROOT / "node/unix/runner.sh").read_text())
         self.assertIn("MODEL=%s\\nEFFORT=%s", (ROOT / "node/unix/ctl.sh").read_text())
 
+    def test_99g_own_memory(self):
+        """Once a node measures a job's own processes, what the whole machine grew by no longer decides what a job is reserved."""
+        cfg = so.load_cfg()
+        ids = []
+        def done(mb, own):
+            j = so.load_job(so.submit_job(cfg, "memory sample", node="n2"))
+            j.update({"status": "done", "node": "n2", "mem_mb": mb, "finished_at": so.now(), **({"mem_own": True} if own else {})})
+            so.save_job(j); ids.append(j["id"])
+        try:
+            for _ in range(4):
+                done(14 * 1024, False)
+            so._LEARNED["t"] = 0
+            self.assertGreaterEqual(so.learned_mem("n2", "default"), 14)
+            for _ in range(2):
+                done(1500, True)
+            so._LEARNED["t"] = 0
+            self.assertIsNone(so.learned_mem("n2", "default"), "too few of the right kind: the default, not the old samples")
+            done(2048, True)
+            so._LEARNED["t"] = 0
+            self.assertEqual(so.learned_mem("n2", "default"), 2.0)
+        finally:
+            for i in ids:
+                (so.STATE_DIR / "jobs" / f"{i}.json").unlink()
+            so._LEARNED["t"] = 0
+        ids.clear()
+        cfg = so.load_cfg(); was = cfg["nodes"]["n2"].get("os"); cfg["nodes"]["n2"]["os"] = "Linux"; so.save_cfg(cfg)
+        try:
+            for _ in range(4):
+                done(14 * 1024, False)
+            so._LEARNED["t"] = 0
+            self.assertIsNone(so.learned_mem("n2", "default"), "a Linux node drops the old samples at once")
+        finally:
+            for i in ids:
+                (so.STATE_DIR / "jobs" / f"{i}.json").unlink()
+            cfg = so.load_cfg(); cfg["nodes"]["n2"]["os"] = was; so.save_cfg(cfg); so._LEARNED["t"] = 0
+        ctl = (ROOT / "node/unix/ctl.sh").read_text()
+        self.assertIn('own_peak "$1"; printf', ctl)
+        d = so.DEFAULTS if hasattr(so, "DEFAULTS") else None
+        if d:
+            self.assertGreater(d["cleanup_below_disk_gb"], d["min_free_disk_gb"] + 4)
+
     def test_99e_whatif_compactions(self):
         """A session that compacted at its own window is not free at a larger one: it goes on and compacts there later."""
         run = lambda n, start, step: [start + i * step for i in range(n)]
