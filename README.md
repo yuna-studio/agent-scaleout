@@ -255,6 +255,14 @@ scaleout tokens on [--window 300k] [--auto]   # off · status (default) · tune
 - **Working rules** for every new session (one task per session, long output to files, batched calls, verbose work to the
   pool), and forks are refused from sessions above `--fork-max` (100k): a fork re-reads the parent's whole context on
   every step. Node jobs get a short version through `--append-system-prompt`.
+- **No skill list in node jobs** (about 11k tokens in every request of a job). Kept when the task names one of the node's
+  skills, says "skill", or is about documents, charts or pages; `JOB_SKILLS=on` in `node.conf` keeps it always.
+- **Checks on a cheaper model** (off by default): `scaleout config check_model claude-sonnet-5-5`. A job that says it changes no
+  code and only runs tests, builds or E2E (or is sent with `--check`) gets `--model` and has to see a failure twice, with
+  evidence, before reporting it; fixes, reviews and play tests stay on the node's own model (`--model default` forces that).
+  It runs at `check_effort` (high unless set otherwise): a machine may set an effort for its own model only, and the other one
+  would fall to its default. The session that looks into a failure records what it was, `scaleout check JOB real=1 false=0`, and `scaleout check` shows
+  how many reported failures were real. When that model is limited or not available, the job runs again on the node's own.
 - **Self-tuning (`--auto`).** Once a day the daemon replays the last 7 days at each window and charges every compaction
   what it costs, in cache reads at API prices: reading the context once more, writing the summary, putting the new context
   in the cache, and re-reading files the session had read before it (measured in the transcripts; assumed until three
@@ -361,6 +369,7 @@ scaleout rename NAME [NEW]                     # your own name for a machine (or
 scaleout remove NAME · nodes · status [NAME…] · doctor NAME · update [NAME…] · local on|off [--max-jobs N]
 scaleout submit|run [-f FILE] [-w NODE] [-a AGENT] [-d DIR] [--sync DIR] [--repo DIR [--apply]] [--tags a,b] [--mem GB] [--cpu N] [--timeout MIN]
 scaleout wait|result|logs|cancel JOB · jobs [-n N] · gc
+scaleout check [JOB real=N false=N missed=N]      # checks the check model ran: were the failures it reported real?
 scaleout exec NAME -- CMD · cleanup [NAME…] [--aggressive|--deep] · sync-skills [NAME…]
 scaleout config [KEY [VALUE]] [--node NAME] · tick · daemon · install-daemon
 scaleout runner add|remove|ls [NAME] --org ORG|--repo OWNER/REPO [--labels L] [--runner-name N]

@@ -50,6 +50,10 @@ corrections, small steps. Handing off costs a little (the receiving agent loads 
   - A job that needs bash scripts or `--repo` does not go to a Windows node.
   - Results that differ by OS (golden images, native binaries) → tag the OS they must match.
 - Memory decides how many jobs a node runs at once (no fixed limit on simulators or emulators). Pass `--mem <GB>` when a job needs more than usual, e.g. several simulators.
+- A job that only runs something and reports (E2E, tests, builds, screenshots) says so in its first lines ("do not change code,
+  report only") or is sent with `--check`: where `check_model` is set it runs on that cheaper model. Work that needs changes or
+  judgement (fixing, reviews, play tests) is left as it is; `--model default` forces the node's own model.
+  Its result ends with `[check]`: look at the evidence of each failure, then record `scaleout check <job> real=<n> false=<n>`.
 - Write the task so it stands alone: what to do, which folder, how to check it. The node's agent has not seen this conversation.
 - A job waits in the queue while no machine has room (memory, CPU load, a free phone). `scaleout run`/`wait` print why, and
   `scaleout jobs` shows it as `waits: …`. Waiting is normal: do not cancel and resubmit, it starts as soon as a machine has room.

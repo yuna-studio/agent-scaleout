@@ -944,6 +944,139 @@ class E2E(unittest.TestCase):
         st = so.refresh_metrics(cfg, [name], max_age=0)[name]
         self.assertEqual(so.node_health(cfg, name, st), "ok", "answers in time again: back to ok")
 
+    def test_99d_check_model(self):
+        """Jobs that only check and report go to check_model; what makes or judges stays. Their failures get counted, real or not."""
+        yes = ("앱 E2E(Maestro)를 iOS 시뮬레이터에서 dev 로 돌리고 결과만 보고해 주세요. 앱 코드 · 흐름은 고치지 마세요(실패하면 원인과 스크린샷만).",
+               "안드로이드 에뮬레이터 E2E 를 돌려 줘. 앱 코드는 고치지 말고, 실패하면 원인(앱 · 시험 · 환경)을 갈라 보고만 해.",
+               "Run the full test suite in web/. Do not change code, report only.", "# 전체 테스트 · arm64 APK\n코드는 고치지 않는다.",
+               "# 통합 E2E — iOS 전체 시나리오\n흐름(yaml)은 고쳐도 된다. 앱 코드(app/lib) · 서버는 고치지 않는다.",
+               "에뮬레이터 E2E 를 돌려 줘. 앱 코드는 고치지 말고 보고만 해. 작업 사본은 브랜치 fix/notify 다.")
+        no = ("게임별 주간 순위를 만들어 주세요. 서버 코드는 고치지 마세요. 테스트도 돌립니다.", "# AI 플레이테스트\n에뮬레이터에서 해 보고 평가한다. 코드는 고치지 않는다.",
+              "폰에 새 게임이 있다. 아무 설명도 듣지 못했다. 에뮬레이터에서 해 보고 솔직한 소감. 코드는 고치지 않는다.",
+              "E2E 를 돌리고 실패한 것은 고쳐 주세요.", "Review the tests in api/. Do not change code.", "에뮬레이터에서 돌려 본 뒤 남은 것을 고치는 일입니다. 서버 코드는 고치지 마세요.",
+              "# E2E 도구 마무리 · 충돌 풀기\n앱 코드는 고치지 않는다.", "E2E 시나리오를 돌려 통과시켜 주세요.")
+        for x in yes:
+            self.assertTrue(so.is_check(x), x)
+        for x in no:
+            self.assertFalse(so.is_check(x), x)
+        cfg = so.load_cfg()
+        self.assertEqual(so.pick_model(cfg, yes[0], "default", "", "auto", False), ("", ""), "off until check_model is set")
+        cfg["defaults"]["check_model"] = "claude-sonnet-5-5"
+        pick = lambda p, agent="default", resume="", model="auto", check=False: so.pick_model(cfg, p, agent, resume, model, check)
+        self.assertEqual(pick(yes[0]), ("claude-sonnet-5-5", "check"))
+        self.assertEqual(pick(no[0]), ("", ""))
+        self.assertEqual(pick(no[3], check=True), ("claude-sonnet-5-5", "check"))
+        self.assertEqual(pick(yes[0], model="default"), ("", ""))
+        self.assertEqual(pick(no[0], model="opus; ls"), ("opusls", "asked"))
+        self.assertEqual(pick(yes[0], resume="abc"), ("", ""))
+        self.assertEqual(pick(yes[0], agent="codex"), ("", ""))
+        self.assertEqual(so.CHECK_LINE.findall("끝\n`SCALEOUT-CHECK: pass=12 fail=1 blocked=0`"), [("12", "1", "0")])
+        jid = so.submit_job(so.load_cfg(), yes[0], node="n1", agent="default", model="auto")
+        j = so.load_job(jid)
+        self.assertNotIn("model", j)
+        j.update({"model": "claude-sonnet-5-5", "model_why": "check", "status": "done", "finished_at": so.now(), "cost_usd": 0.5,
+                  "check": {"pass": 3, "fail": 2, "blocked": 0}, "node": None})
+        so.save_job(j)
+        self.assertIn(f"scaleout check {jid} real=<n> false=<n>", so.check_text(j))
+        so.cmd_check(argparse.Namespace(job=jid, counts=["real=1", "false=1"], days=14))
+        r = so.check_rows(14)["claude-sonnet-5-5"]
+        self.assertEqual((r["jobs"], r["fail"], r["real"], r["false"], r["open"]), (1, 2, 1, 1, 0))
+        self.assertIn("real=1 false=1", so.check_text(so.load_job(jid)))
+        with self.assertRaises(SystemExit):
+            so.cmd_check(argparse.Namespace(job=jid, counts=["maybe=1"], days=14))
+        self.assertEqual(so.job_answer(b'{"result":"x\\nSCALEOUT-CHECK: pass=1 fail=0 blocked=2"}').splitlines()[-1], "SCALEOUT-CHECK: pass=1 fail=0 blocked=2")
+        self.assertEqual((so.pick_effort(cfg), so.pick_effort(cfg, "xhigh")), ("high", "xhigh"))
+        with self.assertRaises(SystemExit):
+            so.pick_effort(cfg, "huge")
+        self.assertEqual(so.check_name({"model": "m", "effort": "high"}), "m (high)")
+        ej = so.load_job(so.submit_job(cfg, yes[0], node="n1"))
+        self.assertEqual((ej["model"], ej["model_why"], ej["effort"]), ("claude-sonnet-5-5", "check", "high"), "never without an effort")
+        so.cmd_cancel(argparse.Namespace(job=ej["id"]))
+        pj = so.load_job(so.submit_job(cfg, no[0], node="n1"))
+        self.assertEqual((pj.get("model"), pj.get("effort")), (None, None), "the node's own model keeps its own effort")
+        so.cmd_cancel(argparse.Namespace(job=pj["id"]))
+        self.assertIn('--effort $effort', (ROOT / "node/unix/runner.sh").read_text())
+        self.assertIn('--model $model', (ROOT / "node/unix/runner.sh").read_text())
+        self.assertIn("MODEL=%s\\nEFFORT=%s", (ROOT / "node/unix/ctl.sh").read_text())
+
+    def test_99g_own_memory(self):
+        """Once a node measures a job's own processes, what the whole machine grew by no longer decides what a job is reserved."""
+        cfg = so.load_cfg()
+        ids = []
+        def done(mb, own):
+            j = so.load_job(so.submit_job(cfg, "memory sample", node="n2"))
+            j.update({"status": "done", "node": "n2", "mem_mb": mb, "finished_at": so.now(), **({"mem_own": True} if own else {})})
+            so.save_job(j); ids.append(j["id"])
+        try:
+            for _ in range(4):
+                done(14 * 1024, False)
+            so._LEARNED["t"] = 0
+            self.assertGreaterEqual(so.learned_mem("n2", "default"), 14)
+            for _ in range(2):
+                done(1500, True)
+            so._LEARNED["t"] = 0
+            self.assertIsNone(so.learned_mem("n2", "default"), "too few of the right kind: the default, not the old samples")
+            done(2048, True)
+            so._LEARNED["t"] = 0
+            self.assertEqual(so.learned_mem("n2", "default"), 2.0)
+        finally:
+            for i in ids:
+                (so.STATE_DIR / "jobs" / f"{i}.json").unlink()
+            so._LEARNED["t"] = 0
+        ids.clear()
+        cfg = so.load_cfg(); was = cfg["nodes"]["n2"].get("os"); cfg["nodes"]["n2"]["os"] = "Linux"; so.save_cfg(cfg)
+        try:
+            for _ in range(4):
+                done(14 * 1024, False)
+            so._LEARNED["t"] = 0
+            self.assertIsNone(so.learned_mem("n2", "default"), "a Linux node drops the old samples at once")
+            self.assertEqual(so.job_mem_gb({"id": "x", "tags": []}, "n2"), so.DEFAULT_GB + 3)
+            for _ in range(3):
+                done(700, True)
+            so._LEARNED["t"] = 0
+            self.assertEqual(so.job_mem_gb({"id": "x", "tags": []}, "n2"), so.DEFAULT_GB, "never below the default")
+        finally:
+            for i in ids:
+                (so.STATE_DIR / "jobs" / f"{i}.json").unlink()
+            cfg = so.load_cfg(); cfg["nodes"]["n2"]["os"] = was; so.save_cfg(cfg); so._LEARNED["t"] = 0
+        ctl = (ROOT / "node/unix/ctl.sh").read_text()
+        self.assertIn('own_peak "$1"; printf', ctl)
+        d = so.DEFAULTS if hasattr(so, "DEFAULTS") else None
+        if d:
+            self.assertGreater(d["cleanup_below_disk_gb"], d["min_free_disk_gb"] + 4)
+
+    def test_99e_whatif_compactions(self):
+        """A session that compacted at its own window is not free at a larger one: it goes on and compacts there later."""
+        run = lambda n, start, step: [start + i * step for i in range(n)]
+        ctx = run(27, 60000, 10000) + run(27, 60000, 10000) + run(27, 60000, 10000)     # compacted twice, at 320k
+        reqs = {"s": [(str(i), c) for i, c in enumerate(ctx)]}
+        small, big = so.whatif(reqs, 250000, 60000), so.whatif(reqs, 400000, 60000)
+        self.assertGreaterEqual(big[1], 2, "the 780k it grew do not fit in one 400k window")
+        self.assertGreater(small[1], big[1])
+        self.assertGreater(big[0], small[0], "a larger window reads more on every step")
+
+    def test_99f_job_skills(self):
+        """With token saving on, a job loads no skill list unless its task names a skill or is about documents or charts."""
+        src = (ROOT / "node/unix/runner.sh").read_text()
+        fn = src[src.index("skills_off() {"):src.index("run_job() {")]
+        home = TMP / "skills-home"
+        (home / ".claude/skills/code-gen").mkdir(parents=True, exist_ok=True)
+        (home / ".claude/skills/synced").mkdir(exist_ok=True)
+        prompt = TMP / "skills-prompt.md"
+
+        def off(text, **env):
+            prompt.write_text(text)
+            r = subprocess.run(["bash", "-c", fn + f'\nskills_off "{prompt}"'], env={"PATH": os.environ["PATH"], "HOME": str(home), "TOKEN_SAVING": "1", **env})
+            return r.returncode == 0
+
+        self.assertTrue(off("앱 화면을 고치고 테스트를 돌려 보고해 주세요."))
+        self.assertTrue(off("Fix the login test. Files are synced already."))   # `synced` is a folder of skills, not a skill
+        for text in ("code-gen 으로 화면을 만들어 주세요", "e2e 스킬대로", "use the review Skill", "지표 차트를 그려", "report.pdf 로 저장"):
+            self.assertFalse(off(text), text)
+        self.assertFalse(off("앱 화면을 고쳐 주세요.", TOKEN_SAVING="0"))
+        self.assertFalse(off("앱 화면을 고쳐 주세요.", JOB_SKILLS="on"))
+        self.assertIn('skills_off "$d/prompt.md" && cmd="$cmd --disable-slash-commands"', src)
+
     def test_99g_token_saving(self):
         """scaleout tokens: the window goes into Claude's settings here and on the nodes (node.conf too, so jobs get the
         rules); before a compaction a ledger is taken from the transcript, after it the notes and ledger come back word for

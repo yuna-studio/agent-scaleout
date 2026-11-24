@@ -34,7 +34,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "0.9.9"
+VERSION = "0.9.12"
 HOME = Path.home()
 CONF_DIR = Path(os.environ.get("SCALEOUT_CONF", HOME / ".config" / "scaleout"))
 STATE_DIR = Path(os.environ.get("SCALEOUT_STATE", HOME / ".local" / "state" / "scaleout"))
@@ -50,9 +50,12 @@ E_OK, E_JOB_FAILED, E_RUNNING, E_UNREACHABLE, E_USAGE, E_NOT_FOUND = 0, 1, 2, 3,
 DEFAULTS: Dict[str, Any] = {
     "min_free_disk_gb": 5,       # do not dispatch to a node with less free disk
     "min_free_mem_pct": 15,      # ... or less free memory
-    "cleanup_below_disk_gb": 8,  # ask the node to reclaim disk below this
+    "cleanup_below_disk_gb": 12,  # ask the node to reclaim disk below this; above min_free_disk_gb + what a heavy job fills (4),
+                                  # or a node refuses heavy jobs and nothing frees the disk for them
     "cleanup_target_disk_gb": 20,  # ... and to drop idle repo work trees (least recently used first) until this much is free
     "job_timeout_min": 180,
+    "check_model": "",           # the model for jobs that only check and report (is_check); empty: the node's own model
+    "check_effort": "high",      # the effort of a job on another model than the node's: a machine may set its effort for its own model only
     "stall_min": 5,              # running job whose heartbeat is older than this is considered dead
     "node_wait_min": 10,
     "mem_reserve_gb": 1.5,
@@ -1125,7 +1128,9 @@ def repo_name(root: str) -> str:
 
 def submit_job(cfg: Dict[str, Any], prompt: str, node: Optional[str] = None, agent: str = "default", workdir: str = "",
                sync: str = "", tags: Optional[List[str]] = None, timeout: Optional[int] = None, pull: bool = True,
-               resume: str = "", force: bool = False, repo: str = "", apply: bool = False, mem_gb: float = 0, cpu: int = 0) -> str:
+               resume: str = "", force: bool = False, repo: str = "", apply: bool = False, mem_gb: float = 0, cpu: int = 0,
+               model: str = "auto", check: bool = False, effort: str = "") -> str:
+    model, why = pick_model(cfg, prompt, agent, resume, model, check)
     if resume:
         resume = re.sub(r"[^A-Za-z0-9-]", "", resume)
         f = session_file(resume)
@@ -1152,8 +1157,65 @@ def submit_job(cfg: Dict[str, Any], prompt: str, node: Optional[str] = None, age
                        "repo_base": repo_snapshot(top, jid), "apply": apply}
     save_job({**repo_fields, "id": jid, "status": "queued", "created": now(), "created_ns": time.time_ns(), "node": None, "want_node": node, "agent": agent,
               "workdir": workdir, "sync": sync, "pull": pull, "tags": tags or [], "attempts": 0, "resume": resume, "mem_gb": mem_gb, "cpu": cpu,
+              **({"model": model, "model_why": why, "effort": pick_effort(cfg, effort)} if model else {"effort": pick_effort(cfg, effort)} if effort else {}),
               "timeout": timeout or cfg["defaults"]["job_timeout_min"], "history": []})
     return jid
+
+
+# A job that only runs something and reports (tests, builds, E2E): it says no code is changed, names such work at its start,
+# and asks neither for something to be made nor for a judgement (play tests, reviews). Anything unclear stays on the node's model.
+CHECK_NOEDIT = re.compile(r"(코드|소스|파일|제품|레포|저장소|흐름)[^.\n]{0,24}?(고치지|바꾸지|수정하지|건드리지) ?(않|말|마)|"
+                          r"(보고|검사|확인|실행|테스트|시험|빌드|돌리기)만 ?(하|해|돌|한|합|$)|"
+                          r"\b(do not|don't|never|without) (edit|chang|modif|fix|touch)\w*|no code changes|report only", re.I | re.M)
+CHECK_WORK = re.compile(r"e2e|에뮬|시뮬|maestro|playwright|테스트|시험|빌드|커버리지|analyze|\blint|\bapk\b|\btests?\b|\bbuilds?\b|emulator|simulator", re.I)
+CHECK_MAKE = re.compile(r"만들어|만드(는|세요)|구현|고쳐(?!도)|고치(세요|십시오|는 (일|작업)|고 )|고칩|추가(해|하|합)|바꿔|바꾸(세요|고 )|옮겨|넓혀|리팩터|다듬|붙여|개발|"
+                        r"충돌|생성 파일|마무리|맞추기|고침|\bimplement|\brefactor|\bfix(es)?\b(?!/)|\badd\b|\bcreate\b", re.I)
+CHECK_JUDGE = re.compile(r"플레이 ?테스트|페르소나|play ?test|게임성|재미|소감|솔직|첫인상|아무 설명도|평가|리뷰|검토|화면 점검|균형|조사|리서치|분석해|"
+                         r"root cause|\breview|\bevaluat|\bresearch", re.I)
+CHECK_RULES = """
+(agent-scaleout) This job is a check. Before you report a failure, run that case once more and rule out the test itself and
+the environment (device not ready, another branch's build, slow network, leftover data, another job on the same device).
+Report a failure only when it happened twice, with what you did, what was expected, what happened, and the evidence (file name
+of the screenshot or the log lines), and say whether it is the app, the test or the environment. A case you could not run is
+blocked, never passed. End your answer with exactly one line, `fail` counting only failures of the app:
+SCALEOUT-CHECK: pass=<n> fail=<n> blocked=<n>
+"""
+CHECK_LINE = re.compile(r"SCALEOUT-CHECK:\W*pass\s*=\s*(\d+)\W+fail\s*=\s*(\d+)\W+blocked\s*=\s*(\d+)", re.I)
+
+
+CHECK_NO_PRODUCT = re.compile(r"(앱|제품|서버)[^.\n]{0,60}?(고치지|바꾸지|수정하지|건드리지) ?(않|말|마)|(app|product|server) code[^.\n]{0,40}(is not|not to be|do not)", re.I)
+
+
+def is_check(prompt: str) -> bool:
+    plain = re.sub(r"[^.\n]{0,40}?((고치|바꾸|수정하|건드리|만들|커밋하|추가하)지|do not|don't|never)[^.\n]*", " ", prompt[:900], flags=re.I)
+    if CHECK_MAKE.search(plain[:250]) or CHECK_JUDGE.search(prompt[:600]):
+        return False
+    if re.search(r"e2e", prompt[:160], re.I):    # an E2E run may repair its own flows; the product stays as it is
+        return bool(CHECK_NOEDIT.search(prompt[:12000]) or CHECK_NO_PRODUCT.search(prompt[:12000]))
+    if not CHECK_WORK.search(prompt[:900]):
+        return False
+    return bool(CHECK_NOEDIT.search(prompt[:500]) or (CHECK_NOEDIT.search(prompt[:3000]) and not CHECK_MAKE.search(plain)))
+
+
+def pick_model(cfg: Dict[str, Any], prompt: str, agent: str, resume: str, model: str, check: bool) -> Tuple[str, str]:
+    """The model of a Claude Code job and why ("" = the node's own). No model call: the rule reads the task text."""
+    if agent not in ("default", "claude") or resume:
+        return "", ""
+    if model and model != "auto":
+        m = re.sub(r"[^A-Za-z0-9._-]", "", model)
+        return ("", "") if m == "default" else (m, "check" if check else "asked")
+    m = re.sub(r"[^A-Za-z0-9._-]", "", str(cfg["defaults"].get("check_model") or ""))
+    return (m, "check") if m and (check or is_check(prompt)) else ("", "")
+
+
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+def pick_effort(cfg: Dict[str, Any], effort: str = "") -> str:
+    e = effort or str(cfg["defaults"].get("check_effort") or "")
+    if e and e not in EFFORTS:
+        die(E_USAGE, f"effort '{e}': use {' '.join(EFFORTS)}")
+    return e
 
 
 DEVICE_TAGS = ("android-device", "ios-device")
@@ -1235,18 +1297,23 @@ def job_kind(j: Dict[str, Any]) -> str:
     return ",".join(sorted(t for t in (j.get("tags") or []) if t in DEFAULT_JOB_GB)) or "default"
 
 
-_LEARNED: Dict[str, Any] = {"t": 0, "v": {}}
+_LEARNED: Dict[str, Any] = {"t": 0, "v": {}, "linux": set()}
 
 
 def learned_mem(node: str, kind: str) -> Optional[float]:
-    """p90 of the memory recent finished jobs of this kind added on this node (needs 3 samples)."""
+    """p90 of the memory recent finished jobs of this kind took on this node (needs 3 samples). Where a node measures a job's own
+    processes only those samples count: the growth of the whole machine also holds what the jobs beside it took."""
     if now() - _LEARNED["t"] > 60:
         v: Dict[Tuple[str, str], List[float]] = {}
         since = now() - 14 * 86400
-        for x in all_jobs():
-            if x.get("status") == "done" and x.get("mem_mb") and x.get("node") and x.get("created", 0) >= since and not x.get("bench"):
+        xj = [x for x in all_jobs() if x.get("status") == "done" and x.get("mem_mb") and x.get("node") and x.get("created", 0) >= since and not x.get("bench")]
+        own = {x["node"] for x in xj if x.get("mem_own")}
+        linux = {k for k, nd in load_cfg()["nodes"].items() if nd.get("os") == "Linux"}
+        own |= linux      # measured there from now on
+        for x in xj:
+            if x.get("mem_own") or x["node"] not in own:
                 v.setdefault((x["node"], job_kind(x)), []).append(x["mem_mb"] / 1024)
-        _LEARNED.update(t=now(), v=v)
+        _LEARNED.update(t=now(), v=v, linux=linux)
     xs = sorted(_LEARNED["v"].get((node, kind), []))
     return xs[min(len(xs) - 1, int(round(0.9 * (len(xs) - 1))))] if len(xs) >= 3 else None
 
@@ -1256,9 +1323,10 @@ def job_mem_gb(j: Dict[str, Any], node: str) -> float:
         return float(j["mem_gb"])
     kind = job_kind(j)
     got = learned_mem(node, kind)
-    if got:
-        return max(1.0, got)
-    return max([DEFAULT_JOB_GB[t] for t in kind.split(",") if t in DEFAULT_JOB_GB] or [DEFAULT_GB])
+    base = max([DEFAULT_JOB_GB[t] for t in kind.split(",") if t in DEFAULT_JOB_GB] or [DEFAULT_GB])
+    if node in _LEARNED["linux"]:   # only what a job's own processes took: jobs differ more than that, so leave room above and below
+        return max(base, got) if got else base + 3.0
+    return max(1.0, got) if got else base
 
 
 def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[str, Any]], load: Dict[str, int],
@@ -1454,7 +1522,9 @@ def dispatch(cfg: Dict[str, Any], j: Dict[str, Any], name: str) -> bool:
         prompt += ("\n\n---\n(agent-scaleout) Save every screenshot, screen recording, log or report you produce into the folder "
                    "given by the SCALEOUT_ARTIFACTS environment variable; it is sent back to the requester automatically. "
                    "List those file names in your final answer.\n").encode()
-    res = n.ctl("submit", j["id"], j.get("agent") or "default", str(j["timeout"]), wd, j.get("resume") or "", input=prompt, timeout=60)
+    if j.get("model") and j.get("model_why") == "check":
+        prompt += ("\n\n---" + CHECK_RULES).encode()
+    res = n.ctl("submit", j["id"], j.get("agent") or "default", str(j["timeout"]), wd, j.get("resume") or "", j.get("model") or "", j.get("effort") or "", input=prompt, timeout=60)
     if res.returncode != 0:
         return False
     j.update({"status": "dispatched", "node": name, "dispatched_at": now(), "last_seen": now(), "node_workdir": wd})
@@ -1497,17 +1567,35 @@ def collect(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[str,
         try:   # Claude Code reports tokens, cost and turns in its JSON answer
             rep = json.loads(out.decode(errors="replace").strip().splitlines()[-1])
             j.update(report_usage(rep))
+            if j.get("model") and rep.get("modelUsage") and not any(j["model"] in m for m in rep["modelUsage"]):
+                j.pop("model"), j.pop("model_why", None), j.pop("effort", None)   # a runner from before an update took it: it ran on the node's own model
             if rep.get("session_id"):   # the context a fresh agent loads before any work: spent only because it ran apart
                 jt = json.loads(n.ctl("job-tokens", str(rep["session_id"]), timeout=60).stdout.decode().strip().splitlines()[-1])
                 j["start_tokens"], j["requests"] = int(jt.get("start") or 0), int(jt.get("requests") or 0)
         except (ValueError, IndexError, AttributeError, TypeError):
             pass
+        if j.get("model_why") == "check":
+            found = CHECK_LINE.findall(job_answer(out))
+            if found:
+                j["check"] = dict(zip(("pass", "fail", "blocked"), map(int, found[-1])))
         if s.get("mem_mb") is not None:
             j["mem_mb"] = int(s.get("mem_mb") or 0)
+        if int(s.get("own_mb") or 0):
+            j["mem_mb"], j["mem_own"] = int(s["own_mb"]), True
         if rc != 0:
             err = n.ctl("err", j["id"], "60").stdout
             (STATE_DIR / "results" / f"{j['id']}.err").write_bytes(err)
-            trouble = agent_trouble(out.decode(errors="replace")[-4000:] + "\n" + err.decode(errors="replace")[-4000:])
+            said = out.decode(errors="replace")[-4000:] + "\n" + err.decode(errors="replace")[-4000:]
+            trouble = agent_trouble(said)
+            if j.get("model") and (trouble or re.search(r"selected model|model .{0,60}(not (exist|available|found)|no access)", said, re.I)):
+                # a limit of that model, or no access to it: the same job on the node's own model, the node keeps taking jobs
+                n.ctl("rm", j["id"])
+                if j.get("repo_wt"):
+                    n.ctl("repo-unlock", j["repo_wt"]); j.pop("repo_wt", None)
+                j["history"].append({"t": now(), "event": "moved", "node": name, "why": f"{j['model']}: {trouble[0] if trouble else 'not available'}, back to the node's model"})
+                j.pop("model"), j.pop("model_why", None), j.pop("effort", None)
+                j.update({"status": "queued", "node": None})
+                return
             if trouble and j.get("agent") not in ("custom", "bench"):
                 use = cfg["nodes"][name].get("agent", "claude") if (j.get("agent") or "default") == "default" else j["agent"]
                 block_agent(name, use, trouble[0], trouble[1])
@@ -1567,6 +1655,16 @@ def collect(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[str,
         j.update({"status": "queued", "node": None})
     elif state in ("missing", "lost"):
         requeue(cfg, j, f"job vanished on {name}")
+
+
+def job_answer(out: bytes) -> str:
+    """The text of a job's answer (Claude Code puts it in JSON)."""
+    raw = out.decode(errors="replace").strip()
+    try:
+        obj = json.loads(raw.splitlines()[-1])
+        return str(obj.get("result") or "") if isinstance(obj, dict) else raw
+    except (ValueError, IndexError):
+        return raw
 
 
 def requeue(cfg: Dict[str, Any], j: Dict[str, Any], why: str) -> None:
@@ -1859,7 +1957,7 @@ def read_prompt(a) -> str:
 def cmd_submit(a) -> None:
     cfg = load_cfg()
     jid = submit_job(cfg, read_prompt(a), node=None if a.node in (None, "auto") else a.node, agent=a.agent,
-                     workdir=a.dir or "", sync=a.sync or "", tags=a.tags.split(",") if a.tags else [], timeout=a.timeout, pull=not a.no_pull, resume=a.resume, force=a.force, repo=a.repo, apply=a.apply, mem_gb=a.mem, cpu=a.cpu)
+                     workdir=a.dir or "", sync=a.sync or "", tags=a.tags.split(",") if a.tags else [], timeout=a.timeout, pull=not a.no_pull, resume=a.resume, force=a.force, repo=a.repo, apply=a.apply, mem_gb=a.mem, cpu=a.cpu, model=a.model, check=a.check, effort=a.effort or "")
     tick()
     print(jid)
 
@@ -1867,16 +1965,16 @@ def cmd_submit(a) -> None:
 def cmd_run(a) -> None:
     cfg = load_cfg()
     jid = submit_job(cfg, read_prompt(a), node=None if a.node in (None, "auto") else a.node, agent=a.agent,
-                     workdir=a.dir or "", sync=a.sync or "", tags=a.tags.split(",") if a.tags else [], timeout=a.timeout, pull=not a.no_pull, resume=a.resume, force=a.force, repo=a.repo, apply=a.apply, mem_gb=a.mem, cpu=a.cpu)
+                     workdir=a.dir or "", sync=a.sync or "", tags=a.tags.split(",") if a.tags else [], timeout=a.timeout, pull=not a.no_pull, resume=a.resume, force=a.force, repo=a.repo, apply=a.apply, mem_gb=a.mem, cpu=a.cpu, model=a.model, check=a.check, effort=a.effort or "")
     print(jid, file=sys.stderr)
     rc, text = wait_job(jid, a.max)
-    print(text + repo_text(load_job(jid)) + artifacts_text(load_job(jid)))
+    print(text + repo_text(load_job(jid)) + artifacts_text(load_job(jid)) + check_text(load_job(jid)))
     sys.exit(rc)
 
 
 def cmd_wait(a) -> None:
     rc, text = wait_job(a.job, a.max)
-    print(text + repo_text(load_job(a.job)) + artifacts_text(load_job(a.job)))
+    print(text + repo_text(load_job(a.job)) + artifacts_text(load_job(a.job)) + check_text(load_job(a.job)))
     sys.exit(rc)
 
 
@@ -1900,6 +1998,74 @@ def artifacts_text(j: Dict[str, Any]) -> str:
     return f"\n\n[artifacts] {j['artifacts_note']}" if j.get("artifacts_note") else ""
 
 
+def check_text(j: Dict[str, Any]) -> str:
+    """Under the answer of a check that a cheaper model ran: what to do with its failures, so that their truth gets counted."""
+    if j.get("model_why") != "check" or j.get("status") not in ("done", "failed"):
+        return ""
+    c = j.get("check")
+    t = f"\n\n[check] run by {check_name(j)}: " + (f"pass {c['pass']} · fail {c['fail']} · blocked {c['blocked']}" if c else "it left no SCALEOUT-CHECK line")
+    if j.get("verdict"):
+        return t + "  (recorded: " + " ".join(f"{k}={v}" for k, v in j["verdict"].items()) + ")"
+    if not c or c["fail"]:
+        t += (f"\n  Look at the evidence of each failure before changing code, then record what it was (costs nothing):"
+              f"\n  scaleout check {j['id']} real=<n> false=<n>     real = a fault there, false = reported but nothing was wrong")
+    if not c or not c["fail"]:
+        t += f"\n  If a fault it passed turns up later: scaleout check {j['id']} missed=<n>"
+    return t
+
+
+def check_name(j: Dict[str, Any]) -> str:
+    return str(j.get("model")) + (f" ({j['effort']})" if j.get("effort") else "")
+
+
+def check_rows(days: int) -> Dict[str, Dict[str, float]]:
+    rows: Dict[str, Dict[str, float]] = {}
+    for j in all_jobs():
+        if j.get("model_why") != "check" or j.get("status") not in ("done", "failed") or j.get("finished_at", 0) < now() - days * 86400:
+            continue
+        r = rows.setdefault(check_name(j), dict.fromkeys(("jobs", "cost", "failed", "noline", "pass", "fail", "blocked", "open", "real", "false", "missed"), 0))
+        c, v = j.get("check") or {}, j.get("verdict") or {}
+        r["jobs"] += 1
+        r["cost"] += float(j.get("cost_usd") or 0)
+        r["failed"] += j["status"] == "failed"
+        r["noline"] += j["status"] == "done" and not c
+        for k in ("pass", "fail", "blocked"):
+            r[k] += c.get(k, 0)
+        for k in ("real", "false", "missed"):
+            r[k] += v.get(k, 0)
+        r["open"] += max(0, c.get("fail", 0) - v.get("real", 0) - v.get("false", 0))
+    return rows
+
+
+def cmd_check(a) -> None:
+    """`scaleout check`: how true the failures of the check model's jobs were. `scaleout check JOB real=1 false=0`: record it."""
+    if a.job:
+        j = load_job(a.job)
+        got = {}
+        for x in a.counts:
+            m = re.fullmatch(r"(real|false|missed)=(\d+)", x)
+            if not m:
+                die(E_USAGE, f"'{x}': use real=<n> false=<n> missed=<n>")
+            got[m.group(1)] = int(m.group(2))
+        if got:
+            j["verdict"] = {**(j.get("verdict") or {}), **got}
+            save_job(j)
+        say((check_text(j).strip() or "this job was not run as a check"))
+        return
+    cfg = load_cfg()
+    m = cfg["defaults"].get("check_model")
+    say(f"check model: {m + ' · effort ' + (cfg['defaults'].get('check_effort') or 'as set on each machine') if m else 'off (scaleout config check_model claude-sonnet-5-5)'} · last {a.days} days")
+    rows = check_rows(a.days)
+    if not rows:
+        say("no checks run on it yet")
+    for name, r in rows.items():
+        seen = r["real"] + r["false"]
+        say(f"{name}: {r['jobs']} jobs · ${r['cost']:.2f} · {r['failed']} did not finish · {r['noline']} without a result line")
+        say(f"  cases: pass {r['pass']} · fail {r['fail']} · blocked {r['blocked']}")
+        say(f"  failures: real {r['real']} · false {r['false']}" + (f" ({100 * r['false'] / seen:.0f}% false)" if seen else "")
+            + f" · not looked at {r['open']} · faults it missed {r['missed']}")
+
+
 def cmd_artifacts(a) -> None:
     j = load_job(a.job)
     if not j.get("artifacts"):
@@ -1918,7 +2084,7 @@ def cmd_artifacts(a) -> None:
 def cmd_result(a) -> None:
     j = load_job(a.job)
     rc, text = job_output(j) if j["status"] in ("done", "failed", "cancelled") else (E_RUNNING, f"still {j['status']}")
-    print(text + repo_text(j) + artifacts_text(j))
+    print(text + repo_text(j) + artifacts_text(j) + check_text(j))
     sys.exit(rc)
 
 
@@ -3039,7 +3205,7 @@ TOKENS_DIR = STATE_DIR / "tokens"
 RESERVE = 35000              # Claude Code compacts this far below the window (it keeps room for the answer and the summary)
 POST, POST_WRITE = 124000, 90000   # until measured: the context right after a compaction (tools, skills, memory, summary, files put back, and what came after a summary taken in advance) and the part of it written to the cache anew
 SUMMARY_OUT = 8000           # tokens a summary takes to write
-W_OUT, W_WRITE = 50, 20      # an output token and a cache write in cache reads (API prices: 5x and 2x input; a cache read is 0.1x)
+W_OUT, W_WRITE = 100, 40     # an output token and a 1 h cache write in cache reads (Opus 5.5 API prices, checked against the cost of 313 jobs)
 HOOK_MAX = 9500              # Claude Code takes up to 10,000 characters from one hook; a longer text reaches the session as a 2 KB preview
 LEDGER_MAX = 9000
 NOTES_DIR = ".scaleout"
@@ -3509,14 +3675,16 @@ def whatif(reqs: Dict[str, List[Tuple[str, int]]], window: int, post: int = POST
     for v in reqs.values():
         sim = prev = None
         for _, c in v:
-            if sim is None or c < 0.7 * prev:    # first request, or the session itself compacted or cleared
+            if sim is None:
                 sim = min(c, at)
             else:
-                grow = c - prev
+                # where the session itself compacted (a big drop) the replay goes on: at another window it may not have, and
+                # a free fall there would make the largest window look cheap
+                grow = 0 if c < 0.7 * prev else c - prev
                 sim = max(0, sim + grow)
                 if sim > at:
                     comps, total = comps + 1, total + at
-                    sim = min(post, c) + max(0, grow)
+                    sim = post + max(0, grow)
             prev = c
             total += sim
     return total, comps
@@ -4537,6 +4705,9 @@ def main(argv: Optional[List[str]] = None) -> None:
         s.add_argument("--mem", type=float, default=0, help="GB of memory the job needs (default: learned per node and job kind, else by tags)")
         s.add_argument("--cpu", type=int, default=0, help="CPU units: 2 = heavy (builds, tests, simulators), 1 = light (default: guessed from tags and task)")
         s.add_argument("--force", action="store_true", help="with --resume: even if the session was just written here")
+        s.add_argument("--model", default="auto", help="Claude model for this job: auto (checks go to check_model), default (the node's own), or a model name")
+        s.add_argument("--effort", choices=EFFORTS, help="effort of this job (default: the machine's own; check_effort where --model or a check changes the model)")
+        s.add_argument("--check", action="store_true", help="this job only runs and reports (E2E, tests, builds): use check_model")
 
     s = sp.add_parser("submit", help="queue a job and print its id"); job_opts(s); s.set_defaults(fn=cmd_submit)
     s = sp.add_parser("run", help="queue a job and wait for its result"); job_opts(s); s.add_argument("-m", "--max", type=int, default=540); s.set_defaults(fn=cmd_run)
@@ -4544,6 +4715,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     s = sp.add_parser("result", help="print a finished job's answer"); s.add_argument("job"); s.set_defaults(fn=cmd_result)
     s = sp.add_parser("artifacts", help="screenshots/videos/logs a job saved (paths; --to DIR copies them)")
     s.add_argument("job"); s.add_argument("--to"); s.set_defaults(fn=cmd_artifacts)
+    s = sp.add_parser("check", help="jobs the check model ran: were the failures it reported real? JOB real=N false=N missed=N records one")
+    s.add_argument("job", nargs="?"); s.add_argument("counts", nargs="*"); s.add_argument("--days", type=int, default=14); s.set_defaults(fn=cmd_check)
     s = sp.add_parser("logs", help="history and stderr of a job"); s.add_argument("job"); s.set_defaults(fn=cmd_logs)
     s = sp.add_parser("cancel", help="cancel a job"); s.add_argument("job"); s.set_defaults(fn=cmd_cancel)
     s = sp.add_parser("jobs", help="recent jobs"); s.add_argument("-n", "--limit", type=int, default=20); s.set_defaults(fn=cmd_jobs)

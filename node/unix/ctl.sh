@@ -73,6 +73,20 @@ reclaim_wts() {  # reclaim_wts <free GB wanted> [idle days] -> how many repo wor
   if [ "$n" -gt 0 ]; then for r in "$B"/repos/*.git; do [ -d "$r" ] && git -C "$r" worktree prune 2>/dev/null; done; fi
   echo "$n"
 }
+own_peak() {  # own_peak <jid>: keep the most memory the job's own processes held (Linux: they carry its SCALEOUT_JOB_ID), MB
+  [ "$OS" = Darwin ] && return 0
+  local d="$B/jobs/$1" f mb=0 l=()
+  while IFS= read -r f; do l+=("${f%/environ}/smaps_rollup"); done < <(grep -slz "^SCALEOUT_JOB_ID=$1\$" /proc/[0-9]*/environ 2>/dev/null)
+  [ "${#l[@]}" -gt 0 ] && mb="$(cat "${l[@]}" 2>/dev/null | awk '/^(Pss|SwapPss):/ {s += $2} END {printf "%d", s / 1024}')"
+  [ -f "$d/own_since" ] || date +%s > "$d/own_since"
+  [ "${mb:-0}" -gt "$(cat "$d/own_mb" 2>/dev/null || echo 0)" ] && echo "$mb" > "$d/own_mb"
+  return 0
+}
+own_mb() {  # own_mb <jid>: that peak, 0 when the job was not watched from its start
+  local d="$B/jobs/$1" a b
+  a="$(cat "$d/started" 2>/dev/null || echo 0)"; b="$(cat "$d/own_since" 2>/dev/null || echo 0)"
+  if [ "$b" -gt 0 ] && [ $((b - a)) -lt 180 ]; then cat "$d/own_mb" 2>/dev/null || echo 0; else echo 0; fi
+}
 queued_jobs() { ls "$B/queue" 2>/dev/null | wc -l | tr -d ' '; }
 runner_ok() {
   if [ "${RUNNER:-}" = manual ]; then echo true; return; fi   # the user starts runner.sh some other way
@@ -149,10 +163,10 @@ case "$verb" in
       "$(j "$OS")" "$(uname -m)" "$(j "$(hostname)")" "$(mem_free_pct)" "$(mem_total_gb)" "$(disk_free_gb "$HOME")" \
       "$(disk_free_gb "${WORK_ROOT:-$HOME}")" "$(load1)" "$(cpus)" "$(running_jobs)" "$(queued_jobs)" "$(runner_ok)" "$(agents)" "$(devices)" "$(claude_now)" "$(caps)" "$(skills_hash)" "$VERSION" ;;
 
-  submit)  # submit <jid> <agent> <timeout_min> <workdir> [resume-session-id]   (prompt on stdin)
+  submit)  # submit <jid> <agent> <timeout_min> <workdir> [resume-session-id] [model] [effort]   (prompt on stdin)
     jid="$1"; d="$B/jobs/$jid"; mkdir -p "$d" "$B/queue"
     cat > "$d/prompt.md"
-    printf 'AGENT=%s\nTIMEOUT_MIN=%s\nWORKDIR=%s\nRESUME=%s\n' "$2" "$3" "$4" "${5:-}" > "$d/meta"
+    printf 'AGENT=%s\nTIMEOUT_MIN=%s\nWORKDIR=%s\nRESUME=%s\nMODEL=%s\nEFFORT=%s\n' "$2" "$3" "$4" "${5:-}" "${6:-}" "${7:-}" > "$d/meta"
     touch "$B/queue/$jid"
     [ "$OS" = Darwin ] || "$B/bin/kick" >/dev/null 2>&1 &   # Linux: start the runner now (its systemd service when there is one)
     echo queued ;;
@@ -163,9 +177,9 @@ case "$verb" in
     now="$(date +%s)"
     if [ "$OS" = Darwin ]; then hb="$(stat -f %m "$d/heartbeat" 2>/dev/null)"; else hb="$(stat -c %Y "$d/heartbeat" 2>/dev/null)"; fi
     case "$hb" in ''|*[!0-9]*) hb="$now" ;; esac   # GNU stat -f means "file system": never let its text reach the arithmetic
-    if [ -f "$d/rc" ]; then printf '{"state":"done","rc":%s,"mem_mb":%s,"artifacts":%s,"artifacts_kb":%s}\n' "$(tr -dc '0-9' < "$d/rc")" "$(cat "$d/mem_mb" 2>/dev/null || echo 0)" \
+    if [ -f "$d/rc" ]; then printf '{"state":"done","rc":%s,"mem_mb":%s,"own_mb":%s,"artifacts":%s,"artifacts_kb":%s}\n' "$(tr -dc '0-9' < "$d/rc")" "$(cat "$d/mem_mb" 2>/dev/null || echo 0)" "$(own_mb "$1")" \
       "$(find "$d/artifacts" -type f 2>/dev/null | wc -l | tr -d ' ')" "$(du -sk "$d/artifacts" 2>/dev/null | cut -f1 || echo 0)"
-    elif [ -f "$d/started" ]; then printf '{"state":"running","heartbeat_age":%s}\n' "$((now - hb))"
+    elif [ -f "$d/started" ]; then own_peak "$1"; printf '{"state":"running","heartbeat_age":%s}\n' "$((now - hb))"
     elif [ -f "$B/queue/$1" ]; then echo '{"state":"queued"}'
     elif [ -n "$(find "$d/taken" -mmin -2 2>/dev/null)" ]; then echo '{"state":"queued"}'   # a runner took it and is starting the agent
     else echo '{"state":"lost"}'; fi ;;
