@@ -351,7 +351,15 @@ Start it with `-gpu host`.
 When a job is handed over, scaleout looks at the machine as it is at that moment and adds to the task: the text before the
 first `##`, and each section whose `when` words are in the task (no `when` = always) and whose `needs` tags the machine has
 right now. A section that fits but whose tag is missing (a broken driver) is named as not possible. The rest is named with the
-path of the whole guide on the machine, `~/.scaleout/guide.md`. New Claude Code sessions on the orchestrator get the first
+path of the whole guide on the machine, `~/.scaleout/guide.md`. Two more notes decide where a job goes:
+
+- `<!-- here: godot|blender -->`: a task with one of these words runs on this machine only, as if it had been sent with `-w` (`-w` and tags of its own come first).
+- `<!-- wait: 20 -->` with it: it waits up to 20 minutes for room here, then any machine may take it, this one first.
+
+A job that will use the graphics card (`--tags gpu`, or a section with `needs: gpu` fits it) is not added to a machine whose card is
+full (95% busy, or 90% of its memory) while other jobs run there; `scaleout jobs` shows `waits: … GPU full`.
+
+New Claude Code sessions on the orchestrator get the first
 paragraph and the section titles, so they know where to send what. Guides are yours: they are not part of this repository.
 
 ## Skills sync

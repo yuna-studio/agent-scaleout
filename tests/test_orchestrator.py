@@ -878,7 +878,7 @@ class E2E(unittest.TestCase):
             self.assertIn("A card.", so.guide_for(cfg, "n1", "x", up)[0])
             f.write_text(text)
             rules = so.guide_rules(cfg)
-            self.assertIn("(`n1`): A card. Sections: Emulator (`--tags gpu`", rules); self.assertNotIn("CUDA", rules)
+            self.assertIn("(`n1`): A card. Sections: Emulator (needs gpu", rules); self.assertNotIn("CUDA", rules)
             # a real job: its task carries what fits, the whole guide is on the node, the text scaleout adds does not count as the task
             f.write_text(text.replace("needs: gpu", "needs: n1"))
             for task, want in (("Build the apk.", True), ("Say hello.", False)):
@@ -894,6 +894,51 @@ class E2E(unittest.TestCase):
         finally:
             if f.exists():
                 f.unlink()
+
+    def test_99k_guide_routing(self):
+        """A guide can say which work goes to its machine; a full graphics card takes no more of it."""
+        cfg = {"nodes": {"pc": {"os": "Linux", "user": "u", "max_jobs": 8, "cpu_slots": 8}, "mac": {"os": "Darwin", "user": "u", "max_jobs": 8, "cpu_slots": 8}},
+               "defaults": {**so.load_cfg()["defaults"]}}
+        st = lambda **k: {"online": True, "os": "Linux", "cpus": 16, "mem_total_gb": 64, "mem_free_pct": 90, "disk_free_gb": 500, "load": 1, "agents": ["claude"], "paused": False,
+                          "agent_ok": True, "ts": so.now(), "caps": ["gpu"], "gpu": {"util": 10, "mem_used_mb": 500, "mem_total_mb": 8192}, **k}
+        m = {"pc": st(), "mac": st(os="Darwin", caps=[], gpu=None, load=0)}
+        f = so.GUIDES / "pc.md"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        ids = []
+
+        def job(text, ago=0, **kw):
+            jid = so.submit_job(so.load_cfg(), text); ids.append(jid)
+            return {**so.load_job(jid), "created": so.now() - ago * 60, **kw}
+
+        def pick(j, load=None, why=None):
+            return so.pick_node(cfg, j, m, load or {}, {}, {}, {}, why if why is not None else {})
+        try:
+            godot, plain = job("Run the Godot captures."), job("Run the unit tests. Do not start Godot.")
+            f.write_text("x\n\n## Godot\n<!-- needs: gpu -->\n<!-- here: godot -->\nUse it.\n")
+            self.assertEqual(pick(godot), "pc")
+            self.assertEqual(pick(godot, {"pc": 4}), "pc", "also when the other one is empty")
+            why = {}
+            m["pc"]["load"] = 100000
+            self.assertIsNone(pick(godot, {"pc": 4}, why)); self.assertIn("goes to pc", why["mac"])
+            self.assertIsNone(pick({**godot, "created": so.now() - 86400}), "no wait given: only there")
+            self.assertEqual(pick(plain), "mac")
+            self.assertEqual(pick({**godot, "want_node": "mac"}), "mac"); self.assertEqual(pick({**godot, "only": ["mac"]}), "mac"); self.assertEqual(pick({**godot, "tags": ["mac"]}), "mac")
+            f.write_text("x\n\n## Godot\n<!-- needs: gpu -->\n<!-- here: godot -->\n<!-- wait: 20 -->\nUse it.\n")
+            self.assertIsNone(pick({**godot, "created": so.now() - 600})); self.assertEqual(pick({**godot, "created": so.now() - 1500}), "mac")
+            m["pc"]["load"] = 1
+            self.assertEqual(pick({**godot, "created": so.now() - 1500}, {"pc": 2}), "pc", "still first")
+            # a full card
+            for g in ({"util": 99, "mem_used_mb": 500, "mem_total_mb": 8192}, {"util": 5, "mem_used_mb": 7900, "mem_total_mb": 8192}):
+                m["pc"]["gpu"] = g
+                why = {}
+                self.assertIsNone(pick(godot, {"pc": 1}, why)); self.assertIn("GPU full", why["pc"])
+                self.assertEqual(pick(godot), "pc", "an idle machine takes one")
+                self.assertEqual(pick({**plain, "only": ["pc"]}, {"pc": 1}), "pc", "work that does not use the card")
+                self.assertIsNone(pick({**plain, "only": ["pc"], "tags": ["gpu"]}, {"pc": 1}))
+        finally:
+            f.unlink()
+            for i in ids:
+                so.job_path(i).unlink()
 
     def test_99c_stale_tunnel_freed(self):
         # a node that slept leaves its reverse tunnel's sshd session holding the port: free it after a minute
