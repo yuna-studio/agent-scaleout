@@ -34,7 +34,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "0.9.16"
+VERSION = "0.9.17"
 HOME = Path.home()
 CONF_DIR = Path(os.environ.get("SCALEOUT_CONF", HOME / ".config" / "scaleout"))
 STATE_DIR = Path(os.environ.get("SCALEOUT_STATE", HOME / ".local" / "state" / "scaleout"))
@@ -1379,8 +1379,12 @@ def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[st
     perf = {k: node_perf(k, metrics.get(k, {})) for k in cfg["nodes"]}
     top_perf = max(perf.values() or [1.0]) or 1.0
     best, best_score = None, -1e9
+    here = guide_here(cfg, j, metrics)
     for name, n in cfg["nodes"].items():
         if n.get("pending") or (j.get("want_node") and name != j["want_node"]) or (j.get("only") and name not in j["only"]):
+            continue
+        if any(here.values()) and not here.get(name):
+            why[name] = "its work goes to " + ", ".join(label_of(cfg, k) for k, v in here.items() if v) + " (guide)"
             continue
         st = metrics.get(name, {})
         h = node_health(cfg, name, st)
@@ -1437,6 +1441,10 @@ def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[st
         if busy and cpu_used.get(name, 0) + job_cpu(j) > units and float(st.get("load", 0) or 0) >= cores:
             why[name] = f"CPU units full ({cpu_used.get(name, 0)}/{units}, load {float(st.get('load', 0)):.1f})"
             continue       # units full and the cores really busy; a heavy job in a quiet phase (load < cores) leaves room
+        gpu = wants_gpu(cfg, name, j) if st.get("gpu") else False
+        if gpu and busy and gpu_full(st):
+            why[name] = gpu_full(st)
+            continue       # one more would only slow the others down (an idle node still takes one)
         disk_room = float(st.get("disk_free_gb", 0) or 0) - planned_disk.get(name, 0.0) - min_disk
         if busy and disk_room < disk_need:
             why[name] = f"disk {disk_room + min_disk:.0f} GB free, job needs {disk_need:.0f}"
@@ -1460,6 +1468,10 @@ def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[st
             score -= 30 if plat == "android" else 15
         elif not mac and plat == "ios":
             score -= 40
+        if gpu:
+            score -= 20 * (gpu_of(st) or 0) / 100
+        if name in here:
+            score += 40
         score += float(n.get("score_bias", 0))   # the orchestrator has a negative bias: it orchestrates, runs what only it can, and takes overflow
         if score > best_score:
             best, best_score = name, score
@@ -1495,7 +1507,7 @@ def push_skills(cfg: Dict[str, Any], name: str, force: bool = False) -> bool:
 
 # ── machine guides: how to do things on one machine, told to every job that goes there ───────────────────────────────
 GUIDES = CONF_DIR / "guides"   # <node id>.md, kept on the orchestrator: what it knows about that machine
-GUIDE_NOTE = re.compile(r"<!--\s*(when|needs)\s*:\s*(.*?)\s*-->", re.S | re.I)
+GUIDE_NOTE = re.compile(r"<!--\s*(when|needs|here|wait)\s*:\s*(.*?)\s*-->", re.S | re.I)
 
 
 def guide_text(name: str) -> str:
@@ -1507,11 +1519,12 @@ def guide_text(name: str) -> str:
 
 def guide_parts(text: str) -> List[Dict[str, Any]]:
     """The parts of a guide: what stands before the first '## ' (title ''), then one part per '## ' section. A part may say
-    `<!-- when: word|word -->` (only for a task that has one of these words) and `<!-- needs: gpu -->` (only while the
-    machine has that tag; in the first part it holds for the whole guide)."""
+    `<!-- when: word|word -->` (only for a task that has one of these words), `<!-- needs: gpu -->` (only while the machine
+    has that tag; in the first part it holds for the whole guide), `<!-- here: word|word -->` (a task with one of these words
+    goes to this machine) and `<!-- wait: 20 -->` (minutes it waits for room here, then any machine; none = it only runs here)."""
     parts = []
     for i, block in enumerate(re.split(r"(?m)^## +", text)):
-        notes: Dict[str, List[str]] = {"when": [], "needs": []}
+        notes: Dict[str, List[str]] = {"when": [], "needs": [], "here": [], "wait": []}
         for key, val in GUIDE_NOTE.findall(block):
             notes[key.lower()] += [w.strip().lower() for w in re.split(r"[|,]", val) if w.strip()]
         block = re.sub(r"\n{3,}", "\n\n", GUIDE_NOTE.sub("", block)).strip()
@@ -1527,14 +1540,72 @@ def node_has(cfg: Dict[str, Any], name: str, st: Dict[str, Any]) -> set:
         | {str(t).lower() for t in st.get("caps") or []}
 
 
+def task_of(j: Dict[str, Any]) -> str:
+    """The task of a job as it was given (not what scaleout adds to it), with its repo and folder."""
+    try:
+        text = (STATE_DIR / "prompts" / f"{j['id']}.md").read_text(errors="replace")
+    except (OSError, KeyError):
+        text = ""
+    return " ".join([text] + [str(j.get(k) or "") for k in ("repo_name", "repo_sub", "sync", "workdir")])
+
+
+def asks(task: str, words: List[str]) -> bool:
+    """Does the task name one of these? Sentences like "do not start an emulator" do not count."""
+    low = PIN_NOT.sub(" ", task).lower()
+    return any(re.search(r"(?<![a-z0-9])" + re.escape(w), low) for w in words)
+
+
+def guide_here(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[str, Any]]) -> Dict[str, bool]:
+    """The machines whose guide says a job like this goes there -> whether it may still run on nothing else (it has not waited
+    `wait` minutes yet). Not for a job that names its machine or needs what that machine does not have."""
+    out: Dict[str, bool] = {}
+    if j.get("want_node") or j.get("only") or j.get("agent") == "bench":
+        return out
+    task = None
+    for name, n in cfg["nodes"].items():
+        parts = [p for p in guide_parts(guide_text(name)) if p["here"]]
+        if not parts or n.get("pending"):
+            continue
+        st = metrics.get(name, {})
+        if j.get("agent") not in (None, "default", "custom") and st.get("agents") and j["agent"] not in st["agents"]:
+            continue
+        have = node_has(cfg, name, st) | {f"{k}-device" for k in (st.get("devices") or {})}
+        if st.get("online") and not set(j.get("tags") or []) <= have:
+            continue
+        task = task_of(j) if task is None else task
+        waits = [p["wait"] for p in parts if asks(task, p["here"])]
+        if waits:
+            mins = [float(w[0]) if w and re.fullmatch(r"\d+(\.\d+)?", w[0]) else None for w in waits]
+            out[name] = None in mins or now() - float(j.get("created") or now()) < 60 * max(m for m in mins if m is not None)
+    return out
+
+
+def wants_gpu(cfg: Dict[str, Any], name: str, j: Dict[str, Any]) -> bool:
+    """Will this job use the machine's graphics card? Its tag says so, or a section of the guide that fits it."""
+    if "gpu" in (j.get("tags") or []):
+        return True
+    parts = [p for p in guide_parts(guide_text(name))[1:] if "gpu" in p["needs"]]
+    return bool(parts) and asks(task_of(j), [w for p in parts for w in p["when"] + p["here"]])
+
+
+def gpu_full(st: Dict[str, Any]) -> str:
+    """Why the graphics card has no room for one more job ("" = it has)."""
+    g, use = st.get("gpu") or {}, gpu_of(st)
+    try:
+        mem = int(g["mem_used_mb"]) / max(int(g["mem_total_mb"]), 1)
+    except (KeyError, TypeError, ValueError):
+        mem = 0.0
+    return f"GPU full ({fmt_gpu(st)}{', ' + fmt_vram(st) if fmt_vram(st) else ''})" if (use or 0) >= 95 or mem >= 0.9 else ""
+
+
 def guide_for(cfg: Dict[str, Any], name: str, task: str, st: Dict[str, Any], path: str = "") -> Tuple[str, List[str]]:
     """What a job with this task text is told about the machine it goes to, and the titles of the sections in it. With the
     path of the whole guide on that machine, sections the task does not seem to need are only named."""
     parts = guide_parts(guide_text(name))
-    have, head, low = node_has(cfg, name, st), parts[0], PIN_NOT.sub(" ", task).lower()   # "do not start an emulator" does not ask for one
+    have, head = node_has(cfg, name, st), parts[0]
     if set(head["needs"]) - have:
         return "", []
-    asked = [p for p in parts[1:] if not p["when"] or any(re.search(r"(?<![a-z0-9])" + re.escape(w), low) for w in p["when"])]
+    asked = [p for p in parts[1:] if not (p["when"] or p["here"]) or asks(task, p["when"] + p["here"])]
     fit = [p for p in parts[1:] if not set(p["needs"]) - have]
     on = [p for p in fit if p in asked or not path]
     rest = [p["title"] for p in fit if p not in on]
@@ -1632,9 +1703,7 @@ def dispatch(cfg: Dict[str, Any], j: Dict[str, Any], name: str) -> bool:
                    "emulators here yourself; do not hand the work to scaleout again.\n").encode()
     if j.get("agent") != "bench" and guide_text(name):
         try:
-            task = " ".join([(STATE_DIR / "prompts" / f"{j['id']}.md").read_text(errors="replace")]   # the task itself, not what is added to it
-                            + [str(j.get(k) or "") for k in ("repo_name", "repo_sub", "sync", "workdir")])
-            about, titles = guide_for(cfg, name, task, read_json(node_state_path(name), {}), push_guide(n, name))
+            about, titles = guide_for(cfg, name, task_of(j), read_json(node_state_path(name), {}), push_guide(n, name))
             if about:
                 prompt += about.encode()
                 j["guide"] = titles
@@ -2989,12 +3058,12 @@ def guide_rules(cfg: Dict[str, Any]) -> str:
         if not parts[0]["body"] and len(parts) == 1:
             continue
         have = node_has(cfg, name, read_json(node_state_path(name), {}))
-        tagged = lambda p: p["title"] + (f" (`--tags {','.join(p['needs'])}`{'' if set(p['needs']) <= have else ', not there now'})" if p["needs"] else "")
+        tagged = lambda p: p["title"] + (f" (needs {', '.join(p['needs'])}{'' if set(p['needs']) <= have else ', not there now'})" if p["needs"] else "") + (" (goes here)" if p["here"] else "")
         L.append(f"- **{label_of(cfg, name)}** (`{name}`): " + " ".join(parts[0]["body"].split())
                  + (" Sections: " + ", ".join(tagged(p) for p in parts[1:]) + "." if len(parts) > 1 else ""))
-    return "" if not L else ("## Machines with a guide\nSend work that fits a section to that machine, with the tag named there. scaleout checks the machine and "
-                             "adds the parts that fit to every job it sends there, so do not repeat them in the task. `scaleout guide NODE` prints the "
-                             "whole guide; follow it too when you run something there yourself over ssh.\n" + "\n".join(L))
+    return "" if not L else ("## Machines with a guide\nscaleout reads the task, sends work that only runs there to that machine (a section marked \"goes here\"), checks the "
+                             "machine and adds the parts that fit to every job it sends there. Name the work in the task (e.g. Godot, Blender), leave `-w` out and "
+                             "do not repeat the guide. `scaleout guide NODE` prints the whole guide; follow it when you run something there yourself over ssh.\n" + "\n".join(L))
 
 
 def cmd_guide(a) -> None:
