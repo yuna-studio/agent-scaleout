@@ -49,6 +49,8 @@ corrections, small steps. Handing off costs a little (the receiving agent loads 
     (iOS layout bug, iOS plugin, signing). `mac` is for work only a Mac can do; it keeps the job off every other machine.
   - A job that needs bash scripts or `--repo` does not go to a Windows node.
   - Results that differ by OS (golden images, native binaries) → tag the OS they must match.
+- Leave `-w NODE` out unless the job needs something only that machine has: pinned jobs are what waits in line while other
+  machines sit idle. A `-w` job that waited 10 minutes and names nothing of its machine goes to another one; `--pin` keeps it.
 - Memory decides how many jobs a node runs at once (no fixed limit on simulators or emulators). Pass `--mem <GB>` when a job needs more than usual, e.g. several simulators.
 - A job that only runs something and reports (E2E, tests, builds, screenshots) says so in its first lines ("do not change code,
   report only") or is sent with `--check`: where `check_model` is set it runs on that cheaper model. Work that needs changes or

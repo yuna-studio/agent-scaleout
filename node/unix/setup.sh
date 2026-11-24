@@ -108,7 +108,7 @@ install_runner_service() {
   elif has_systemd; then
     mkdir -p "$SU"
     # no start limit: the path unit starts the service whenever the queue has files, and a limit hit leaves both units failed
-    printf '[Unit]\nDescription=agent-scaleout runner\nStartLimitIntervalSec=0\n[Service]\nType=oneshot\nExecStart=/bin/bash %%h/.scaleout/bin/runner.sh\n' > "$SU/scaleout-runner.service"
+    printf '[Unit]\nDescription=agent-scaleout runner\nStartLimitIntervalSec=0\n[Service]\nType=oneshot\nOOMPolicy=continue\nExecStart=/bin/bash %%h/.scaleout/bin/runner.sh\n' > "$SU/scaleout-runner.service"
     printf '[Unit]\nDescription=agent-scaleout queue watch\n[Path]\nPathExistsGlob=%%h/.scaleout/queue/*\nUnit=scaleout-runner.service\n[Install]\nWantedBy=default.target\n' > "$SU/scaleout-runner.path"
     systemctl --user daemon-reload && systemctl --user reset-failed scaleout-runner.service scaleout-runner.path >/dev/null 2>&1
     systemctl --user enable --now scaleout-runner.path >/dev/null 2>&1

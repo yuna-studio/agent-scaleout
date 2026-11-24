@@ -84,23 +84,25 @@ Tunnels are optional; on one LAN nothing extra is needed. (Reverse tunnels are n
 ## Run jobs
 
 ```bash
-scaleout status                                   # health, route, free memory/disk, load, jobs and agents per node
+scaleout status                                   # health, route, free memory/disk, CPU load, GPU load, jobs and agents per node
 echo "Run the test suite in ./api and summarise failures" | scaleout run -d ~/src/app
 id=$(scaleout submit -f task.md --tags xcode)     # queue and return immediately
 scaleout wait "$id"                               # result (exit 2 = still running, run it again)
 scaleout jobs · logs ID · cancel ID · result ID
 scaleout exec build-01 -- df -h                   # any shell command on a node
+scaleout hold build-01 --from 07:30 --until 10:00 # no new jobs there for a while (before a reboot); `hold build-01 off` ends it
 ```
 
 | option | meaning |
 |---|---|
-| `-w NODE` | pin a node (default `auto`: least-loaded healthy node) |
+| `-w NODE` | prefer a node (default `auto`: least-loaded healthy node). After `unpin_min` minutes (10, 0 = never) without room there, a job that brings its own files (`--repo`, `--sync`) and names nothing of that machine (emulator, device, OS, GPU, its name, a benchmark …) may go to another node |
+| `--pin` | with `-w`: that node only, however long it takes |
 | `-a claude\|codex\|gemini` | pick an agent (default: the node's default) |
 | `-d DIR` | working folder on the node (default: the node's `--dir`) |
 | `--repo DIR` | work on a git repo of this machine: the node gets its current working tree (uncommitted changes too; git sends only what changed), the result comes back as branch `scaleout/JOB` |
 | `--apply` | with `--repo`: also apply the result to this working tree (never forced; conflicts are reported) |
 | `--sync DIR` | non-git folders: copied to the node before, copied back after |
-| `--tags a,b` | node requirements, e.g. `xcode`, `gpu`; a node's OS counts as a tag (`mac`, `linux`, `windows`; `scaleout status` shows each machine's OS); `android-device` / `ios-device` = needs a phone plugged into the node |
+| `--tags a,b` | node requirements, e.g. `xcode`, `gpu` (a Linux node with a working NVIDIA driver gets it by itself); a node's OS counts as a tag (`mac`, `linux`, `windows`; `scaleout status` shows each machine's OS); `android-device` / `ios-device` = needs a phone plugged into the node |
 | `--timeout MIN` | hard limit (default 180) |
 
 Exit codes: `0` ok · `1` agent failed · `2` still running · `3` no reachable node · `4` usage · `5` not found.

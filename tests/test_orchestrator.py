@@ -839,6 +839,19 @@ class E2E(unittest.TestCase):
         names = tarfile.open(fileobj=io.BytesIO(so.node_package("windows"))).getnames()
         self.assertTrue({"ctl.ps1", "runner.ps1", "setup.ps1"} <= set(names), names)
 
+    def test_99i_gpu_and_swap(self):
+        """The GPU column: a card with its own memory, one that shares it, none; what `ctl metrics` reports."""
+        nv = {"gpu": {"util": 45, "mem_used_mb": 300, "mem_total_mb": 8192, "temp": 50, "name": "GTX"}}
+        self.assertEqual((so.gpu_of(nv), so.fmt_gpu(nv), so.fmt_vram(nv)), (45, "45%", "0.3/8G"))
+        self.assertEqual((so.fmt_gpu({"gpu": {"util": 3}}), so.fmt_vram({"gpu": {"util": 3}})), ("3%", ""))
+        for none in ({}, {"gpu": None}, {"gpu": {}}, {"gpu": {"util": "x"}}, {"gpu": "x"}):
+            self.assertEqual(so.fmt_gpu(none), "-")
+        ctl = str(Path(so.__file__).resolve().parents[1] / "node" / "unix" / "ctl.sh")
+        out = subprocess.run(["bash", ctl, "metrics"], capture_output=True, text=True, timeout=60).stdout
+        m = json.loads(out)
+        self.assertIn("gpu", m)
+        self.assertGreaterEqual(float(m["swap_gb"]), 0)
+
     def test_99c_stale_tunnel_freed(self):
         # a node that slept leaves its reverse tunnel's sshd session holding the port: free it after a minute
         cfg = so.load_cfg()
@@ -998,6 +1011,55 @@ class E2E(unittest.TestCase):
         self.assertIn('--effort $effort', (ROOT / "node/unix/runner.sh").read_text())
         self.assertIn('--model $model', (ROOT / "node/unix/runner.sh").read_text())
         self.assertIn("MODEL=%s\\nEFFORT=%s", (ROOT / "node/unix/ctl.sh").read_text())
+
+    def test_99h_unpin_and_hold(self):
+        """A -w job that waited long enough and names nothing of its machine may go elsewhere; a machine on hold takes nothing."""
+        cfg = so.load_cfg()
+        keep = cfg["defaults"].get("unpin_min")
+        cfg["defaults"]["unpin_min"] = 10
+        ids = []
+        def job(text, ago=15, **kw):
+            jid = so.submit_job(cfg, text, node="n1", **kw)
+            j = so.load_job(jid); j["created"] = so.now() - ago * 60
+            j["repo"] = j.get("repo") or "/r"; so.save_job(j); ids.append(jid)
+            return j
+        try:
+            self.assertTrue(so.may_move(cfg, job("Run the unit tests of app/ and report.")))
+            self.assertTrue(so.may_move(cfg, job("전체 시험을 돌린다. 에뮬레이터 · 시뮬레이터 · apk 빌드는 하지 않는다(위젯 시험만). 커밋 금지.")))
+            self.assertFalse(so.may_move(cfg, job("Run the unit tests.", ago=5)), "not yet")
+            self.assertFalse(so.may_move(cfg, job("에뮬레이터를 띄워 화면을 찍는다.")))
+            self.assertFalse(so.may_move(cfg, job("이 기계에서 걸리는 시간을 잰다.")))
+            self.assertFalse(so.may_move(cfg, job("Files are in /home/me/out.")))
+            self.assertFalse(so.may_move(cfg, job("Compare n1 with the rest of the macbook runs.")))
+            self.assertFalse(so.may_move(cfg, job("Run the unit tests.", pin=True)), "--pin")
+            self.assertFalse(so.may_move(cfg, job("Run the unit tests.", workdir="/w")), "a folder on that machine")
+            j = job("Run the unit tests."); j["want_node"] = None
+            self.assertFalse(so.may_move(cfg, j), "no pin, nothing to undo")
+            j = job("Run the unit tests."); j["repo"] = ""
+            self.assertFalse(so.may_move(cfg, j), "it works on what that machine has")
+            cfg["defaults"]["unpin_min"] = 0
+            self.assertFalse(so.may_move(cfg, job("Run the unit tests.")), "off")
+            cfg["defaults"]["unpin_min"] = 10
+            m = {n: {"online": True, "ts": so.now(), "mem_free_pct": 80, "mem_total_gb": 64, "disk_free_gb": 50, "load": 0.1, "cpus": 16,
+                     "agents": ["claude"], "runner": True} for n in ("n1", "n2")}
+            j = {"tags": [], "agent": "default", "id": "h1", "want_node": "n1"}
+            self.assertEqual(so.pick_node(cfg, j, m, {}, {}, {}, {}, {}), "n1")
+            cfg["nodes"]["n1"].update(hold_from=so.now() - 5, hold_until=so.now() + 600)
+            why = {}
+            self.assertIsNone(so.pick_node(cfg, j, m, {}, {}, {}, {}, why))
+            self.assertIn("on hold until", why["n1"])
+            self.assertEqual(so.pick_node(cfg, {**j, "want_node": None, "only": ["n1", "n2"]}, m, {}, {}, {}, {}, {}), "n2")
+            cfg["nodes"]["n1"]["hold_from"] = so.now() + 300
+            self.assertEqual(so.pick_node(cfg, j, m, {}, {}, {}, {}, {}), "n1", "the hold has not begun")
+            lt = __import__("time").localtime(so.clock_time("07:30"))
+            self.assertEqual((lt.tm_hour, lt.tm_min), (7, 30))
+            self.assertGreater(so.clock_time("07:30"), so.now())
+            lt = __import__("time").localtime(so.clock_time("11-25 09:00"))
+            self.assertEqual((lt.tm_mon, lt.tm_mday, lt.tm_hour), (11, 25, 9))
+        finally:
+            for i in ids:
+                (so.STATE_DIR / "jobs" / f"{i}.json").unlink()
+            cfg["defaults"]["unpin_min"] = keep
 
     def test_99g_own_memory(self):
         """Once a node measures a job's own processes, what the whole machine grew by no longer decides what a job is reserved."""

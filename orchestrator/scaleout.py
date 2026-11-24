@@ -34,7 +34,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "0.9.12"
+VERSION = "0.9.15"
 HOME = Path.home()
 CONF_DIR = Path(os.environ.get("SCALEOUT_CONF", HOME / ".config" / "scaleout"))
 STATE_DIR = Path(os.environ.get("SCALEOUT_STATE", HOME / ".local" / "state" / "scaleout"))
@@ -58,6 +58,7 @@ DEFAULTS: Dict[str, Any] = {
     "check_effort": "high",      # the effort of a job on another model than the node's: a machine may set its effort for its own model only
     "stall_min": 5,              # running job whose heartbeat is older than this is considered dead
     "node_wait_min": 10,
+    "unpin_min": 10,             # a -w job that waited this long and needs nothing only that machine has may go to another one (0 = never)
     "mem_reserve_gb": 1.5,
     "max_load_per_cpu": 2.0,     # a busy node whose 1-minute load is above this × cores gets no new job (simulators are CPU-heavy)
     "reap_idle_min": 20,         # simulators/emulators with no test running this long are shut down (0 = never), here and on nodes       # memory a node always keeps free when the scheduler fits jobs into it
@@ -1129,7 +1130,7 @@ def repo_name(root: str) -> str:
 def submit_job(cfg: Dict[str, Any], prompt: str, node: Optional[str] = None, agent: str = "default", workdir: str = "",
                sync: str = "", tags: Optional[List[str]] = None, timeout: Optional[int] = None, pull: bool = True,
                resume: str = "", force: bool = False, repo: str = "", apply: bool = False, mem_gb: float = 0, cpu: int = 0,
-               model: str = "auto", check: bool = False, effort: str = "") -> str:
+               model: str = "auto", check: bool = False, effort: str = "", pin: bool = False) -> str:
     model, why = pick_model(cfg, prompt, agent, resume, model, check)
     if resume:
         resume = re.sub(r"[^A-Za-z0-9-]", "", resume)
@@ -1157,6 +1158,7 @@ def submit_job(cfg: Dict[str, Any], prompt: str, node: Optional[str] = None, age
                        "repo_base": repo_snapshot(top, jid), "apply": apply}
     save_job({**repo_fields, "id": jid, "status": "queued", "created": now(), "created_ns": time.time_ns(), "node": None, "want_node": node, "agent": agent,
               "workdir": workdir, "sync": sync, "pull": pull, "tags": tags or [], "attempts": 0, "resume": resume, "mem_gb": mem_gb, "cpu": cpu,
+              **({"pin": True} if pin else {}),
               **({"model": model, "model_why": why, "effort": pick_effort(cfg, effort)} if model else {"effort": pick_effort(cfg, effort)} if effort else {}),
               "timeout": timeout or cfg["defaults"]["job_timeout_min"], "history": []})
     return jid
@@ -1266,6 +1268,39 @@ def job_platform(j: Dict[str, Any]) -> str:
     return "ios" if ios and not android else "android" if android and not ios else ""
 
 
+# A -w job is tied to its machine when it names something only that machine has, a device or emulator set up there, its OS, or
+# speed and pixels that differ by machine. Sentences that say not to use such a thing do not count.
+PIN_NOT = re.compile(r"[^.\n|]{0,80}?(하지 ?(않|말|마)|쓰지 ?(않|말|마)|띄우지|켜지 ?(않|말|마)|안 ?(쓴|쓰|한|켠|띄)|금지|말 것|없이|do not|don't|never|without)[^.\n|]*", re.I)
+PIN_STAYS = re.compile(r"godot|blender|블렌더|에뮬|emulator|\bavd\b|\badb\b|시뮬레이터|simulator|simctl|xcode|\bpod install|xvfb|maestro|golden|골든|"
+                       r"ubuntu|우분투|라이젠|맥 ?미니|\blinux\b|리눅스|windows|macbook|맥북|/home/|nvidia|\bgpu\b|그래픽카드|docker|"
+                       r"이 (머신|기계|pc)(에서|의|에)|this (machine|node|computer)|벤치|benchmark|프로파일|profil|\bfps\b|끊김|성능(을|이)? ?(재|측정)", re.I)
+
+
+def may_move(cfg: Dict[str, Any], j: Dict[str, Any]) -> bool:
+    """A job sent to one machine with -w that has waited `unpin_min` minutes there and could run on another one."""
+    wait = float(cfg["defaults"].get("unpin_min") or 0)
+    if not wait or not j.get("want_node") or now() - float(j.get("created") or now()) < wait * 60:
+        return False
+    if j.get("loose") is None:   # read once: the job brings its own files and its task names nothing of that machine
+        text = ""
+        if not j.get("pin") and not j.get("resume") and not j.get("workdir") and (j.get("repo") or j.get("sync")) \
+                and not cfg["nodes"].get(j["want_node"], {}).get("local"):
+            try:
+                text = (STATE_DIR / "prompts" / f"{j['id']}.md").read_text(errors="replace")
+            except (OSError, KeyError):
+                text = ""
+        names = [x for k, n in cfg["nodes"].items() for x in (k, str(n.get("label") or "").split(" ")[0]) if len(x) > 3]
+        plain = PIN_NOT.sub(" ", text)
+        j["loose"] = bool(text.strip()) and not PIN_STAYS.search(plain) and not any(x.lower() in plain.lower() for x in names)
+    return bool(j["loose"])
+
+
+def held(n: Dict[str, Any]) -> float:
+    """Until when a machine takes no new job (`scaleout hold`), 0 = it takes jobs."""
+    until = float(n.get("hold_until") or 0)
+    return until if float(n.get("hold_from") or 0) <= now() < until else 0.0
+
+
 def job_disk_gb(j: Dict[str, Any]) -> float:
     """Disk a job fills on the node: the work tree with its build output, and on a Mac the Xcode build cache (4-8 GB)."""
     if j.get("disk_gb"):
@@ -1351,6 +1386,9 @@ def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[st
         h = node_health(cfg, name, st)
         if h != "ok":
             why[name] = h
+            continue
+        if held(n):
+            why[name] = "on hold until " + time.strftime("%m-%d %H:%M", time.localtime(held(n)))
             continue
         if not j.get("want_node") and (j.get("avoid") or {}).get(name, 0) > now():
             why[name] = "failed this job recently"
@@ -1515,6 +1553,11 @@ def dispatch(cfg: Dict[str, Any], j: Dict[str, Any], name: str) -> bool:
         prompt += ("\n\n---\n(agent-scaleout) Your working folder is a disposable copy of the requester's repository at their "
                    "current working tree. Leave your changes in the files: do not commit, push or switch branches; "
                    "they are sent back automatically.\n").encode()
+    if j.get("moved_from"):
+        prompt += (f"\n\n---\n(agent-scaleout) This job was meant for {label_of(cfg, j['moved_from'])} and came here because that machine had no room. "
+                   f"This one is {label_of(cfg, name)}: {j.get('moved_cpus') or '?'} cores, {j.get('moved_gb') or '?'} GB of memory. Where the task names "
+                   "a number of parallel workers (for example `flutter test --concurrency=4`), use at most a quarter of the cores here. "
+                   "If it needs something this machine does not have, say so and stop.\n").encode()
     if j.get("agent") != "bench":
         prompt += ("\n\n---\n(agent-scaleout) You are already running as a scaleout job: run builds, tests, simulators and "
                    "emulators here yourself; do not hand the work to scaleout again.\n").encode()
@@ -1702,7 +1745,7 @@ def sample_history(metrics: Dict[str, Dict[str, Any]], cfg: Optional[Dict[str, A
         return
     me = local_metrics()
     row = {"t": int(now()), "orch": {k: me.get(k) for k in ("load", "cpus", "mem_free_pct", "swap_gb")},
-           "nodes": {n: {"load": st.get("load"), "cpus": st.get("cpus"), "mem_free_pct": st.get("mem_free_pct"),
+           "nodes": {n: {"load": st.get("load"), "cpus": st.get("cpus"), "mem_free_pct": st.get("mem_free_pct"), "gpu": gpu_of(st), "swap_gb": st.get("swap_gb"),
                          "running": st.get("running"), "online": st.get("online")} for n, st in metrics.items()}}
     if cfg:
         jobs = all_jobs()
@@ -1869,6 +1912,11 @@ def tick(verbose: bool = False) -> None:
                 continue
             why: Dict[str, str] = {}
             name = pick_node(cfg, j, metrics, load, dev_load, planned_gb, cpu_used, why, planned_disk)
+            if not name and may_move(cfg, j):   # never to the orchestrator: it is kept free for the sessions on it
+                others = [k for k, n in cfg["nodes"].items() if k != j["want_node"] and not n.get("local")]
+                name = pick_node(cfg, {**j, "want_node": None, "only": others}, metrics, load, dev_load, planned_gb, cpu_used, why, planned_disk) if others else None
+                if name:
+                    j.update({"moved_from": j["want_node"], "moved_cpus": metrics[name].get("cpus"), "moved_gb": metrics[name].get("mem_total_gb")})
             if not name:
                 wait = "; ".join(f"{k}: {v}" for k, v in sorted(why.items())) or "no nodes"
                 if wait != j.get("wait", ""):
@@ -1876,6 +1924,8 @@ def tick(verbose: bool = False) -> None:
                     save_job(j)
                 continue
             j.pop("dispatch_error", None)
+            if name == j.get("want_node"):
+                j.pop("moved_from", None)
             if not dispatch(cfg, j, name):
                 # a node had room but the hand-over failed: say why, or the job sits in the queue with nothing shown
                 wait = f"{name}: {j.pop('dispatch_error', '') or 'could not hand the job over'}"
@@ -1884,6 +1934,8 @@ def tick(verbose: bool = False) -> None:
                 save_job(j)
                 continue
             j.pop("wait", None)
+            if j.get("moved_from"):
+                j["history"].append({"t": now(), "event": "unpinned", "node": name, "why": f"waited {int((now() - j['created']) / 60)} min for {j['moved_from']}"})
             load[name] = load.get(name, 0) + 1
             cpu_used[name] = cpu_used.get(name, 0) + job_cpu(j)
             planned_gb[name] = planned_gb.get(name, 0.0) + job_mem_gb(j, name)
@@ -1957,7 +2009,7 @@ def read_prompt(a) -> str:
 def cmd_submit(a) -> None:
     cfg = load_cfg()
     jid = submit_job(cfg, read_prompt(a), node=None if a.node in (None, "auto") else a.node, agent=a.agent,
-                     workdir=a.dir or "", sync=a.sync or "", tags=a.tags.split(",") if a.tags else [], timeout=a.timeout, pull=not a.no_pull, resume=a.resume, force=a.force, repo=a.repo, apply=a.apply, mem_gb=a.mem, cpu=a.cpu, model=a.model, check=a.check, effort=a.effort or "")
+                     workdir=a.dir or "", sync=a.sync or "", tags=a.tags.split(",") if a.tags else [], timeout=a.timeout, pull=not a.no_pull, resume=a.resume, force=a.force, repo=a.repo, apply=a.apply, mem_gb=a.mem, cpu=a.cpu, model=a.model, check=a.check, effort=a.effort or "", pin=a.pin)
     tick()
     print(jid)
 
@@ -1965,7 +2017,7 @@ def cmd_submit(a) -> None:
 def cmd_run(a) -> None:
     cfg = load_cfg()
     jid = submit_job(cfg, read_prompt(a), node=None if a.node in (None, "auto") else a.node, agent=a.agent,
-                     workdir=a.dir or "", sync=a.sync or "", tags=a.tags.split(",") if a.tags else [], timeout=a.timeout, pull=not a.no_pull, resume=a.resume, force=a.force, repo=a.repo, apply=a.apply, mem_gb=a.mem, cpu=a.cpu, model=a.model, check=a.check, effort=a.effort or "")
+                     workdir=a.dir or "", sync=a.sync or "", tags=a.tags.split(",") if a.tags else [], timeout=a.timeout, pull=not a.no_pull, resume=a.resume, force=a.force, repo=a.repo, apply=a.apply, mem_gb=a.mem, cpu=a.cpu, model=a.model, check=a.check, effort=a.effort or "", pin=a.pin)
     print(jid, file=sys.stderr)
     rc, text = wait_job(jid, a.max)
     print(text + repo_text(load_job(jid)) + artifacts_text(load_job(jid)) + check_text(load_job(jid)))
@@ -1979,6 +2031,11 @@ def cmd_wait(a) -> None:
 
 
 def repo_text(j: Dict[str, Any]) -> str:
+    moved = f"\n\n[moved] ran on {j['node']}: {j['moved_from']} had no room" if j.get("moved_from") and j.get("node") not in (None, j["moved_from"]) else ""
+    return moved + repo_result_text(j)
+
+
+def repo_result_text(j: Dict[str, Any]) -> str:
     if not j.get("repo"):
         return ""
     if j.get("repo_error"):
@@ -2281,6 +2338,28 @@ def fmt_devices(st: Dict[str, Any]) -> str:
     return " ".join(parts) or "-"
 
 
+def gpu_of(st: Dict[str, Any]) -> Optional[int]:
+    """How busy a machine's graphics card is (0..100), None when it has none or its node does not report it."""
+    try:
+        return max(0, min(100, int((st.get("gpu") or {})["util"])))
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None
+
+
+def fmt_gpu(st: Dict[str, Any]) -> str:
+    g = gpu_of(st)
+    return "-" if g is None else f"{g}%"
+
+
+def fmt_vram(st: Dict[str, Any]) -> str:
+    """'0.3/8G': the card's own memory. Empty where it shares the machine's (Apple silicon)."""
+    g = st.get("gpu") or {}
+    try:
+        return f"{int(g['mem_used_mb']) / 1024:.1f}/{int(g['mem_total_mb']) / 1024:.0f}G"
+    except (KeyError, TypeError, ValueError):
+        return ""
+
+
 # ── paint: colour and width for the terminal views ───────────────────────────
 PAINT = False   # set by paint_auto(): colour only on a terminal
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -2405,7 +2484,7 @@ def cmd_insights(a) -> None:
     tips: List[str] = []
     waiting_rows = [r for r in rows if r.get("waiting")]
     say("")
-    say(c(f"{'MACHINE':<{nw}}{'ONLINE':>8}{'AVG':>7}{'BUSY':>7}  {'BOTTLENECK (when busy)':<28}{'IDLE WHILE JOBS WAITED':>24}{'JOBS':>6}{'RUN':>8}{'FAIL':>6}", C_DIM))
+    say(c(f"{'MACHINE':<{nw}}{'ONLINE':>8}{'AVG':>7}{'BUSY':>7}{'GPU':>6}  {'BOTTLENECK (when busy)':<28}{'IDLE WHILE JOBS WAITED':>24}{'JOBS':>6}{'RUN':>8}{'FAIL':>6}", C_DIM))
     for r in rows:   # samples from before 0.9.3 have load and memory but no strain: work it out the same way
         for name, x in (r.get("nodes") or {}).items():
             if x.get("online") and "strain" not in x and name in cfg["nodes"] and x.get("cpus"):
@@ -2415,6 +2494,7 @@ def cmd_insights(a) -> None:
         on = [x for x in samples if x.get("online")]
         st = [x for x in on if "strain" in x]
         avg = sum(x["strain"] for x in st) / len(st) if st else 0
+        gp = [x["gpu"] for x in on if x.get("gpu") is not None]
         busy = [x for x in st if x["strain"] >= 0.9]
         necks: Dict[str, int] = {}
         for x in busy:
@@ -2427,7 +2507,7 @@ def cmd_insights(a) -> None:
         runs = sorted(j["run_s"] for j in mine if j.get("run_s"))
         fails = sum(1 for j in mine if j.get("status") == "failed")
         say(pad(c(label_of(cfg, name), C_TEXT, bold=True), nw) + f"{pct(len(on) / len(samples)) if samples else '-':>8}"
-            + f"{pct(avg) if st else '-':>7}{pct(len(busy) / len(st)) if st else '-':>7}  {neck_txt:<28}"
+            + f"{pct(avg) if st else '-':>7}{pct(len(busy) / len(st)) if st else '-':>7}{f'{sum(gp) / len(gp):.0f}%' if gp else '-':>6}  {neck_txt:<28}"
             + f"{pct(idle) if idle_w else '-':>24}{len(mine):>6}{fmt_dur(runs[len(runs) // 2]) if runs else '-':>8}{fails:>6}")
         if busy and len(busy) / max(len(st), 1) >= 0.2:
             top = max(necks, key=necks.get)
@@ -2705,13 +2785,14 @@ def cmd_status(a) -> None:
     metrics = refresh_metrics(cfg, names, max_age=0)
     say(f"orchestrator {socket.gethostname().split('.')[0]} · agent-scaleout {VERSION}")
     nw = name_w(cfg, 16)
-    say(f"{'machine':<{nw}}{'role':<14}{'os':<14}{'state':<12}{'route':<8}{'mem free':>9}{'disk free':>11}{'load':>8}{'jobs':>7}  {'devices':<9}agents")
+    say(f"{'machine':<{nw}}{'role':<14}{'os':<14}{'state':<12}{'route':<8}{'mem free':>9}{'disk free':>11}{'load':>8}{'gpu':>6}{'jobs':>7}  {'devices':<9}agents")
     for name in sorted(metrics):
         st = metrics[name]
         h = node_health(cfg, name, st)
+        h = "on hold" if h == "ok" and held(cfg["nodes"].get(name, {})) else h
         route = "-" if not st.get("online") else ("local" if cfg["nodes"].get(name, {}).get("local") else "lan" if str(st.get("route", "")).endswith("-lan") else "tunnel")
         say(f"{pad(label_of(cfg, name), nw)}{role_of(cfg, name):<14}{fmt_os(st, cfg['nodes'].get(name)):<14}{pad(c(h, C_OK if h == 'ok' else C_WARN), 12)}{route:<8}{str(st.get('mem_free_pct', '-')) + '%':>9}{str(st.get('disk_free_gb', '-')) + 'GB':>11}"
-            f"{str(st.get('load', '-')):>8}{str(st.get('running', 0)) + '+' + str(st.get('queued', 0)):>7}  {fmt_devices(st):<9}{','.join(st.get('agents') or []) or '-'}")
+            f"{str(st.get('load', '-')):>8}{fmt_gpu(st):>6}{str(st.get('running', 0)) + '+' + str(st.get('queued', 0)):>7}  {fmt_devices(st):<9}{','.join(st.get('agents') or []) or '-'}")
     q = [j for j in all_jobs() if j.get("status") in ("queued", "dispatched", "running")]
     say(f"queue: {sum(1 for j in q if j['status'] == 'queued')} waiting · {sum(1 for j in q if j['status'] != 'queued')} running")
     for name, ags in (read_json(AGENT_BLOCKS, {}) or {}).items():
@@ -2803,6 +2884,47 @@ def cmd_config(a) -> None:
     target[a.key] = v
     save_cfg(cfg)
     say(f"{a.node + '.' if a.node else ''}{a.key} = {v}")
+
+
+def clock_time(text: str) -> float:
+    """'HH:MM' (the next one) or 'MM-DD HH:MM' or 'YYYY-MM-DD HH:MM' as a time."""
+    lt = time.localtime()
+    for fmt in ("%Y-%m-%d %H:%M", "%m-%d %H:%M", "%H:%M"):
+        try:
+            t = time.strptime((f"{lt.tm_year}-{text}" if fmt == "%m-%d %H:%M" else text), "%Y-%m-%d %H:%M" if fmt == "%m-%d %H:%M" else fmt)
+        except ValueError:
+            continue
+        if fmt != "%H:%M":
+            return time.mktime(t)
+        at = time.mktime(lt[:3] + (t.tm_hour, t.tm_min, 0) + lt[6:8] + (-1,))
+        return at if at > now() else at + 86400
+    die(E_USAGE, f"time '{text}': use HH:MM or MM-DD HH:MM")
+    return 0.0
+
+
+def cmd_hold(a) -> None:
+    """Give a machine no new job for a while (before a reboot or an update). Jobs it already has go on."""
+    cfg = load_cfg()
+    show = lambda t: time.strftime("%m-%d %H:%M", time.localtime(t))
+    if not a.node:
+        rows = [(k, n) for k, n in cfg["nodes"].items() if float(n.get("hold_until") or 0) > now()]
+        say("\n".join(f"{k}: no new jobs {show(n.get('hold_from') or now())} - {show(n['hold_until'])}" for k, n in rows) or "no machine is on hold")
+        return
+    if a.node not in cfg["nodes"]:
+        die(E_NOT_FOUND, f"no node '{a.node}'")
+    n = cfg["nodes"][a.node]
+    if a.action == "off":
+        n.pop("hold_from", None); n.pop("hold_until", None)
+        save_cfg(cfg)
+        say(f"{a.node}: takes jobs again")
+        return
+    start = clock_time(a.start) if a.start else now()
+    until = clock_time(a.until) if a.until else start + 2 * 3600
+    if until <= start or until <= now():
+        die(E_USAGE, "--until must be after --from and in the future")
+    n["hold_from"], n["hold_until"] = int(start), int(until)
+    save_cfg(cfg)
+    say(f"{a.node}: no new jobs {show(start)} - {show(until)} (jobs it has go on; `scaleout hold {a.node} off` ends it)")
 
 
 # ── commands: daemon ─────────────────────────────────────────────────────────
@@ -4465,7 +4587,7 @@ def efficiency_lines(cfg: Dict[str, Any], jobs: List[Dict[str, Any]], nw: int) -
     for j in jobs:
         if j.get("status") in ("dispatched", "running") and j.get("node"):
             running[j["node"]] = running.get(j["node"], 0) + 1
-    L = [c(f"{'MACHINE':<{nw}}{'JOBS':>9}{'LOAD':>8}{'MEM':>7}{'STRAIN':>16}  {'BOTTLENECK':<11}{'SCORE':>7}{'LIVE':>7}", C_DIM)]
+    L = [c(f"{'MACHINE':<{nw}}{'JOBS':>9}{'LOAD':>8}{'MEM':>7}{'STRAIN':>16}  {'BOTTLENECK':<11}{'SCORE':>7}{'LIVE':>7}  GPU", C_DIM)]
     tot_score = live_score = 0.0
     for name in sorted(cfg["nodes"], key=lambda x: (not cfg["nodes"][x].get("local"), x)):
         n = cfg["nodes"][name]
@@ -4483,7 +4605,9 @@ def efficiency_lines(cfg: Dict[str, Any], jobs: List[Dict[str, Any]], nw: int) -
                  + f"{float(st.get('load', 0) or 0) / cores:>7.1f}×" + f"{gates['memory'] * 100:>6.0f}%"
                  + "  " + meter(strain * 100, 8, col) + c(f"{strain * 100:>5.0f}%", col)
                  + "  " + pad(c(neck, col if strain >= 0.6 else C_DIM), 11)
-                 + c(f"{score:>7.0f}" if score else f"{'-':>7}", C_DIM) + c(f"{live:>7.0f}" if score else f"{'-':>7}", col))
+                 + c(f"{score:>7.0f}" if score else f"{'-':>7}", C_DIM) + c(f"{live:>7.0f}" if score else f"{'-':>7}", col)
+                 + ("" if gpu_of(st) is None else "  " + meter(gpu_of(st), 4) + c(f"{fmt_gpu(st):>5}", C_ACCENT if gpu_of(st) else C_DIM)
+                    + c(f" {fmt_vram(st)}", C_DIM)))
     waiting = [j for j in jobs if j.get("status") == "queued" and not j.get("bench")]
     reasons: Dict[str, int] = {}
     for j in waiting:
@@ -4527,7 +4651,7 @@ def top_lines(cfg: Dict[str, Any], lu: "LocalUsage", interval: int, width: int =
     me = local_metrics()
     local = {n for n, v in cfg["nodes"].items() if v.get("local")}
     nw = name_w(cfg)
-    rows = [c(f"{'MACHINE':<{nw}}{'ROLE':<14}{'OS':<12}{'STATE':<9}{'MEM free':<14}{'SWAP':>6}{'DISK':>6}{'LOAD/CPU':>13}{'JOBS':>6}  DEVICES", C_DIM)]
+    rows = [c(f"{'MACHINE':<{nw}}{'ROLE':<13}{'OS':<12}{'STATE':<9}{'MEM free':<12}{'SWAP':>6}{'DISK':>6}{'LOAD/CPU':>13}{'GPU':>5}{'JOBS':>6}  DEVICES", C_DIM)]
 
     def machine(name: str, role: str, os_s: str, h: str, st: Dict[str, Any], swap: str) -> str:
         free = float(st.get("mem_free_pct") or 0)
@@ -4535,10 +4659,10 @@ def top_lines(cfg: Dict[str, Any], lu: "LocalUsage", interval: int, width: int =
         load = float(st.get("load") or 0)
         lc = C_OK if load < cpus else C_WARN if load < cpus * 2 else C_BAD
         dot = c("●", C_OK if h == "ok" else C_BAD if h.startswith(("off", "down", "unreach")) else C_WARN)
-        return (pad(c(name, C_TEXT, bold=True), nw) + pad(c(role, C_VIOLET if role == "orchestrator" else C_DIM), 14) + pad(os_s, 12)
+        return (pad(c(name, C_TEXT, bold=True), nw) + pad(c(role, C_VIOLET if role == "orchestrator" else C_DIM), 13) + pad(os_s, 12)
                 + pad(dot + " " + c(h, C_OK if h == "ok" else C_WARN), 9)
-                + meter(free, 8, level_color(free)) + f"{str(int(free)) + '%':>5} " + f"{swap:>6}" + f"{str(st.get('disk_free_gb', '?')) + 'G':>6}"
-                + "  " + meter(min(100, load / (cpus * 2) * 100), 4, lc) + c(f"{load:>4.1f}", lc) + c(f"/{cpus:<2}", C_DIM)
+                + meter(free, 6, level_color(free)) + f"{str(int(free)) + '%':>5} " + f"{swap:>6}" + f"{str(st.get('disk_free_gb', '?')) + 'G':>6}"
+                + "  " + meter(min(100, load / (cpus * 2) * 100), 4, lc) + c(f"{load:>4.1f}", lc) + c(f"/{cpus:<2}", C_DIM) + c(f"{fmt_gpu(st):>5}", C_ACCENT if gpu_of(st) else C_DIM)
                 + f"{str(st.get('running', 0)) + '+' + str(st.get('queued', 0)):>6}  {fmt_devices(st)}")
 
     if not local:
@@ -4551,7 +4675,7 @@ def top_lines(cfg: Dict[str, Any], lu: "LocalUsage", interval: int, width: int =
         if age is not None and age >= 90:
             h = f"{h} {age // 60}m"
         rows.append(machine(label_of(cfg, name), role_of(cfg, name), fmt_os(st, cfg["nodes"][name]), h[:7], st,
-                            f"{me.get('swap_gb', '-')}G" if name in local else "-"))
+                            f"{st['swap_gb']}G" if st.get("swap_gb") is not None else f"{me.get('swap_gb', '-')}G" if name in local else "-"))
     L.extend(box("MACHINES", rows, width, f"{len(rows) - 1} in the pool"))
     try:
         L.extend(box("EFFICIENCY", efficiency_lines(cfg, all_jobs(), nw), width, "load = per core (full at 2×) · strain = the fullest gate"))
@@ -4607,6 +4731,8 @@ def top_lines(cfg: Dict[str, Any], lu: "LocalUsage", interval: int, width: int =
 
 def cmd_top(a) -> None:
     cfg_t = 0.0
+    me, born = Path(__file__).resolve(), Path(__file__).resolve().stat().st_mtime
+    newer = False
     cfg = load_cfg()
     lu = LocalUsage()
 
@@ -4631,6 +4757,12 @@ def cmd_top(a) -> None:
         while True:
             if now() - cfg_t > 30:
                 cfg, cfg_t = load_cfg(), now()
+                try:
+                    newer = me.stat().st_mtime != born   # scaleout was updated: this window starts again as the new version
+                except OSError:
+                    pass
+                if newer:
+                    break
             out.write("\x1b[H" + "".join(line + "\x1b[K\n" for line in frame()) + "\x1b[J")
             out.flush()
             if select.select([fd], [], [], a.interval)[0]:   # sleeps here between redraws: no busy loop
@@ -4643,6 +4775,8 @@ def cmd_top(a) -> None:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
         out.write("\x1b[?25h\x1b[?1049l")
         out.flush()
+    if newer:
+        os.execv(sys.executable, [sys.executable, str(me)] + sys.argv[1:])
 
 
 # ── cli ──────────────────────────────────────────────────────────────────────
@@ -4704,6 +4838,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         s.add_argument("--apply", action="store_true", help="with --repo: also apply the result to this working tree (never forced)")
         s.add_argument("--mem", type=float, default=0, help="GB of memory the job needs (default: learned per node and job kind, else by tags)")
         s.add_argument("--cpu", type=int, default=0, help="CPU units: 2 = heavy (builds, tests, simulators), 1 = light (default: guessed from tags and task)")
+        s.add_argument("--pin", action="store_true", help="with -w: wait for that machine however long it takes (default: after unpin_min minutes a job that needs nothing of it may go to another)")
         s.add_argument("--force", action="store_true", help="with --resume: even if the session was just written here")
         s.add_argument("--model", default="auto", help="Claude model for this job: auto (checks go to check_model), default (the node's own), or a model name")
         s.add_argument("--effort", choices=EFFORTS, help="effort of this job (default: the machine's own; check_effort where --model or a check changes the model)")
@@ -4727,6 +4862,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     s.add_argument("--deep", action="store_true", help="--aggressive plus machine-wide: docker prune, unavailable simulators"); s.set_defaults(fn=cmd_cleanup)
     s = sp.add_parser("sync-skills", help="send ~/.claude skills/agents/commands to nodes"); s.add_argument("names", nargs="*"); s.set_defaults(fn=cmd_sync_skills)
     s = sp.add_parser("update", help="push this version to nodes"); s.add_argument("names", nargs="*"); s.set_defaults(fn=cmd_update)
+    s = sp.add_parser("hold", help="give a machine no new jobs for a while (before a reboot): hold NODE [--from TIME] [--until TIME] | hold NODE off")
+    s.add_argument("node", nargs="?"); s.add_argument("action", nargs="?", choices=("on", "off"), default="on")
+    s.add_argument("--from", dest="start", help="HH:MM or MM-DD HH:MM (default now)"); s.add_argument("--until", help="HH:MM or MM-DD HH:MM (default 2 hours)"); s.set_defaults(fn=cmd_hold)
     s = sp.add_parser("config", help="show/set defaults (or --node NAME settings)"); s.add_argument("key", nargs="?"); s.add_argument("value", nargs="?"); s.add_argument("--node"); s.set_defaults(fn=cmd_config)
 
     s = sp.add_parser("bench", help="score nodes (100 = one M1 8GB Mac mini) and track how the pool grows; --load runs a load test")
