@@ -31,8 +31,35 @@ disk_free_gb() {  # free GB of the disk holding $1 (falls back to $HOME when the
   local p="${1:-$HOME}" v; p="${p/#\~/$HOME}"; [ -e "$p" ] || p="$HOME"
   v="$(df -Pk "$p" 2>/dev/null | awk 'NR==2 {printf "%d", $4/1048576}')"; echo "${v:-0}"
 }
+swap_gb() {  # swap in use
+  if [ "$OS" = Darwin ]; then sysctl -n vm.swapusage 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "used") {printf "%.1f", $(i + 2) / 1024; f = 1; exit}} END {if (!f) printf "0"}'
+  else awk '/^SwapTotal/ {t = $2} /^SwapFree/ {f = $2} END {printf "%.1f", (t - f) / 1048576}' /proc/meminfo; fi
+}
 load1() { if [ "$OS" = Darwin ]; then sysctl -n vm.loadavg | awk '{print $2}'; else cut -d' ' -f1 /proc/loadavg; fi; }
 cpus() { if [ "$OS" = Darwin ]; then sysctl -n hw.ncpu; else nproc; fi; }
+gpu() {  # {"util":..,"mem_used_mb":..,"mem_total_mb":..,"temp":..,"name":".."} of the first graphics card, or null when it cannot be read
+  local q u a f x out=""
+  if [ "$OS" = Darwin ]; then   # memory is shared with the machine on Apple silicon: only how busy it is
+    u="$(ioreg -r -d 1 -c IOAccelerator 2>/dev/null | sed -n 's/.*"Device Utilization %"=\([0-9][0-9]*\).*/\1/p' | head -1)"
+    if [ -n "$u" ]; then printf '{"util":%s}' "$u"; else echo null; fi; return
+  fi
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    q="$(timeout 5 nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,name --format=csv,noheader,nounits 2>/dev/null | head -1)"
+    case "$q" in *,*,*,*,*)
+      u="$(timeout 5 nvidia-smi -q -d UTILIZATION 2>/dev/null | awk '/GPU Utilization Samples/ {f = 1} f && /Avg/ {print $3; exit}')"   # over the last ~12 s
+      case "$u" in ''|*[!0-9]*) u="${q%%,*}" ;; esac
+      for x in util mem_used_mb mem_total_mb temp; do
+        a="${q%%,*}"; q="${q#*,}"; [ "$x" = util ] && a="$u"
+        a="$(printf '%s' "$a" | tr -dc '0-9')"; [ -n "$a" ] && out="$out\"$x\":$a,"
+      done
+      printf '{%s"name":"%s"}' "$out" "$(j "${q# }")"; return ;;
+    esac
+  fi
+  for f in /sys/class/drm/card[0-9]*/device/gpu_busy_percent; do   # AMD
+    u="$(cat "$f" 2>/dev/null)"; case "$u" in ''|*[!0-9]*) ;; *) printf '{"util":%s}' "$u"; return ;; esac
+  done
+  echo null
+}
 running_jobs() { local n=0 d; for d in "$B"/jobs/*/; do [ -f "$d/started" ] && [ ! -f "$d/rc" ] && n=$((n + 1)); done; echo "$n"; }
 dd_drop() {  # dd_drop <folder>|orphans -> how many Xcode build caches (DerivedData) went
   # Xcode keeps one build cache per workspace path (4-8 GB for a Flutter app) and never removes it, so every repo work tree
@@ -152,16 +179,21 @@ caps() {   # what this machine can run, as tags a job may ask for: an Android em
   { [ -x "$SDK_DIR/emulator/emulator" ] && ls "$HOME"/.android/avd/*.ini >/dev/null 2>&1; } && c="$c\"emulator\","
   [ "$OS" = Darwin ] && xcrun simctl help >/dev/null 2>&1 && c="$c\"simulator\",\"ios-simulator\","
   command -v maestro >/dev/null 2>&1 && c="$c\"maestro\","
+  [ "$OS" != Darwin ] && command -v nvidia-smi >/dev/null 2>&1 && timeout 5 nvidia-smi -L >/dev/null 2>&1 && c="$c\"gpu\","
   printf '[%s]' "${c%,}"
 }
 
 verb="${1:-}"; shift || true
 case "$verb" in
   version) echo "$VERSION" ;;
+  guide)   # the machine's guide on stdin (empty removes it): jobs read it at ~/.scaleout/guide.md
+    cat > "$B/guide.md.new"
+    if [ -s "$B/guide.md.new" ]; then mv -f "$B/guide.md.new" "$B/guide.md"; else rm -f "$B/guide.md.new" "$B/guide.md"; fi
+    echo ok ;;
   metrics)
-    printf '{"os":"%s","arch":"%s","host":"%s","mem_free_pct":%s,"mem_total_gb":%s,"disk_free_gb":%s,"work_free_gb":%s,"load":%s,"cpus":%s,"running":%s,"queued":%s,"runner":%s,"agents":%s,"devices":%s,"claude":%s,"caps":%s,"skills_hash":"%s","version":"%s"}\n' \
-      "$(j "$OS")" "$(uname -m)" "$(j "$(hostname)")" "$(mem_free_pct)" "$(mem_total_gb)" "$(disk_free_gb "$HOME")" \
-      "$(disk_free_gb "${WORK_ROOT:-$HOME}")" "$(load1)" "$(cpus)" "$(running_jobs)" "$(queued_jobs)" "$(runner_ok)" "$(agents)" "$(devices)" "$(claude_now)" "$(caps)" "$(skills_hash)" "$VERSION" ;;
+    printf '{"os":"%s","arch":"%s","host":"%s","mem_free_pct":%s,"mem_total_gb":%s,"swap_gb":%s,"disk_free_gb":%s,"work_free_gb":%s,"load":%s,"cpus":%s,"gpu":%s,"running":%s,"queued":%s,"runner":%s,"agents":%s,"devices":%s,"claude":%s,"caps":%s,"skills_hash":"%s","version":"%s"}\n' \
+      "$(j "$OS")" "$(uname -m)" "$(j "$(hostname)")" "$(mem_free_pct)" "$(mem_total_gb)" "$(swap_gb)" "$(disk_free_gb "$HOME")" \
+      "$(disk_free_gb "${WORK_ROOT:-$HOME}")" "$(load1)" "$(cpus)" "$(gpu)" "$(running_jobs)" "$(queued_jobs)" "$(runner_ok)" "$(agents)" "$(devices)" "$(claude_now)" "$(caps)" "$(skills_hash)" "$VERSION" ;;
 
   submit)  # submit <jid> <agent> <timeout_min> <workdir> [resume-session-id] [model] [effort]   (prompt on stdin)
     jid="$1"; d="$B/jobs/$jid"; mkdir -p "$d" "$B/queue"

@@ -34,7 +34,7 @@ scaleout install-daemon   # 권장: 배정 · 회수 · 복구를 뒤에서 계�
 
 ## 일 맡기기
 ```bash
-scaleout status                                    # 노드별 상태 · 남은 메모리 · 디스크 · 부하 · 일 · 에이전트
+scaleout status                                    # 노드별 상태 · 남은 메모리 · 디스크 · CPU 부하 · GPU 사용률 · 일 · 에이전트
 echo "api 테스트 돌리고 실패만 요약해" | scaleout run -d ~/src/app
 id=$(scaleout submit -f task.md --tags xcode); scaleout wait "$id"
 scaleout run --sync ~/work/proj -f task.md        # 오케스트레이터 폴더를 노드로 보내 작업 → 다시 받아 옴
@@ -58,6 +58,10 @@ scaleout exec build-01 -- df -h                    # 노드에서 아무 명령
 - **기기 전체 정리:** Docker prune, 시뮬레이터 정리는 사람이 `scaleout cleanup 노드 --deep`으로 부를 때만 해요.
 
 ## 오케스트레이터도 일해요
+- **GPU:** `scaleout status` · `top`에 머신마다 GPU 사용률이 나와요(NVIDIA는 그래픽 메모리까지, 맥은 사용률만). NVIDIA 드라이버가 도는 리눅스 노드는 `gpu` 태그를 저절로 가져서 `--tags gpu`로 보내면 돼요. `top`의 SWAP도 머신마다 나와요.
+- **`-w 노드`로 고른 일:** 그 노드에 자리가 없어 `unpin_min`분(기본 10, 0이면 끔)을 기다리면, 제 파일을 갖고 오고(`--repo` · `--sync`) 그 머신만의 것(에뮬레이터 · 실기기 · OS · GPU · 머신 이름 · 성능 재기 …)을 말하지 않는 일은 다른 노드로 가요. 꼭 그 노드여야 하면 `--pin`을 붙여요.
+- **머신 안내(`scaleout guide 노드 -f 파일`):** 그 머신에서만 다르게 해야 하는 것(그래픽카드를 쓰는 실행 파일 · 동시 개수 · 에뮬레이터 옵션 …)을 오케스트레이터에 한 번 적어 두면, 일을 넘길 때 머신 상태를 보고 맞는 절만 지시문에 붙여요. `<!-- when: 낱말|낱말 -->`은 지시문에 그 낱말이 있을 때만, `<!-- needs: gpu -->`는 그 태그가 지금 될 때만이에요(안 되면 「지금 안 됨」이라고 알려요). 전체 글은 노드의 `~/.scaleout/guide.md`에 있고, 오케스트레이터의 새 세션도 요약을 받아요. `--for "지시문"`으로 무엇이 붙는지 미리 봐요.
+- **`scaleout hold 노드 --from 07:30 --until 10:00`:** 재부팅 전처럼 그 노드에 한동안 새 일을 안 보내요. `scaleout hold 노드 off`로 끝내요.
 - **`scaleout local on [--max-jobs N]`:** 오케스트레이터에 여유가 있으면 먼저 직접 일하고, 바쁘면 노드로, 아무도 여유가 없으면 대기열에서 기다려요. 노드 설치 · SSH가 필요 없어요. `scaleout top`에는 `orchestrator` 한 줄로 보여요. `scaleout local off`로 꺼요(도는 일은 끝까지 해요).
 - **레포 일:** 내장 디스크(`~/.local/state/scaleout/local`)의 사본에서 해요. 처음 한 번만 복사하고 다음부터는 바뀐 부분만 보내요.
 - **macOS 주의:** launchd로 도는 Apple 것이 아닌 프로그램(Claude Code · Homebrew/uv 파이썬 · node)은 외장 디스크를 건드리면 권한 창을 기다리며 멈춰요. worktree의 `.git`이 외장 디스크를 가리켜도 같아요. 그래서 데몬은 `/usr/bin/python3`로 돌고, 오케스트레이터의 일은 내장 디스크에서 해요. 다른 launchd 서비스의 작업 폴더도 내장에 두세요.

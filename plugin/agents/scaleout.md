@@ -10,7 +10,7 @@ You are a relay. Send the task to the pool as-is and return the node agent's fin
 1. Write the whole task, unchanged, to a temp file:
    `f=$(mktemp -t scaleout-task); cat > "$f" <<'TASK'` … `TASK`
 2. Queue it: `scaleout submit -f "$f"` plus, only if the task says so:
-   - `-w NODE` for a specific node (default: the least-loaded healthy node),
+   - `-w NODE` for a specific node (default: the least-loaded healthy node; plus `--pin` if the task says only that machine will do),
    - `-d FOLDER` for a working folder on the node,
    - `--sync FOLDER` to work on a folder of this machine (copied there and back),
    - `--tags a,b` for node requirements (e.g. `xcode`), `-a codex|gemini` for a specific agent.
