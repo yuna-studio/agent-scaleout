@@ -305,6 +305,33 @@ PY
     fi
     echo "disk_free_gb $before -> $(disk_free_gb), work trees dropped $wts" ;;
 
+  spec)  # what the machine is built from (read once a day): memory kind, speed and modules, graphics card and its cores or memory.
+         # Placing weighs these with the free % so work goes where it runs fastest. Nothing here needs root.
+    mt="" mm="" md=0 gn="" gv="" gc=""
+    if [ "$OS" = Darwin ]; then
+      sp="$(system_profiler SPDisplaysDataType SPMemoryDataType 2>/dev/null)"
+      gn="$(printf '%s\n' "$sp" | sed -n 's/^ *Chipset Model: //p' | head -1)"
+      gc="$(printf '%s\n' "$sp" | sed -n 's/^ *Total Number of Cores: \([0-9]*\).*/\1/p' | head -1)"
+      gv="$(printf '%s\n' "$sp" | sed -n 's/^ *VRAM ([^)]*): \([0-9]*\) GB.*/\1/p' | head -1)"; [ -n "$gv" ] && gv=$((gv * 1024))
+      mt="$(printf '%s\n' "$sp" | sed -n 's/^ *Type: \(.*DDR.*\)/\1/p' | head -1)"
+      mm="$(printf '%s\n' "$sp" | sed -n 's/^ *Speed: \([0-9]*\) MHz.*/\1/p' | head -1)"   # Intel Macs; Apple silicon does not say
+    else
+      if command -v udevadm >/dev/null 2>&1; then   # systemd reads the memory modules from the firmware tables for everyone
+        p="$(udevadm info -q property /sys/class/dmi/id 2>/dev/null)"
+        mt="$(printf '%s\n' "$p" | sed -n 's/^MEMORY_DEVICE_[0-9]*_TYPE=\(.*DDR.*\)/\1/p' | head -1)"
+        mm="$(printf '%s\n' "$p" | sed -n 's/^MEMORY_DEVICE_[0-9]*_CONFIGURED_SPEED_MTS=\([0-9][0-9]*\)$/\1/p' | head -1)"
+        [ -n "$mm" ] || mm="$(printf '%s\n' "$p" | sed -n 's/^MEMORY_DEVICE_[0-9]*_SPEED_MTS=\([0-9][0-9]*\)$/\1/p' | head -1)"
+        md="$(printf '%s\n' "$p" | grep -cE '^MEMORY_DEVICE_[0-9]+_SIZE=[1-9]')"
+      fi
+      if command -v nvidia-smi >/dev/null 2>&1; then
+        q="$(timeout 5 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)"
+        case "$q" in *,*) gn="${q%,*}"; gv="$(printf '%s' "${q##*,}" | tr -dc '0-9')" ;; esac
+      fi
+      [ -n "$gn" ] || gn="$(lspci 2>/dev/null | grep -iE 'vga|3d controller|display controller' | head -1 | sed 's/^[^:]*:[^:]*: //')"
+    fi
+    printf '{"cpu":"%s","cpus":%s,"mem_total_gb":%s,"mem_type":"%s","mem_mts":%s,"mem_modules":%s,"gpu_name":"%s","gpu_vram_mb":%s,"gpu_cores":%s}\n' \
+      "$(j "$(model)")" "$(cpus)" "$(mem_total_gb)" "$(j "$mt")" "${mm:-0}" "${md:-0}" "$(j "$gn")" "${gv:-0}" "${gc:-0}" ;;
+
   bench)  # hardware probe for `scaleout bench`: gzip of random data on one core and on all cores, disk write, memory
     t="$B/bench.tmp"; rm -rf "$t"; mkdir -p "$t"
     head -c 33554432 /dev/urandom > "$t/r"

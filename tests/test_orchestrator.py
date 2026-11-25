@@ -1450,6 +1450,63 @@ class E2E(unittest.TestCase):
 class DispatchFailure(unittest.TestCase):
     """A node has room but the hand-over fails: the job must say why instead of waiting with nothing shown."""
 
+    def test_99h_spec_placing(self):
+        # parts: graphics by name, cores and memory; memory by kind, speed and modules
+        self.assertEqual(so.gpu_power("NVIDIA GeForce GTX 1070 Ti", 8192), (8.2, "card"))
+        self.assertEqual(so.gpu_power("NVIDIA GeForce GTX 1070", 8192), (6.5, "card"))
+        self.assertEqual(so.gpu_power("Apple M1", 0, 8), (2.6, "built-in"))
+        self.assertEqual(so.gpu_power("Apple M2", 0, 10), (3.6, "built-in"))
+        self.assertEqual(so.gpu_power("NVIDIA RTX A9999", 24576), (28.8, "card"))   # unknown card: by its memory
+        self.assertEqual(so.gpu_power("Intel Corporation UHD Graphics 630"), (0.5, "built-in"))
+        self.assertEqual(so.gpu_power(""), (0.0, ""))
+        ddr4 = {"mem_type": "DDR4", "mem_mts": 3200, "mem_modules": 2}
+        self.assertEqual(so.mem_speed(ddr4, {}), (51.2, "DDR4-3200 x2"))
+        self.assertEqual(so.mem_speed({**ddr4, "mem_mts": 2400}, {}), (38.4, "DDR4-2400 x2"))       # slower modules, less
+        self.assertEqual(so.mem_speed({**ddr4, "mem_modules": 4}, {}), (51.2, "DDR4-3200 x4"))     # still two channels
+        self.assertEqual(so.mem_speed(ddr4, {"mem_channels": 4})[0], 102.4)
+        self.assertEqual(so.mem_speed({"gpu_name": "Apple M2", "mem_type": "LPDDR5"}, {}), (100.0, "LPDDR5"))
+        self.assertEqual(so.mem_speed({"mem_type": "DDR5"}, {}), (76.8, "DDR5-4800"))
+        self.assertEqual(so.mem_speed(ddr4, {"mem_gbps": 45})[0], 45.0)
+        # kinds of work, from the task; "do not" sentences do not count
+        need = lambda text, tags=(): so.job_needs({"text": text, "tags": list(tags)})
+        self.assertEqual(need("Blender Cycles 로 렌더해서 PNG 저장"), "gpu")
+        self.assertEqual(need("xvfb-run 으로 Godot 화면 캡처 31장"), "gpu")
+        self.assertEqual(need("anything", ["gpu"]), "gpu")
+        self.assertEqual(need("Godot --headless 로 C# 시험을 돌린다. 스크린샷은 찍지 않는다."), "build")
+        self.assertEqual(need("dotnet test 전부 돌리고 보고만"), "build")
+        self.assertEqual(need("이 함수가 어디서 불리는지 찾아 정리해줘"), "light")
+        # guide words: "a+b" = both somewhere in the task
+        self.assertTrue(so.asks("Godot 으로 띄워 스크린샷 31장", ["godot+스크린샷"]))
+        self.assertFalse(so.asks("Godot --headless 로 C# 시험", ["godot+스크린샷"]))
+        self.assertFalse(so.asks("Flutter E2E 마다 스크린샷", ["godot+스크린샷"]))
+        self.assertTrue(so.asks("blender 렌더", ["godot+스크린샷", "blender"]))
+        # placing: a graphics job goes to the card even when it is busier; a build goes where CPU is left
+        cfg = so.load_cfg()
+        cfg["nodes"] = {"card": {"max_jobs": 4, "agent": "claude"}, "mac": {"max_jobs": 2, "agent": "claude"}}
+        cfg["defaults"]["max_load_per_cpu"] = 2
+        base = {"online": True, "runner": True, "agents": ["claude"], "disk_free_gb": 200, "mem_free_pct": 60}
+        card = {**base, "os": "Linux", "cpus": 16, "mem_total_gb": 32, "load": 8, "gpu": {"util": 30, "mem_used_mb": 900, "mem_total_mb": 8192},
+                "spec": {"cpu": "AMD Ryzen 7 5700X", "gpu_name": "NVIDIA GeForce GTX 1070 Ti", "gpu_vram_mb": 8192, **ddr4}}
+        mac = {**base, "os": "Linux", "cpus": 8, "mem_total_gb": 16, "load": 0, "gpu": {"util": 0},
+               "spec": {"cpu": "Apple M1", "gpu_name": "Apple M1", "gpu_cores": 8, "mem_type": "LPDDR4"}}
+        s = so.node_spec(cfg, "card", card)
+        self.assertEqual((s["gpu"], s["gpu_tflops"], s["vram_gb"], s["mem"], s["mem_gbps"]), ("GTX 1070 Ti", 8.2, 8, "DDR4-3200 x2", 51.2))
+        self.assertEqual(so.node_spec(cfg, "mac", mac)["gpu"], "Apple M1 8-core")
+        self.assertIn("GTX 1070 Ti 8.2 TF 8 GB", so.spec_line(cfg, "card", card))
+        render = {"id": "", "text": "Blender 렌더", "tags": [], "agent": "default"}
+        build = {"id": "", "text": "dotnet test 전부", "tags": [], "agent": "default"}
+        why: dict = {}
+        self.assertEqual(so.pick_node(cfg, render, {"card": card, "mac": mac}, {"card": 1, "mac": 0}, why=why), "card")
+        self.assertTrue(why["*"].startswith("gpu job"), why)
+        self.assertEqual(so.pick_node(cfg, build, {"card": dict(card, load=0), "mac": mac}, {"card": 0, "mac": 0}), "card")   # idle: more cores
+        self.assertEqual(so.pick_node(cfg, build, {"card": dict(card, load=30), "mac": mac}, {"card": 3, "mac": 0}), "mac")  # its CPU is taken
+        # a full card takes no more graphics work while another machine can draw
+        full = dict(card, gpu={"util": 99, "mem_used_mb": 900, "mem_total_mb": 8192})
+        self.assertEqual(so.pick_node(cfg, render, {"card": full, "mac": mac}, {"card": 1, "mac": 0}), "mac")
+        # a part the tables do not know is set by hand
+        cfg["nodes"]["mac"]["gpu_tflops"] = 50
+        self.assertEqual(so.node_spec(cfg, "mac", mac)["gpu_tflops"], 50.0)
+
     def test_error_line_picks_the_git_reason(self):
         text = "To ssh://node/repo.git\n ! [remote rejected]   abc -> refs/scaleout/base/j1 (shallow update not allowed)\nerror: failed to push some refs to 'ssh://node/repo.git'"
         self.assertIn("failed to push", so.dispatch_error_line(text))
