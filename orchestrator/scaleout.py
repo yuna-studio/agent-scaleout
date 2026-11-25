@@ -34,7 +34,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "0.9.17"
+VERSION = "0.9.18"
 HOME = Path.home()
 CONF_DIR = Path(os.environ.get("SCALEOUT_CONF", HOME / ".config" / "scaleout"))
 STATE_DIR = Path(os.environ.get("SCALEOUT_STATE", HOME / ".local" / "state" / "scaleout"))
@@ -1234,7 +1234,7 @@ HEAVY_WORDS = re.compile(r"e2e|maestro|emulator|simulator|에뮬|시뮬|xcodebui
 def job_text(j: Dict[str, Any]) -> str:
     """The start of the job's prompt (what kind of work it is)."""
     try:
-        return (STATE_DIR / "prompts" / f"{j['id']}.md").read_text(errors="replace")[:4000]
+        return (j.get("text") or (STATE_DIR / "prompts" / f"{j['id']}.md").read_text(errors="replace"))[:4000]
     except (OSError, KeyError):
         return ""
 
@@ -1270,7 +1270,7 @@ def job_platform(j: Dict[str, Any]) -> str:
 
 # A -w job is tied to its machine when it names something only that machine has, a device or emulator set up there, its OS, or
 # speed and pixels that differ by machine. Sentences that say not to use such a thing do not count.
-PIN_NOT = re.compile(r"[^.\n|]{0,80}?(하지 ?(않|말|마)|쓰지 ?(않|말|마)|띄우지|켜지 ?(않|말|마)|안 ?(쓴|쓰|한|켠|띄)|금지|말 것|없이|do not|don't|never|without)[^.\n|]*", re.I)
+PIN_NOT = re.compile(r"[^.\n|]{0,80}?(지 ?(않|말|마)|띄우지|안 ?(쓴|쓰|한|켠|띄|찍)|금지|말 것|없이|do not|don't|never|without|\bno (screenshots?|gpu|emulator)\b)[^.\n|]*", re.I)
 PIN_STAYS = re.compile(r"godot|blender|블렌더|에뮬|emulator|\bavd\b|\badb\b|시뮬레이터|simulator|simctl|xcode|\bpod install|xvfb|maestro|golden|골든|"
                        r"ubuntu|우분투|라이젠|맥 ?미니|\blinux\b|리눅스|windows|macbook|맥북|/home/|nvidia|\bgpu\b|그래픽카드|docker|"
                        r"이 (머신|기계|pc)(에서|의|에)|this (machine|node|computer)|벤치|benchmark|프로파일|profil|\bfps\b|끊김|성능(을|이)? ?(재|측정)", re.I)
@@ -1313,19 +1313,178 @@ def job_disk_gb(j: Dict[str, Any]) -> float:
     return 4.0 if heavy else 1.0
 
 
-_PERF: Dict[str, Any] = {"t": 0, "v": {}}
+_BENCH: Dict[str, Any] = {"t": 0, "v": {}}
+
+
+def bench_of(name: str) -> Dict[str, Any]:
+    """The last `scaleout bench` of a machine: single_x / multi_x (1.0 = an M1 MacBook), disk_mbps, model ({} = never measured)."""
+    if now() - _BENCH["t"] > 60:
+        v: Dict[str, Dict[str, Any]] = {}
+        for h in bench_history():
+            for k, b in (h.get("nodes") or {}).items():
+                if isinstance(b, dict) and b.get("multi_x"):
+                    v[k] = b
+        _BENCH.update(t=now(), v=v)
+    return _BENCH["v"].get(name) or {}
 
 
 def node_perf(name: str, st: Dict[str, Any]) -> float:
     """All-core speed of a machine, 1.0 = an M1 MacBook: its last `scaleout bench` (multi_x), else a guess from its threads."""
-    if now() - _PERF["t"] > 60:
-        v: Dict[str, float] = {}
-        for h in bench_history():
-            for k, b in (h.get("nodes") or {}).items():
-                if isinstance(b, dict) and b.get("multi_x"):
-                    v[k] = float(b["multi_x"])
-        _PERF.update(t=now(), v=v)
-    return _PERF["v"].get(name) or max(int(st.get("cpus", 1) or 1), 1) / 6.5
+    return float(bench_of(name).get("multi_x") or 0) or max(int(st.get("cpus", 1) or 1), 1) / 6.5
+
+
+# What a machine is built from. Free % alone says where there is room, not how fast a job runs there: a busy graphics card can
+# still beat an idle built-in one, and 16 threads at full load give a new job less than 8 idle ones. Placing weighs both.
+# CPU is measured (`scaleout bench`); memory and graphics are read from the machine once a day (`ctl spec`) and looked up below.
+# A machine whose parts the tables do not know: `scaleout config gpu_tflops|mem_gbps|mem_channels <value> --node NAME`.
+APPLE_CHIPS = {   # chip -> (memory GB/s, graphics TFLOPS per GPU core)
+    "m1": (68, 0.33), "m1 pro": (200, 0.33), "m1 max": (400, 0.33), "m1 ultra": (800, 0.33),
+    "m2": (100, 0.36), "m2 pro": (200, 0.36), "m2 max": (400, 0.36), "m2 ultra": (800, 0.36),
+    "m3": (100, 0.36), "m3 pro": (150, 0.36), "m3 max": (400, 0.36), "m3 ultra": (819, 0.36),
+    "m4": (120, 0.43), "m4 pro": (273, 0.43), "m4 max": (546, 0.43), "m5": (153, 0.45),
+}
+GPU_TFLOPS = {    # FP32 at boost clock; the longest name found in the card's name wins ("gtx 1070 ti" over "gtx 1070")
+    "gtx 1050": 1.9, "gtx 1050 ti": 2.1, "gtx 1060": 4.4, "gtx 1070": 6.5, "gtx 1070 ti": 8.2, "gtx 1080": 8.9, "gtx 1080 ti": 11.3,
+    "gtx 1650": 3.0, "gtx 1650 super": 4.4, "gtx 1660": 5.0, "gtx 1660 super": 5.0, "gtx 1660 ti": 5.4,
+    "rtx 2060": 6.5, "rtx 2060 super": 7.2, "rtx 2070": 7.5, "rtx 2070 super": 9.1, "rtx 2080": 10.1, "rtx 2080 super": 11.2,
+    "rtx 2080 ti": 13.4, "rtx 3050": 9.1, "rtx 3060": 12.7, "rtx 3060 ti": 16.2, "rtx 3070": 20.3, "rtx 3070 ti": 21.7,
+    "rtx 3080": 29.8, "rtx 3080 ti": 34.1, "rtx 3090": 35.6, "rtx 4060": 15.1, "rtx 4060 ti": 22.1, "rtx 4070": 29.1,
+    "rtx 4070 super": 35.5, "rtx 4070 ti": 40.1, "rtx 4080": 48.7, "rtx 4090": 82.6, "rtx 5060": 19.2, "rtx 5060 ti": 23.7,
+    "rtx 5070": 30.9, "rtx 5070 ti": 43.9, "rtx 5080": 56.3, "rtx 5090": 104.8,
+}
+MEM_MTS = {"ddr3": 1600, "ddr4": 2666, "ddr5": 4800, "lpddr4": 3200, "lpddr4x": 4266, "lpddr5": 6400, "lpddr5x": 7500}   # when unread
+APPLE_RE = re.compile(r"apple (m\d+(?: pro| max| ultra)?)", re.I)
+SPEC_TTL = 86400
+
+
+def gpu_power(name: str, vram_mb: int = 0, cores: int = 0) -> Tuple[float, str]:
+    """(TFLOPS, "card" | "built-in" | "") of a graphics chip from its name, memory and cores."""
+    low = re.sub(r"\s+", " ", name.lower()).strip()
+    m = APPLE_RE.search(low)
+    if m:
+        return round(APPLE_CHIPS.get(m.group(1), (0, 0.36))[1] * (cores or 8), 1), "built-in"
+    hit = max((k for k in GPU_TFLOPS if k in low), key=len, default="")
+    if hit:
+        return GPU_TFLOPS[hit], "card"
+    if re.search(r"nvidia|geforce|quadro|tesla|radeon (rx|pro)|\barc a\d", low):
+        return round(max(2.0, vram_mb / 1024 * 1.2), 1), "card"      # a card the table does not know: about its memory size
+    if low:
+        return 0.5, "built-in"                                        # Intel, an AMD APU, a server's display chip
+    return 0.0, ""
+
+
+def mem_speed(raw: Dict[str, Any], n: Dict[str, Any]) -> Tuple[float, str]:
+    """(GB/s, e.g. "DDR4-3200 x2") of a machine's memory: Apple silicon by chip, others by kind x speed x channels."""
+    kind = str(raw.get("mem_type") or "")
+    m = APPLE_RE.search(f"{raw.get('gpu_name', '')} {raw.get('cpu', '')}")
+    mts = int(raw.get("mem_mts") or 0) or MEM_MTS.get(kind.lower(), 0)
+    mods = int(raw.get("mem_modules") or 0)
+    label = kind if m or not mts else f"{kind}-{mts}" + (f" x{mods}" if mods else "")
+    if n.get("mem_gbps"):
+        return float(n["mem_gbps"]), label
+    if m:
+        return float(APPLE_CHIPS.get(m.group(1).lower(), (100, 0))[0]), label
+    if not mts:
+        return 0.0, label
+    channels = int(n.get("mem_channels") or (min(mods, 2) if mods else 2))   # a desktop board runs two modules side by side
+    return round(mts * 8 * channels / 1000, 1), label
+
+
+def node_spec(cfg: Dict[str, Any], name: str, st: Dict[str, Any]) -> Dict[str, Any]:
+    """What a machine can do flat out: CPU on one core and on all (1.0 = an M1 MacBook), graphics TFLOPS, memory GB/s, disk MB/s."""
+    n, raw, b, g = cfg["nodes"].get(name, {}), st.get("spec") or {}, bench_of(name), st.get("gpu") or {}
+    cpus = max(int(st.get("cpus") or raw.get("cpus") or b.get("cpus") or 1), 1)
+    gname = str(raw.get("gpu_name") or g.get("name") or "")
+    if not gname:   # a node from before `ctl spec`: an Apple chip still says what it is in its CPU name
+        m = APPLE_RE.search(str(b.get("model") or ""))
+        gname = m.group(0) if m else ""
+    vram = int(raw.get("gpu_vram_mb") or g.get("mem_total_mb") or 0)
+    tf, gkind = gpu_power(gname, vram, int(raw.get("gpu_cores") or 0))
+    if n.get("gpu_tflops") is not None:
+        tf = float(n["gpu_tflops"])
+    gbps, mem = mem_speed({**raw, "gpu_name": gname, "cpu": raw.get("cpu") or b.get("model") or ""}, n)
+    short = re.sub(r"^(nvidia )?(geforce )?", "", gname, flags=re.I)
+    if gkind == "built-in" and raw.get("gpu_cores"):
+        short += f" {raw['gpu_cores']}-core"
+    return {"single": float(b.get("single_x") or 0) or 1.0, "multi": node_perf(name, st), "cpus": cpus,
+            "gpu": short, "gpu_kind": gkind, "gpu_tflops": tf, "vram_gb": round(vram / 1024),
+            "mem_gb": int(st.get("mem_total_gb") or raw.get("mem_total_gb") or 0), "mem": mem, "mem_gbps": gbps,
+            "disk_mbps": int(b.get("disk_mbps") or 0)}
+
+
+def spec_or_plain(cfg: Dict[str, Any], name: str, st: Dict[str, Any]) -> Dict[str, Any]:
+    """node_spec, or only what the CPU and threads say when a node reported something odd: placing never stops over it."""
+    try:
+        return node_spec(cfg, name, st)
+    except Exception:
+        cpus = max(int(st.get("cpus") or 1) if str(st.get("cpus") or "1").isdigit() else 1, 1)
+        return {"single": 1.0, "multi": cpus / 6.5, "cpus": cpus, "gpu": "", "gpu_kind": "", "gpu_tflops": 0.0, "vram_gb": 0,
+                "mem_gb": 0, "mem": "", "mem_gbps": 0.0, "disk_mbps": 0}
+
+
+def refresh_spec(cfg: Dict[str, Any], name: str, st: Dict[str, Any], force: bool = False) -> None:
+    """Read what a machine is built from (`ctl spec`) once a day, or now with force."""
+    if not st.get("online") or (not force and now() - int(st.get("spec_t", 0) or 0) < SPEC_TTL):
+        return
+    st["spec_t"] = now()   # after a failure too: a node from before `spec` is not asked again every tick
+    try:
+        r = Node(name, cfg).ctl("spec", timeout=30)
+        if r.returncode == 0:
+            st["spec"] = json.loads(r.stdout.decode().strip().splitlines()[-1])
+    except Exception:  # unreachable, an older node, odd output
+        pass
+    write_json(node_state_path(name), st)
+
+
+# What a job leans on. Weights add up to 1; the number after them is how much a faster machine counts against a fuller one.
+NEEDS: Dict[str, Tuple[Dict[str, float], float]] = {
+    "gpu": ({"gpu": 0.6, "multi": 0.25, "mem": 0.15}, 60),                     # renders, captures, screens
+    "build": ({"multi": 0.65, "single": 0.1, "mem": 0.15, "disk": 0.1}, 45),   # builds and tests: all cores, then memory
+    "light": ({"single": 0.6, "multi": 0.2, "disk": 0.2}, 15),                 # research, writing: mostly waiting for the model
+}
+SPEED_KEYS = {"multi": "multi", "single": "single", "mem": "mem_gbps", "gpu": "gpu_tflops", "disk": "disk_mbps"}
+GPU_WORDS = re.compile(r"blender|블렌더|\bcycles\b|렌더링|\brender(ing)?\b|xvfb|opengl|vulkan|webgl|셰이더|shader|캡처|스크린샷|screenshots?\b|"
+                       r"-gpu host|\bcuda\b|그래픽 ?카드", re.I)
+BUILD_WORDS = re.compile(r"\bbuild|빌드|compil|컴파일|\btests?\b|시험|테스트|dotnet|flutter|gradle|cargo|xcodebuild|npm (run|test|ci)|pnpm|"
+                         r"vitest|jest|pytest|mutat|변이|coverage|커버리지", re.I)
+_NEEDS: Dict[str, str] = {}
+
+
+def job_needs(j: Dict[str, Any]) -> str:
+    """"gpu", "build" or "light": what kind of work a job is, from its tags and its task. Sentences that say not to do a
+    thing do not count ("--headless, no screenshots" is not graphics work)."""
+    jid = str(j.get("id") or "")
+    if jid and jid in _NEEDS:
+        return _NEEDS[jid]
+    tags = set(j.get("tags") or [])
+    text = PIN_NOT.sub(" ", task_of(j))
+    kind = "gpu" if "gpu" in tags or GPU_WORDS.search(text) else \
+        "build" if job_cpu(j) >= 2 or HEAVY_WORDS.search(text) or BUILD_WORDS.search(text) else "light"
+    if jid:
+        if len(_NEEDS) > 5000:
+            _NEEDS.clear()
+        _NEEDS[jid] = kind
+    return kind
+
+
+def node_speed(spec: Dict[str, Any], st: Dict[str, Any], kind: str, top: Dict[str, float]) -> float:
+    """How fast a job of this kind runs on a machine right now, 1.0 = the pool's best at each part with nothing else on it.
+    Each part the job leans on counts by what the machine has, times the share left beside the work already there: CPU and
+    memory by its load against its threads (with the new job's own threads counted in), the graphics card by how busy it is."""
+    cores = max(int(st.get("cpus") or spec["cpus"]), 1)
+    load = float(st.get("load", 0) or 0)
+    share = min(1.0, cores / (load + (1 if kind == "light" else 4)))
+    have = {"multi": spec["multi"] * share, "single": spec["single"] * min(1.0, cores / (load + 1)), "mem": spec["mem_gbps"] * share,
+            "gpu": spec["gpu_tflops"] * (1 - (gpu_of(st) or 0) / 100), "disk": float(spec["disk_mbps"])}
+    return sum(w * have[k] / top[k] for k, w in NEEDS[kind][0].items() if top.get(k))
+
+
+def spec_line(cfg: Dict[str, Any], name: str, st: Dict[str, Any]) -> str:
+    s = spec_or_plain(cfg, name, st)
+    gpu = f"{s['gpu']} {s['gpu_tflops']:g} TF" + (f" {s['vram_gb']} GB" if s["vram_gb"] else "") if s["gpu"] else "-"
+    mem = " ".join(x for x in (f"{s['mem_gb']} GB" if s["mem_gb"] else "", s["mem"], f"{s['mem_gbps']:g} GB/s" if s["mem_gbps"] else "") if x)
+    return (f"CPU 1-core {s['single']:.2f}x · all {s['multi']:.2f}x ({s['cpus']} threads) · GPU {gpu} · RAM {mem or '-'}"
+            f" · disk {str(s['disk_mbps']) + ' MB/s' if s['disk_mbps'] else '-'}")
 
 
 def job_kind(j: Dict[str, Any]) -> str:
@@ -1376,8 +1535,10 @@ def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[st
     planned_disk = planned_disk if planned_disk is not None else {}
     plat, disk_need = job_platform(j), job_disk_gb(j)
     min_disk = float(cfg["defaults"].get("min_free_disk_gb", 5))
-    perf = {k: node_perf(k, metrics.get(k, {})) for k in cfg["nodes"]}
-    top_perf = max(perf.values() or [1.0]) or 1.0
+    kind = job_needs(j)
+    specs = {k: spec_or_plain(cfg, k, metrics.get(k, {})) for k, n in cfg["nodes"].items() if not n.get("pending")}
+    top = {d: max([float(s[key]) for s in specs.values()] or [0.0]) for d, key in SPEED_KEYS.items()}
+    speeds: Dict[str, float] = {}
     best, best_score = None, -1e9
     here = guide_here(cfg, j, metrics)
     for name, n in cfg["nodes"].items():
@@ -1441,7 +1602,7 @@ def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[st
         if busy and cpu_used.get(name, 0) + job_cpu(j) > units and float(st.get("load", 0) or 0) >= cores:
             why[name] = f"CPU units full ({cpu_used.get(name, 0)}/{units}, load {float(st.get('load', 0)):.1f})"
             continue       # units full and the cores really busy; a heavy job in a quiet phase (load < cores) leaves room
-        gpu = wants_gpu(cfg, name, j) if st.get("gpu") else False
+        gpu = (kind == "gpu" or wants_gpu(cfg, name, j)) if st.get("gpu") else False
         if gpu and busy and gpu_full(st):
             why[name] = gpu_full(st)
             continue       # one more would only slow the others down (an idle node still takes one)
@@ -1460,7 +1621,10 @@ def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[st
             mem_used = min(1.0, mem_used + (planned_gb.get(name, 0.0) + job_mem_gb(j, name)) / total_gb)
         disk_used = min(1.0, disk_need / max(disk_room, 1.0))
         score = -100 * (0.35 * jobs_full + 0.25 * load_full + 0.2 * mem_used + 0.2 * disk_used)
-        score += 15 * perf[name] / top_perf      # a faster machine (all cores, from `scaleout bench`) finishes builds sooner
+        # and how fast the job runs there: what the machine is built from (CPU, graphics, memory, disk), weighted by what this
+        # kind of job leans on, times the share it gets beside the work already there
+        speeds[name] = node_speed(specs[name], st, kind, top)
+        score += NEEDS[kind][1] * speeds[name]
         # keep the Macs for what only a Mac can do: Android work goes to other machines first, any-machine work leans
         # away from Macs, and work that reads like iOS but is untagged leans to Macs
         mac = st.get("os", "").lower() == "darwin"
@@ -1468,13 +1632,13 @@ def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[st
             score -= 30 if plat == "android" else 15
         elif not mac and plat == "ios":
             score -= 40
-        if gpu:
-            score -= 20 * (gpu_of(st) or 0) / 100
         if name in here:
             score += 40
         score += float(n.get("score_bias", 0))   # the orchestrator has a negative bias: it orchestrates, runs what only it can, and takes overflow
         if score > best_score:
             best, best_score = name, score
+    if best:   # kept in the job's history: why it went where it went
+        why["*"] = f"{kind} job, speed here now: " + ", ".join(f"{label_of(cfg, k)} {v:.2f}" for k, v in sorted(speeds.items(), key=lambda x: -x[1]))
     return best
 
 
@@ -1543,16 +1707,17 @@ def node_has(cfg: Dict[str, Any], name: str, st: Dict[str, Any]) -> set:
 def task_of(j: Dict[str, Any]) -> str:
     """The task of a job as it was given (not what scaleout adds to it), with its repo and folder."""
     try:
-        text = (STATE_DIR / "prompts" / f"{j['id']}.md").read_text(errors="replace")
+        text = j.get("text") or (STATE_DIR / "prompts" / f"{j['id']}.md").read_text(errors="replace")   # text: `spec --for`
     except (OSError, KeyError):
         text = ""
     return " ".join([text] + [str(j.get(k) or "") for k in ("repo_name", "repo_sub", "sync", "workdir")])
 
 
 def asks(task: str, words: List[str]) -> bool:
-    """Does the task name one of these? Sentences like "do not start an emulator" do not count."""
+    """Does the task name one of these? "godot+screenshot" = both somewhere in it. Sentences like "do not start an emulator"
+    do not count."""
     low = PIN_NOT.sub(" ", task).lower()
-    return any(re.search(r"(?<![a-z0-9])" + re.escape(w), low) for w in words)
+    return any(all(re.search(r"(?<![a-z0-9])" + re.escape(p.strip()), low) for p in w.lower().split("+") if p.strip()) for w in words if w.strip("+ "))
 
 
 def guide_here(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[str, Any]]) -> Dict[str, bool]:
@@ -1938,6 +2103,10 @@ def maintain(cfg: Dict[str, Any], metrics: Dict[str, Dict[str, Any]]) -> None:
         if not st.get("online"):
             continue
         n = Node(name, cfg)
+        try:
+            refresh_spec(cfg, name, st)
+        except Exception:
+            pass
         if n.local:
             if (any((local_home() / "queue").iterdir()) if (local_home() / "queue").is_dir() else False):
                 start_local_runner(n.n)   # a job queued just as the runner was leaving
@@ -2066,7 +2235,7 @@ def tick(verbose: bool = False) -> None:
                 if name:
                     j.update({"moved_from": j["want_node"], "moved_cpus": metrics[name].get("cpus"), "moved_gb": metrics[name].get("mem_total_gb")})
             if not name:
-                wait = "; ".join(f"{k}: {v}" for k, v in sorted(why.items())) or "no nodes"
+                wait = "; ".join(f"{k}: {v}" for k, v in sorted(why.items()) if k != "*") or "no nodes"
                 if wait != j.get("wait", ""):
                     j["wait"] = wait
                     save_job(j)
@@ -2084,6 +2253,8 @@ def tick(verbose: bool = False) -> None:
             j.pop("wait", None)
             if j.get("moved_from"):
                 j["history"].append({"t": now(), "event": "unpinned", "node": name, "why": f"waited {int((now() - j['created']) / 60)} min for {j['moved_from']}"})
+            if why.get("*"):
+                j["history"].append({"t": now(), "event": "placed", "node": name, "why": why["*"]})
             load[name] = load.get(name, 0) + 1
             cpu_used[name] = cpu_used.get(name, 0) + job_cpu(j)
             planned_gb[name] = planned_gb.get(name, 0.0) + job_mem_gb(j, name)
@@ -2943,6 +3114,9 @@ def cmd_status(a) -> None:
             f"{str(st.get('load', '-')):>8}{fmt_gpu(st):>6}{str(st.get('running', 0)) + '+' + str(st.get('queued', 0)):>7}  {fmt_devices(st):<9}{','.join(st.get('agents') or []) or '-'}")
     q = [j for j in all_jobs() if j.get("status") in ("queued", "dispatched", "running")]
     say(f"queue: {sum(1 for j in q if j['status'] == 'queued')} waiting · {sum(1 for j in q if j['status'] != 'queued')} running")
+    say("spec (placing weighs these with the free % above; `scaleout spec --for TEXT` shows where a job would go):")
+    for name in sorted(metrics):
+        say(f"  {pad(label_of(cfg, name), nw)}{spec_line(cfg, name, metrics[name])}")
     for name, ags in (read_json(AGENT_BLOCKS, {}) or {}).items():
         for ag, b in (ags or {}).items():
             if b.get("until", 0) > now():
@@ -3129,6 +3303,38 @@ def cmd_hold(a) -> None:
 
 
 # ── commands: daemon ─────────────────────────────────────────────────────────
+def cmd_spec(a) -> None:
+    """What each machine is built from, what placing makes of it, and with --for where a job like that would go right now."""
+    cfg = load_cfg()
+    names = a.names or [k for k, n in cfg["nodes"].items() if not n.get("pending")]
+    metrics = refresh_metrics(cfg, names, max_age=0)
+    if a.refresh:
+        for name in names:
+            refresh_spec(cfg, name, metrics.get(name, {}), force=True)
+    nw = name_w(cfg, 16)
+    for name in sorted(names):
+        say(f"{pad(label_of(cfg, name), nw)}{spec_line(cfg, name, metrics.get(name, {}))}")
+    if not a.for_text:
+        return
+    j = {"id": "", "text": a.for_text, "tags": [t for t in (a.tags or "").split(",") if t], "agent": "default"}
+    kind = job_needs(j)
+    w, k = NEEDS[kind]
+    specs = {x: spec_or_plain(cfg, x, metrics.get(x, {})) for x in names}
+    top = {d: max([float(s[key]) for s in specs.values()] or [0.0]) for d, key in SPEED_KEYS.items()}
+    say(f"\na {kind} job (leans on " + ", ".join(f"{d} {v:.0%}" for d, v in w.items()) + f"; a faster machine counts up to {k:g} points):")
+    for name in sorted(names, key=lambda x: -node_speed(specs[x], metrics.get(x, {}), kind, top)):
+        st = metrics.get(name, {})
+        say(f"  {pad(label_of(cfg, name), nw)}speed flat out {node_speed(specs[name], {'cpus': st.get('cpus')}, kind, top):.2f}"
+            f" · now {node_speed(specs[name], st, kind, top):.2f}  (load {st.get('load', '-')}, GPU {fmt_gpu(st)})")
+    load = {x: int(metrics.get(x, {}).get("running", 0) or 0) for x in names}
+    why: Dict[str, str] = {}
+    pick = pick_node(cfg, j, metrics, load, why=why)
+    say(f"goes to: {label_of(cfg, pick) if pick else 'nowhere yet'}")
+    for x, v in sorted(why.items()):
+        if x != "*":
+            say(f"  {label_of(cfg, x)}: {v}")
+
+
 def cmd_tick(a) -> None:
     tick(verbose=True)
 
@@ -5079,6 +5285,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     s.add_argument("--off", action="store_true", help="remove it"); s.set_defaults(fn=cmd_guide)
     s = sp.add_parser("config", help="show/set defaults (or --node NAME settings)"); s.add_argument("key", nargs="?"); s.add_argument("value", nargs="?"); s.add_argument("--node"); s.set_defaults(fn=cmd_config)
 
+    s = sp.add_parser("spec", help="what each machine is built from (CPU, graphics, memory, disk) as placing weighs it: spec [NODE..] [--refresh] [--for TEXT]")
+    s.add_argument("names", nargs="*"); s.add_argument("--refresh", action="store_true", help="read the parts from the machines again now")
+    s.add_argument("--for", dest="for_text", help="a task: what kind of job it is, how fast it runs on each machine now, where it goes")
+    s.add_argument("--tags", help="with --for: the job's tags, comma separated"); s.set_defaults(fn=cmd_spec)
     s = sp.add_parser("bench", help="score nodes (100 = one M1 8GB Mac mini) and track how the pool grows; --load runs a load test")
     s.add_argument("names", nargs="*"); s.add_argument("--apply", action="store_true", help="set each node's max_jobs to the measured slots")
     s.add_argument("--load", action="store_true", help="push synthetic build jobs through the real scheduler and time them")

@@ -24,7 +24,7 @@ notices when something hangs, retries elsewhere, and cleans nodes up before thei
 > Status: **v0.2, early.** A macOS orchestrator with macOS nodes is used daily. **Linux and Windows node support is written but has not been tested on real machines yet** — reports and fixes are very welcome.
 
 ## Contents
-[Install](#install) · [Attach nodes](#attach-nodes) · [Run jobs](#run-jobs) · [Use from Claude Code](#use-from-claude-code) · [How it works](#how-it-works) · [Resource guard](#resource-guard--self-healing) · [Skills sync](#skills-sync) · [Orchestrator folders](#working-on-orchestrator-folders) · [GitHub runners](#github-actions-runners) · [Security](#security) · [Commands](#command-reference) · [Troubleshooting](#troubleshooting) · [Relocating folders](#bonus-relocate-heavy-folders-to-another-disk)
+[Install](#install) · [Attach nodes](#attach-nodes) · [Run jobs](#run-jobs) · [Use from Claude Code](#use-from-claude-code) · [How it works](#how-it-works) · [Resource guard](#resource-guard--self-healing) · [Machine specs](#machine-specs) · [Skills sync](#skills-sync) · [Orchestrator folders](#working-on-orchestrator-folders) · [GitHub runners](#github-actions-runners) · [Security](#security) · [Commands](#command-reference) · [Troubleshooting](#troubleshooting) · [Relocating folders](#bonus-relocate-heavy-folders-to-another-disk)
 
 ## Install
 
@@ -141,7 +141,7 @@ Write tasks so they stand alone — the node's agent has not seen your conversat
 - **Node control is one script** (`~/.scaleout/bin/ctl`, or `ctl.ps1` on Windows) with verbs such as `metrics`, `submit`, `state`, `result`, `cleanup`. The orchestrator never needs to know a node's OS.
 - **Jobs run inside the node's login session**, started by its service manager whenever the node's queue is non-empty: a LaunchAgent with `QueueDirectories` (macOS), a `systemd --user` path unit (Linux, cron fallback), a scheduled task (Windows). On macOS this matters: an SSH session cannot read the login keychain, so agents look "not logged in" when started over plain SSH.
 - **Heartbeats.** The node runner touches a heartbeat every 10 s and enforces the timeout. A stale heartbeat (default 5 min), a vanished job, or a node offline for 10 min puts the job back in the queue (2 retries by default) and the next try goes to another machine for 15 min; the orphan is cancelled when that node returns, before the job may go back there. A runner unit that systemd gave up on (failed) counts as `runner-down`.
-- **Scheduling** — among nodes that are healthy, have the required tags and agent, and have room (jobs, memory, load, CPU units, disk), the job goes to the one least strained once it has it: jobs ÷ its share (`max_jobs`), load ÷ 2 × cores, memory in use and the part of its free disk the job would fill (the job's own memory and disk counted in). On top: a faster machine (all-core speed from `scaleout bench`) wins a near tie, and Macs are kept for what only a Mac can do — Android work goes to other machines first, any-machine work leans away from Macs, untagged work that reads like iOS leans to Macs. The disk a job fills is guessed by kind: iOS 10 GB heavy / 3 light, Android 6 / 2, other 4 / 1; jobs handed out in the last 10 minutes count as already using theirs.
+- **Scheduling** — among nodes that are healthy, have the required tags and agent, and have room (jobs, memory, load, CPU units, disk), the job goes to the one least strained once it has it: jobs ÷ its share (`max_jobs`), load ÷ 2 × cores, memory in use and the part of its free disk the job would fill (the job's own memory and disk counted in). On top: **how fast the job runs there** (see [Machine specs](#machine-specs)), and Macs are kept for what only a Mac can do — Android work goes to other machines first, any-machine work leans away from Macs, untagged work that reads like iOS leans to Macs. The disk a job fills is guessed by kind: iOS 10 GB heavy / 3 light, Android 6 / 2, other 4 / 1; jobs handed out in the last 10 minutes count as already using theirs.
 
 ## Resource guard & self-healing
 
@@ -329,6 +329,36 @@ scaleout tune [--apply]   # max_jobs from the measured CPU slots (the daemon doe
   measured falls back to `(memory - idle use - 1 GB) / p90(memory per job)` once it has 5 finished jobs. Nodes added with
   an explicit `--max-jobs` are never changed.
 
+## Machine specs
+
+Free % says where there is room, not how fast a job runs there: a busy graphics card can still beat an idle built-in one, and
+16 threads at full load leave a new job less than 8 idle ones. So placing also weighs what each machine is built from:
+
+```bash
+scaleout spec                       # CPU 1-core / all cores, graphics TFLOPS and memory, RAM kind · speed · GB/s, disk MB/s
+scaleout spec --refresh             # read the parts from the machines again (the daemon does this once a day)
+scaleout spec --for "Blender render of the hero shot"   # what kind of job that is, its speed on each machine now, where it goes
+```
+
+```
+Ryzen 7 5700X PC     CPU 1-core 1.00x · all 2.24x (16 threads) · GPU GTX 1070 Ti 8.2 TF 8 GB · RAM 31 GB DDR4-3200 x2 51.2 GB/s · disk 1236 MB/s
+MacBook Pro M1 2020  CPU 1-core 1.00x · all 1.25x (8 threads) · GPU Apple M1 8-core 2.6 TF · RAM 16 GB LPDDR4 68 GB/s · disk 444 MB/s
+```
+
+- **Where the numbers come from.** CPU and disk are measured (`scaleout bench`). Memory kind, speed and modules and the
+  graphics card are read from the machine (`ctl spec`: `udevadm` / `nvidia-smi` on Linux, `system_profiler` on macOS, no root),
+  then looked up: a card's TFLOPS by its name, Apple silicon by chip and GPU cores, memory GB/s = speed × 8 bytes × channels
+  (two modules side by side on a desktop board). A part the tables do not know: `scaleout config gpu_tflops 12 --node NAME`
+  (also `mem_gbps`, `mem_channels`).
+- **What a job leans on**, read from its tags and task (sentences that say not to do something do not count):
+  graphics work (renders, captures, `xvfb`, Blender, tag `gpu`) — graphics 60 %, all cores 25 %, memory 15 %;
+  builds and tests — all cores 65 %, one core 10 %, memory 15 %, disk 10 %; light work (research, writing) — mostly one core.
+- **Speed now** = for each part, what the machine has × the share left beside the work already there (CPU and memory: its
+  threads against load plus the new job's threads; graphics: how busy the card is), against the pool's best. It adds up to
+  60 points for graphics work, 45 for builds, 15 for light work, against the strain score above. A graphics job whose card is
+  full (95 % busy or 90 % of its memory) waits or goes elsewhere. Each job's history says why it went where it went (`placed`).
+- `scaleout status` keeps showing free % and adds one spec line per machine.
+
 ## Machine guides
 Some things are done differently on one machine: which binary uses its graphics card, how many captures fit at once, a flag
 an emulator needs. Write that down once, on the orchestrator:
@@ -353,10 +383,10 @@ first `##`, and each section whose `when` words are in the task (no `when` = alw
 right now. A section that fits but whose tag is missing (a broken driver) is named as not possible. The rest is named with the
 path of the whole guide on the machine, `~/.scaleout/guide.md`. Two more notes decide where a job goes:
 
-- `<!-- here: godot|blender -->`: a task with one of these words runs on this machine only, as if it had been sent with `-w` (`-w` and tags of its own come first).
+- `<!-- here: godot+screenshot|blender -->`: a task with one of these words runs on this machine only, as if it had been sent with `-w` (`-w` and tags of its own come first). `a+b` = both words somewhere in the task (in `when` too): keep it to what really must run there, and let [specs](#machine-specs) place the rest.
 - `<!-- wait: 20 -->` with it: it waits up to 20 minutes for room here, then any machine may take it, this one first.
 
-A job that will use the graphics card (`--tags gpu`, or a section with `needs: gpu` fits it) is not added to a machine whose card is
+A job that will use the graphics card (`--tags gpu`, graphics work by its words, or a section with `needs: gpu` fits it) is not added to a machine whose card is
 full (95% busy, or 90% of its memory) while other jobs run there; `scaleout jobs` shows `waits: … GPU full`.
 
 New Claude Code sessions on the orchestrator get the first
@@ -407,6 +437,7 @@ scaleout wait|result|logs|cancel JOB · jobs [-n N] · gc
 scaleout check [JOB real=N false=N missed=N]      # checks the check model ran: were the failures it reported real?
 scaleout exec NAME -- CMD · cleanup [NAME…] [--aggressive|--deep] · sync-skills [NAME…]
 scaleout config [KEY [VALUE]] [--node NAME] · tick · daemon · install-daemon
+scaleout spec [NAME…] [--refresh] [--for TEXT [--tags a,b]]   # what each machine is built from, and where a job like TEXT would go
 scaleout runner add|remove|ls [NAME] --org ORG|--repo OWNER/REPO [--labels L] [--runner-name N]
 ```
 
