@@ -34,7 +34,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "0.9.18"
+VERSION = "0.9.19"
 HOME = Path.home()
 CONF_DIR = Path(os.environ.get("SCALEOUT_CONF", HOME / ".config" / "scaleout"))
 STATE_DIR = Path(os.environ.get("SCALEOUT_STATE", HOME / ".local" / "state" / "scaleout"))
@@ -1066,6 +1066,18 @@ def log_job(j: Dict[str, Any]) -> None:
 
 
 def save_job(j: Dict[str, Any]) -> None:
+    if j.get("status") != "cancelled" and j.get("id"):
+        disk = read_json(job_path(j["id"]), None)
+        if disk and disk.get("status") == "cancelled":
+            # cancelled since this copy was read (a tick holds the jobs it read for a while): the cancel stays. A node it was
+            # handed to in the meantime stops it with the clean-up of lost copies.
+            if j.get("status") in ("dispatched", "running") and j.get("node") and j.get("node") != disk.get("node"):
+                orphans = read_json(STATE_DIR / "orphans.json", [])
+                orphans.append([j["node"], j["id"]])
+                write_json(STATE_DIR / "orphans.json", orphans)
+            j.clear()
+            j.update(disk)
+            return
     if j.get("status") in ("done", "failed", "cancelled") and not j.get("logged") and not j.get("bench"):
         j["logged"] = True
         try:
@@ -1805,6 +1817,16 @@ def dispatch_error_line(text: str) -> str:
     return ((marked or lines)[-1] if lines else "")[:160]
 
 
+def give_back_wt(n: "Node", j: Dict[str, Any]) -> None:
+    """The job no longer needs the work tree it holds on that node: unlock it so the next job there can use it."""
+    if j.get("repo_wt"):
+        try:
+            n.ctl("repo-unlock", j["repo_wt"], timeout=20)
+        except Exception:   # unreachable: the node frees it itself once the job is gone (stale_lock)
+            pass
+        j.pop("repo_wt", None)
+
+
 def dispatch(cfg: Dict[str, Any], j: Dict[str, Any], name: str) -> bool:
     n = Node(name, cfg)
     node = cfg["nodes"][name]
@@ -1841,7 +1863,7 @@ def dispatch(cfg: Dict[str, Any], j: Dict[str, Any], name: str) -> bool:
             j["history"] = (j.get("history") or [])[-20:] + [{"t": now(), "event": "push-failed", "node": name, "why": why[-300:]}]
             j["dispatch_error"] = "could not send the repository: " + (dispatch_error_line(why) or "git push failed")
             return False
-        co = n.ctl("repo-checkout", j["repo_name"], j["repo_base"], timeout=1800)
+        co = n.ctl("repo-checkout", j["repo_name"], j["repo_base"], j["id"], timeout=1800)
         wt = co.stdout.decode().strip().splitlines()[-1:] if co.returncode == 0 else []
         if not wt:
             j["dispatch_error"] = "the node could not check out the work tree: " + (dispatch_error_line(co.stderr.decode(errors="replace")) or "no reason given")
@@ -1852,6 +1874,7 @@ def dispatch(cfg: Dict[str, Any], j: Dict[str, Any], name: str) -> bool:
         wd = ("~/.scaleout/work/" if not n.windows else "~\\.scaleout\\work\\") + j["id"]
         tar = run(["tar", "-cf", "-", "-C", j["sync"], "--exclude", "node_modules", "--exclude", ".gradle", "--exclude", "build", "--exclude", ".dart_tool", "."]).stdout
         if n.ctl("recv", wd, input=tar, timeout=900).returncode != 0:
+            give_back_wt(n, j)
             return False
     prompt = (STATE_DIR / "prompts" / f"{j['id']}.md").read_bytes()
     if j.get("repo"):
@@ -1882,6 +1905,7 @@ def dispatch(cfg: Dict[str, Any], j: Dict[str, Any], name: str) -> bool:
         prompt += ("\n\n---" + CHECK_RULES).encode()
     res = n.ctl("submit", j["id"], j.get("agent") or "default", str(j["timeout"]), wd, j.get("resume") or "", j.get("model") or "", j.get("effort") or "", input=prompt, timeout=60)
     if res.returncode != 0:
+        give_back_wt(n, j)
         return False
     j.update({"status": "dispatched", "node": name, "dispatched_at": now(), "last_seen": now(), "node_workdir": wd})
     j["history"].append({"t": now(), "event": "dispatched", "node": name})
@@ -2006,6 +2030,7 @@ def collect(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[str,
     elif state == "queued" and now() - j.get("dispatched_at", now()) > d.get("node_wait_min", 10) * 60:
         # the node accepted it but never started it (its runner holds jobs while memory is short): try another node
         n.ctl("rm", j["id"])
+        give_back_wt(n, j)
         j.setdefault("avoid", {})[name] = now() + 30 * 60
         j["history"].append({"t": now(), "event": "moved", "node": name, "why": f"not started on {name} in {d.get('node_wait_min', 10)} min"})
         j.update({"status": "queued", "node": None})
@@ -2081,6 +2106,33 @@ def sample_history(metrics: Dict[str, Dict[str, Any]], cfg: Optional[Dict[str, A
         f.write(json.dumps(row) + "\n")
 
 
+def stale_locks(lines: str, name: str, job: Any) -> List[str]:
+    """Work trees on node `name` whose lock no job holds any more, from `ctl repo-locks` lines (<work tree> <job|-> <minutes>):
+    its job is over, on another machine or back in the queue, or (60 minutes on) gone. A job being handed over keeps it."""
+    out = []
+    for line in lines.splitlines():
+        parts = line.split()
+        if len(parts) != 3 or parts[1] == "-":
+            continue        # no id: taken by an older version, the node frees it after 12 h
+        wt, jid, age = parts[0], parts[1], int(parts[2]) if parts[2].isdigit() else 0
+        j = job(jid)
+        if not j:
+            if age >= 60:
+                out.append(wt)
+        elif j.get("status") in ("done", "failed", "cancelled") or (j.get("status") == "queued" and age >= 30) \
+                or (j.get("node") and j["node"] != name) or (j.get("repo_wt") and j["repo_wt"] != wt):
+            out.append(wt)
+    return out
+
+
+def free_stale_locks(cfg: Dict[str, Any], name: str, n: "Node") -> None:
+    r = n.ctl("repo-locks", timeout=30)
+    if r.returncode != 0:
+        return
+    for wt in stale_locks(r.stdout.decode(errors="replace"), name, lambda jid: read_json(job_path(jid), None)):
+        n.ctl("repo-unlock", wt, timeout=20)
+
+
 def maintain(cfg: Dict[str, Any], metrics: Dict[str, Dict[str, Any]]) -> None:
     """Resource recovery and self-healing on nodes."""
     d = cfg["defaults"]
@@ -2132,6 +2184,13 @@ def maintain(cfg: Dict[str, Any], metrics: Dict[str, Dict[str, Any]]) -> None:
             n.ctl("repair", timeout=120)
             st["last_repair"] = now()
             write_json(node_state_path(name), st)
+        if now() - st.get("last_locks", 0) > 600 and not n.windows:
+            try:
+                free_stale_locks(cfg, name, n)
+            except Exception:
+                pass
+            st["last_locks"] = now()
+            write_json(node_state_path(name), st)
         if d.get("reap_idle_min", 20) and now() - st.get("last_reap", 0) > 120:
             r = n.ctl("reap", str(d["reap_idle_min"]), timeout=120)
             st["last_reap"] = now()
@@ -2162,7 +2221,7 @@ def maintain(cfg: Dict[str, Any], metrics: Dict[str, Dict[str, Any]]) -> None:
         if (name, jid) in active:   # handed back to that node since: the copy there is the live one
             continue
         if name in cfg["nodes"] and st.get("online"):
-            Node(name, cfg).ctl("cancel", jid)
+            Node(name, cfg).ctl("cancel", jid, timeout=60)
             Node(name, cfg).ctl("rm", jid)
         elif name in cfg["nodes"]:
             left.append([name, jid])
@@ -2226,6 +2285,8 @@ def tick(verbose: bool = False) -> None:
             load[name] = max(load.get(name, 0), reported)
         for j in jobs:
             if j.get("status") != "queued":
+                continue
+            if read_json(job_path(j["id"]), {"status": "queued"}).get("status") != "queued":   # cancelled since the tick read it
                 continue
             why: Dict[str, str] = {}
             name = pick_node(cfg, j, metrics, load, dev_load, planned_gb, cpu_used, why, planned_disk)
@@ -2478,13 +2539,36 @@ def cmd_logs(a) -> None:
 
 
 def cmd_cancel(a) -> None:
+    cfg = load_cfg()
     j = load_job(a.job)
+    if j.get("status") in ("done", "failed", "cancelled"):
+        say(f"already {j['status']}")
+        return
     if j.get("node") and j["status"] in ("dispatched", "running"):
-        Node(j["node"], load_cfg()).ctl("cancel", j["id"])
-    j.update({"status": "cancelled", "finished_at": now()})
-    j["history"].append({"t": now(), "event": "cancelled"})
-    save_job(j)
+        cancel_on_node(cfg, j)
+    fresh = load_job(a.job)   # read again just before writing: a tick that held the job may have handed it out meanwhile
+    if fresh.get("status") in ("done", "failed", "cancelled"):
+        say(f"already {fresh['status']}")
+        return
+    if fresh.get("node") and fresh.get("status") in ("dispatched", "running") \
+            and (fresh.get("node"), fresh.get("dispatched_at")) != (j.get("node"), j.get("dispatched_at")):
+        cancel_on_node(cfg, fresh)
+    fresh.update({"status": "cancelled", "finished_at": now()})
+    fresh["history"].append({"t": now(), "event": "cancelled"})
+    save_job(fresh)   # a tick that writes its older copy after this keeps the cancel (save_job)
     say("cancelled")
+
+
+def cancel_on_node(cfg: Dict[str, Any], j: Dict[str, Any]) -> None:
+    """Stop a job on its node and give back the work tree it holds there (once it has stopped)."""
+    if j.get("node") not in cfg["nodes"]:
+        return
+    try:
+        Node(j["node"], cfg).ctl("cancel", j["id"], j.get("repo_wt") or "", timeout=60)
+    except Exception:   # unreachable now: the clean-up of lost copies stops it when the node is back
+        orphans = read_json(STATE_DIR / "orphans.json", [])
+        orphans.append([j["node"], j["id"]])
+        write_json(STATE_DIR / "orphans.json", orphans)
 
 
 DIRECT_DIR = STATE_DIR / "direct"   # heavy commands sessions ran on this machine (agents/claude/direct-run.py)

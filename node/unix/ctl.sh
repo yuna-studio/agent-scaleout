@@ -81,8 +81,34 @@ dd_drop() {  # dd_drop <folder>|orphans -> how many Xcode build caches (DerivedD
   done
   echo "$n"
 }
-idle_wt() {  # idle_wt <work tree> -> takes its lock when no job holds it (a lock older than 12 h was left by a crashed job)
-  [ -n "$(find "$1.lock" -maxdepth 0 -mmin +720 2>/dev/null)" ] && rm -rf "$1.lock"
+alive() { kill -0 "$1" 2>/dev/null && ! ps -o stat= -p "$1" 2>/dev/null | grep -q "^Z"; }   # a stopped child not yet reaped is not alive
+stale_lock() {  # stale_lock <work tree>.lock -> 0 when no job holds it any more. A lock keeps the id of the job that took it:
+  # it is free once that job was cancelled or removed and nothing of it still runs. A lock without an id (from before), or one
+  # whose job ended and was never collected, frees after 12 h as before.
+  local l="$1" jid d
+  [ -d "$l" ] || return 1
+  [ -n "$(find "$l" -maxdepth 0 -mmin +720 2>/dev/null)" ] && return 0
+  jid="$(cat "$l/job" 2>/dev/null)"; [ -n "$jid" ] || return 1
+  d="$B/jobs/$jid"
+  if [ -f "$d/pid" ] && alive "$(cat "$d/pid" 2>/dev/null)"; then return 1; fi   # its agent still works in it
+  [ -f "$d/cancelled" ] && return 0
+  [ ! -d "$d" ] && [ -n "$(find "$l" -maxdepth 0 -mmin +60 2>/dev/null)" ] && return 0   # job gone (moved, removed): not one being handed over
+  return 1
+}
+free_locks() {  # free_locks <job> [<work tree>] -> drop the work tree locks this job holds, once nothing of it runs
+  local d="$B/jobs/$1" l i=0
+  while [ -f "$d/pid" ] && alive "$(cat "$d/pid" 2>/dev/null)" && [ "$i" -lt 10 ]; do sleep 1; i=$((i + 1)); done
+  if [ -f "$d/pid" ] && alive "$(cat "$d/pid" 2>/dev/null)"; then return 1; fi   # still stopping: stale_lock frees it later
+  for l in "$B"/repos/*.lock; do
+    [ -d "$l" ] && [ "$(cat "$l/job" 2>/dev/null)" = "$1" ] && rm -rf "$l"
+  done
+  if [ -n "${2:-}" ] && [ -d "$2.lock" ]; then   # a lock taken by an older version keeps no id: the orchestrator names it
+    case "$(cat "$2.lock/job" 2>/dev/null)" in "$1"|"") rm -rf "$2.lock" ;; esac
+  fi
+  return 0
+}
+idle_wt() {  # idle_wt <work tree> -> takes its lock when no job holds it
+  stale_lock "$1.lock" && rm -rf "$1.lock"
   mkdir "$1.lock" 2>/dev/null
 }
 reclaim_wts() {  # reclaim_wts <free GB wanted> [idle days] -> how many repo work trees were dropped
@@ -219,11 +245,11 @@ case "$verb" in
   result) cat "$B/jobs/$1/out" 2>/dev/null ;;
   artifacts) tar -cf - -C "$B/jobs/$1/artifacts" . 2>/dev/null ;;   # artifacts <jid> -> tar of the job's artifacts folder
   err) tail -n "${2:-40}" "$B/jobs/$1/err.log" 2>/dev/null ;;
-  cancel)
+  cancel)  # cancel <job> [<work tree>]: stop it, and once it has stopped give back the work tree it held
     d="$B/jobs/$1"; rm -f "$B/queue/$1"; touch "$d/cancelled" 2>/dev/null
     [ -f "$d/pid" ] && kill -TERM "$(cat "$d/pid")" 2>/dev/null
     [ -f "$d/rc" ] || [ -f "$d/started" ] || echo 130 > "$d/rc"
-    echo cancelled ;;
+    if free_locks "$1" "${2:-}"; then echo cancelled; else echo "cancelled (still stopping)"; fi ;;
   rm) rm -rf "$B/jobs/$1" "$B/queue/$1" "$B/work/$1"; echo removed ;;
 
   tokens)  # tokens on <window> | off | status — `scaleout tokens`: Claude's auto-compact window on this machine and the job rules
@@ -365,13 +391,14 @@ PY
 
   repo-init)  # repo-init <name> -> the node's bare copy of an orchestrator repo (git sends only missing objects)
     r="$B/repos/$1.git"; [ -d "$r" ] || git init -q --bare "$r"; echo "$r" ;;
-  repo-checkout)  # repo-checkout <name> <commit> -> a locked work tree at <commit>; ignored files (build caches) are kept
+  repo-checkout)  # repo-checkout <name> <commit> [<job>] -> a locked work tree at <commit>; ignored files (build caches) are kept
     r="$B/repos/$1.git"; i=1
+    top=$(( ${MAX_JOBS:-2} + 2 )); [ "$top" -lt 8 ] && top=8   # room for every job this node may run, and a spare
     while :; do
       w="$B/repos/$1-wt$i"
-      if mkdir "$w.lock" 2>/dev/null; then break; fi
-      if [ -n "$(find "$w.lock" -maxdepth 0 -mmin +720 2>/dev/null)" ]; then rm -rf "$w.lock"; continue; fi
-      i=$((i + 1)); [ "$i" -gt 8 ] && { echo "no free work tree" >&2; exit 1; }
+      if mkdir "$w.lock" 2>/dev/null; then printf '%s\n' "${3:-}" > "$w.lock/job"; break; fi
+      if stale_lock "$w.lock"; then rm -rf "$w.lock"; continue; fi
+      i=$((i + 1)); [ "$i" -gt "$top" ] && { echo "no free work tree (all $top held)" >&2; exit 1; }
     done
     if [ -e "$w/.git" ]; then
       git -C "$w" checkout -q -f --detach "$2" && git -C "$w" clean -fdq || { rm -rf "$w.lock"; echo "checkout failed" >&2; exit 1; }
@@ -388,6 +415,12 @@ PY
     else git -c user.name=agent-scaleout -c user.email=scaleout@localhost commit -q --no-verify -m "scaleout $3" && c="$(git rev-parse HEAD)"; fi
     git update-ref "refs/scaleout/result/$3" "$c" && echo "$c" ;;
   repo-unlock) rm -rf "$1.lock"; echo ok ;;
+  repo-locks)  # the work tree locks here, one per line: <work tree> <job or -> <age in minutes>
+    for l in "$B"/repos/*.lock; do
+      [ -d "$l" ] || continue
+      jid="$(cat "$l/job" 2>/dev/null)"; t="$(stat -c %Y "$l" 2>/dev/null || stat -f %m "$l" 2>/dev/null || echo 0)"
+      printf '%s %s %s\n' "${l%.lock}" "${jid:--}" "$(( ($(date +%s) - t) / 60 ))"
+    done ;;
 
   reap)  # reap <idle_min>: stop simulators/emulators when no test has run for that long
     m="${1:-20}"; st="$B/reap.active"

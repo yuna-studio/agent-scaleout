@@ -1507,6 +1507,72 @@ class DispatchFailure(unittest.TestCase):
         cfg["nodes"]["mac"]["gpu_tflops"] = 50
         self.assertEqual(so.node_spec(cfg, "mac", mac)["gpu_tflops"], 50.0)
 
+    def test_99i_work_tree_locks_and_cancel(self):
+        h = make_node("locks")
+        b = h / ".scaleout"
+        env = dict(os.environ, HOME=str(h), PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin")
+        ctl = lambda *a: subprocess.run(["bash", str(b / "bin/ctl"), *a], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=60)
+        (b / "repos").mkdir()
+        lock = lambda i, jid, age_min=0: (
+            (b / f"repos/r-wt{i}.lock").mkdir(),
+            (b / f"repos/r-wt{i}.lock/job").write_text(jid + "\n" if jid else ""),
+            os.utime(b / f"repos/r-wt{i}.lock", (time.time() - age_min * 60,) * 2))
+        # cancel frees the work tree of that job once its agent has stopped
+        sleeper = subprocess.Popen(["sleep", "60"])
+        (b / "jobs/jA").mkdir()
+        (b / "jobs/jA/started").write_text("")
+        (b / "jobs/jA/pid").write_text(str(sleeper.pid))
+        lock(1, "jA")
+        lock(2, "jB")
+        (b / "jobs/jB").mkdir()
+        rows = ctl("repo-locks").stdout.decode().split("\n")
+        self.assertIn(f"{b}/repos/r-wt1 jA 0", rows)
+        self.assertEqual(ctl("cancel", "jA").stdout.decode().strip(), "cancelled")
+        sleeper.wait(10)
+        self.assertFalse((b / "repos/r-wt1.lock").exists(), "the cancelled job gave its work tree back")
+        self.assertTrue((b / "repos/r-wt2.lock").exists(), "another job's lock stays")
+        # a lock from an older version keeps no id: the orchestrator names the work tree
+        lock(3, "")
+        (b / "jobs/jC").mkdir()
+        ctl("cancel", "jC", str(b / "repos/r-wt3"))
+        self.assertFalse((b / "repos/r-wt3.lock").exists())
+        # checkout: locks of jobs that are gone (an hour on) or cancelled come back; a live job's lock is passed over
+        src = TMP / "lock-src"
+        subprocess.run(["git", "init", "-q", str(src)], check=True)
+        (src / "a.txt").write_text("a")
+        subprocess.run(["git", "-C", str(src), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(src), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "a"], check=True)
+        sha = subprocess.run(["git", "-C", str(src), "rev-parse", "HEAD"], stdout=subprocess.PIPE).stdout.decode().strip()
+        bare = ctl("repo-init", "r").stdout.decode().strip()
+        subprocess.run(["git", "-C", str(src), "push", "-q", bare, "HEAD:refs/heads/x"], check=True)
+        shutil.rmtree(b / "repos/r-wt2.lock")
+        for i in range(1, 9):
+            lock(i, "gone", age_min=90) if i == 4 else lock(i, "jB")   # jB's folder exists: it is being handed over or runs
+        out = ctl("repo-checkout", "r", sha, "jNew")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout.decode().strip(), f"{b}/repos/r-wt4")
+        self.assertEqual((b / "repos/r-wt4.lock/job").read_text().strip(), "jNew")
+        # all held: no free work tree, past 8 when the node may run more jobs
+        self.assertIn(b"no free work tree", ctl("repo-checkout", "r", sha, "jX").stderr)
+        conf = (b / "node.conf").read_text()
+        (b / "node.conf").write_text(conf.replace("MAX_JOBS=1", "MAX_JOBS=10"))
+        out = ctl("repo-checkout", "r", sha, "jY")
+        self.assertEqual(out.stdout.decode().strip(), f"{b}/repos/r-wt9", out.stderr)
+        # the orchestrator's sweep: locks whose job is over, elsewhere, back in the queue or gone
+        jobs = {"done1": {"status": "done"}, "run1": {"status": "running", "node": "locks", "repo_wt": "/w/r-wt2"},
+                "else1": {"status": "running", "node": "other"}, "q1": {"status": "queued"}, "fresh": {"status": "dispatched", "node": "locks"}}
+        lines = "/w/r-wt1 done1 3\n/w/r-wt2 run1 300\n/w/r-wt3 else1 5\n/w/r-wt4 q1 45\n/w/r-wt5 fresh 1\n/w/r-wt6 - 900\n/w/r-wt7 nojob 70\n/w/r-wt8 nojob2 5\n"
+        self.assertEqual(so.stale_locks(lines, "locks", jobs.get), ["/w/r-wt1", "/w/r-wt3", "/w/r-wt4", "/w/r-wt7"])
+        # a cancel written while a tick held an older copy stays; a node it was handed to meanwhile gets it stopped
+        jid = "j-sticky"
+        so.write_json(so.job_path(jid), {"id": jid, "status": "cancelled", "history": []})
+        so.save_job({"id": jid, "status": "queued", "wait": "x: busy", "history": []})
+        self.assertEqual(so.load_job(jid)["status"], "cancelled")
+        so.save_job({"id": jid, "status": "dispatched", "node": "n9", "history": []})
+        self.assertEqual(so.load_job(jid)["status"], "cancelled")
+        self.assertIn(["n9", jid], so.read_json(so.STATE_DIR / "orphans.json", []))
+        so.write_json(so.STATE_DIR / "orphans.json", [o for o in so.read_json(so.STATE_DIR / "orphans.json", []) if o[1] != jid])
+
     def test_error_line_picks_the_git_reason(self):
         text = "To ssh://node/repo.git\n ! [remote rejected]   abc -> refs/scaleout/base/j1 (shallow update not allowed)\nerror: failed to push some refs to 'ssh://node/repo.git'"
         self.assertIn("failed to push", so.dispatch_error_line(text))
