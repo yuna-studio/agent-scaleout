@@ -95,20 +95,51 @@ stale_lock() {  # stale_lock <work tree>.lock -> 0 when no job holds it any more
   [ ! -d "$d" ] && [ -n "$(find "$l" -maxdepth 0 -mmin +60 2>/dev/null)" ] && return 0   # job gone (moved, removed): not one being handed over
   return 1
 }
+stray() {  # stray <dir> [stop] -> processes left in a job's folder (working directory in it, no terminal), one per line:
+  # "<pid> <minutes> <command>". With stop they are stopped (TERM, KILL after 5 s). Only scaleout's own job folders; simulators,
+  # emulators and adb stay (the node reuses them and stops them when idle), and so does anything run from a terminal.
+  local dir="${1%/}" p c pids="" line left="" i=0
+  case "$dir" in "$B"/repos/?*|"$B"/work/?*) ;; *) return 0 ;; esac
+  dir="$(cd "$dir" 2>/dev/null && pwd -P)" || return 0   # processes report the real path (/var -> /private/var)
+  if [ -d /proc/self ]; then
+    for p in /proc/[0-9]*; do
+      c="$(readlink "$p/cwd" 2>/dev/null)" || continue
+      case "$c" in "$dir"|"$dir"/*) pids="$pids ${p#/proc/}" ;; esac
+    done
+  else
+    pids="$(lsof -a -d cwd -Fpn 2>/dev/null | awk -v d="$dir" '/^p/ {p=substr($0,2)} /^n/ {n=substr($0,2); if (n == d || index(n, d "/") == 1) print p}')"
+  fi
+  for p in $pids; do
+    [ "$p" = "$$" ] && continue
+    line="$(ps -o tty=,etime=,args= -p "$p" 2>/dev/null)"; [ -n "$line" ] || continue
+    case "${line%% *}" in "?"|"??"|"-") ;; *) continue ;; esac
+    printf '%s\n' "$line" | grep -qE 'qemu-system|(^|[ /])emulator( |$)|Simulator|(^|[ /])adb( |$)|crashpad' && continue
+    left="$left$p $(printf '%s\n' "$line" | awk '{n=split($2,t,/[-:]/); m=0; if (n==4) m=t[1]*1440+t[2]*60+t[3]; else if (n==3) m=t[1]*60+t[2]; else m=t[1]; $1=""; $2=""; sub(/^ +/, ""); printf "%d %s", m, substr($0,1,160)}')
+"
+  done
+  [ -n "$left" ] || return 0
+  printf '%s' "$left"
+  [ "${2:-}" = stop ] || return 0
+  pids="$(printf '%s' "$left" | awk '{print $1}')"
+  kill -TERM $pids 2>/dev/null
+  while [ "$i" -lt 5 ]; do sleep 1; i=$((i + 1)); for p in $pids; do alive "$p" && continue 2; done; break; done
+  kill -KILL $pids 2>/dev/null
+  return 0
+}
 free_locks() {  # free_locks <job> [<work tree>] -> drop the work tree locks this job holds, once nothing of it runs
   local d="$B/jobs/$1" l i=0
   while [ -f "$d/pid" ] && alive "$(cat "$d/pid" 2>/dev/null)" && [ "$i" -lt 10 ]; do sleep 1; i=$((i + 1)); done
   if [ -f "$d/pid" ] && alive "$(cat "$d/pid" 2>/dev/null)"; then return 1; fi   # still stopping: stale_lock frees it later
   for l in "$B"/repos/*.lock; do
-    [ -d "$l" ] && [ "$(cat "$l/job" 2>/dev/null)" = "$1" ] && rm -rf "$l"
+    [ -d "$l" ] && [ "$(cat "$l/job" 2>/dev/null)" = "$1" ] && { stray "${l%.lock}" stop >/dev/null; rm -rf "$l"; }
   done
   if [ -n "${2:-}" ] && [ -d "$2.lock" ]; then   # a lock taken by an older version keeps no id: the orchestrator names it
-    case "$(cat "$2.lock/job" 2>/dev/null)" in "$1"|"") rm -rf "$2.lock" ;; esac
+    case "$(cat "$2.lock/job" 2>/dev/null)" in "$1"|"") stray "$2" stop >/dev/null; rm -rf "$2.lock" ;; esac
   fi
   return 0
 }
 idle_wt() {  # idle_wt <work tree> -> takes its lock when no job holds it
-  stale_lock "$1.lock" && rm -rf "$1.lock"
+  stale_lock "$1.lock" && { stray "$1" stop >/dev/null; rm -rf "$1.lock"; }
   mkdir "$1.lock" 2>/dev/null
 }
 reclaim_wts() {  # reclaim_wts <free GB wanted> [idle days] -> how many repo work trees were dropped
@@ -397,7 +428,7 @@ PY
     while :; do
       w="$B/repos/$1-wt$i"
       if mkdir "$w.lock" 2>/dev/null; then printf '%s\n' "${3:-}" > "$w.lock/job"; break; fi
-      if stale_lock "$w.lock"; then rm -rf "$w.lock"; continue; fi
+      if stale_lock "$w.lock"; then stray "$w" stop >/dev/null; rm -rf "$w.lock"; continue; fi   # what its job left there goes too
       i=$((i + 1)); [ "$i" -gt "$top" ] && { echo "no free work tree (all $top held)" >&2; exit 1; }
     done
     if [ -e "$w/.git" ]; then
@@ -414,7 +445,8 @@ PY
     if git diff --cached --quiet "$2"; then c="$2"
     else git -c user.name=agent-scaleout -c user.email=scaleout@localhost commit -q --no-verify -m "scaleout $3" && c="$(git rev-parse HEAD)"; fi
     git update-ref "refs/scaleout/result/$3" "$c" && echo "$c" ;;
-  repo-unlock) rm -rf "$1.lock"; echo ok ;;
+  repo-unlock) stray "$1" stop >/dev/null; rm -rf "$1.lock"; echo ok ;;   # no job holds it: what is left running there goes
+  stray) stray "$1" "${2:-}" ;;   # stray <dir> [stop]: processes a job left in its folder
   repo-locks)  # the work tree locks here, one per line: <work tree> <job or -> <age in minutes>
     for l in "$B"/repos/*.lock; do
       [ -d "$l" ] || continue

@@ -127,6 +127,14 @@ run_job() {
   done
   wait "$cpid"; local rc=$?
   [ -f "$d/cancelled" ] && rc=130
+  # what the job left running in its folder (a game window, a server, a watcher) is stopped now and listed with its results
+  cd / 2>/dev/null
+  local left; left="$(bash "$B/bin/ctl" stray "$wd" stop 2>/dev/null)"
+  if [ -n "$left" ]; then
+    mkdir -p "$d/artifacts"
+    { echo "# processes the job left running in its folder, stopped when it ended: <pid> <minutes> <command>"; printf '%s\n' "$left"; } > "$d/artifacts/leftovers.txt"
+    echo "$(date '+%F %T') $(basename "$d"): stopped $(printf '%s\n' "$left" | wc -l | tr -d ' ') process(es) it left in $wd" >> "$B/runner.log"
+  fi
   echo "$rc" > "$d/rc"; date +%s > "$d/finished"
 }
 

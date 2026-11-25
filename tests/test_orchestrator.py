@@ -1573,6 +1573,60 @@ class DispatchFailure(unittest.TestCase):
         self.assertIn(["n9", jid], so.read_json(so.STATE_DIR / "orphans.json", []))
         so.write_json(so.STATE_DIR / "orphans.json", [o for o in so.read_json(so.STATE_DIR / "orphans.json", []) if o[1] != jid])
 
+    def test_99j_orchestrator_passes_over_tools_its_agent_cannot_run(self):
+        lh = so.local_home()
+        lh.mkdir(parents=True, exist_ok=True)
+        conf = lh / "node.conf"
+        keep = conf.read_text() if conf.exists() else None
+        local, node = {"local": True}, {"host": "n"}
+        job = lambda text, **k: dict({"id": "", "text": text}, **k)
+        try:
+            conf.write_text("NAME=orchestrator\nMAX_JOBS=2\n")
+            for text in ("Godot 화면 고치기", "dotnet test 돌리기", "Blender 로 렌더", "에뮬레이터에서 E2E"):
+                self.assertTrue(so.local_asks(local, job(text)), text)
+            self.assertTrue(so.local_asks(local, job("앱 시험", tags=["emulator"])))
+            self.assertEqual(so.local_asks(local, job("flutter test 돌리고 보고")), "")
+            self.assertEqual(so.local_asks(local, job("코드 읽고 고치기. 에뮬레이터는 띄우지 않는다.")), "", "a sentence saying not to")
+            self.assertEqual(so.local_asks(local, job("Godot 화면 고치기", want_node=so.LOCAL)), "", "-w sends it there anyway")
+            self.assertEqual(so.local_asks(node, job("Godot 화면 고치기")), "", "nodes run in bypass mode")
+            conf.write_text("NAME=orchestrator\nPERMISSION_MODE=bypass\n")
+            self.assertEqual(so.local_asks(local, job("Godot 화면 고치기")), "")
+        finally:
+            conf.unlink() if keep is None else conf.write_text(keep)
+
+    def test_99k_processes_a_job_left_behind(self):
+        h = make_node("stray")
+        b = h / ".scaleout"
+        env = dict(os.environ, HOME=str(h), PATH="/usr/bin:/bin:/usr/sbin:/sbin")
+        ctl = lambda *a: subprocess.run(["bash", str(b / "bin/ctl"), *a], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=60)
+        for w in ("r-wt1", "r-wt10", "r-wt2"):
+            (b / "repos" / w / "sub").mkdir(parents=True)
+        left = subprocess.Popen(["sleep", "300"], cwd=b / "repos/r-wt1/sub", start_new_session=True)
+        other = subprocess.Popen(["sleep", "301"], cwd=b / "repos/r-wt10", start_new_session=True)
+        held = subprocess.Popen(["sleep", "302"], cwd=b / "repos/r-wt2", start_new_session=True)
+        try:
+            time.sleep(0.5)
+            rows = ctl("stray", str(b / "repos/r-wt1")).stdout.decode().splitlines()
+            self.assertEqual([r.split()[0] for r in rows], [str(left.pid)], "only that folder, not r-wt10")
+            self.assertEqual(rows[0].split(None, 2)[1:], ["0", "sleep 300"])
+            self.assertEqual(ctl("stray", str(h)).stdout, b"", "never outside scaleout's job folders")
+            # a lock given back stops what is left in its work tree
+            (b / "repos/r-wt1.lock").mkdir()
+            ctl("repo-unlock", str(b / "repos/r-wt1"))
+            self.assertIsNotNone(left.wait(10), "stopped")
+            self.assertIsNone(other.poll())
+            # cancelling a job whose lock names it does the same
+            (b / "repos/r-wt2.lock").mkdir()
+            (b / "repos/r-wt2.lock/job").write_text("jS\n")
+            (b / "jobs/jS").mkdir()
+            ctl("cancel", "jS")
+            self.assertIsNotNone(held.wait(10))
+            self.assertFalse((b / "repos/r-wt2.lock").exists())
+        finally:
+            for p in (left, other, held):
+                p.kill()
+                p.wait()
+
     def test_error_line_picks_the_git_reason(self):
         text = "To ssh://node/repo.git\n ! [remote rejected]   abc -> refs/scaleout/base/j1 (shallow update not allowed)\nerror: failed to push some refs to 'ssh://node/repo.git'"
         self.assertIn("failed to push", so.dispatch_error_line(text))
