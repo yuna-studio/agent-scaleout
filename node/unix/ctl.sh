@@ -60,7 +60,15 @@ gpu() {  # {"util":..,"mem_used_mb":..,"mem_total_mb":..,"temp":..,"name":".."} 
   done
   echo null
 }
-running_jobs() { local n=0 d; for d in "$B"/jobs/*/; do [ -f "$d/started" ] && [ ! -f "$d/rc" ] && n=$((n + 1)); done; echo "$n"; }
+running_jobs() {  # jobs whose agent runs now: started, no rc, and its process alive (a runner that died writes no rc)
+  local n=0 d p
+  for d in "$B"/jobs/*/; do
+    [ -f "$d/started" ] && [ ! -f "$d/rc" ] || continue
+    p="$(cat "$d/pid" 2>/dev/null)"; [ -n "$p" ] && ! alive "$p" && continue
+    n=$((n + 1))
+  done
+  echo "$n"
+}
 dd_drop() {  # dd_drop <folder>|orphans -> how many Xcode build caches (DerivedData) went
   # Xcode keeps one build cache per workspace path (4-8 GB for a Flutter app) and never removes it, so every repo work tree
   # that built for iOS leaves one behind. Drop the caches of workspaces under <folder>, or ("orphans") of workspaces
@@ -113,7 +121,7 @@ stray() {  # stray <dir> [stop] -> processes left in a job's folder (working dir
     [ "$p" = "$$" ] && continue
     line="$(ps -o tty=,etime=,args= -p "$p" 2>/dev/null)"; [ -n "$line" ] || continue
     case "${line%% *}" in "?"|"??"|"-") ;; *) continue ;; esac
-    printf '%s\n' "$line" | grep -qE 'qemu-system|(^|[ /])emulator( |$)|Simulator|(^|[ /])adb( |$)|crashpad' && continue
+    printf '%s\n' "$line" | grep -qE 'qemu-system|(^|[ /])emulator( |$)|Simulator|(^|[ /])adb( |$)|crashpad|runner\.sh' && continue
     left="$left$p $(printf '%s\n' "$line" | awk '{n=split($2,t,/[-:]/); m=0; if (n==4) m=t[1]*1440+t[2]*60+t[3]; else if (n==3) m=t[1]*60+t[2]; else m=t[1]; $1=""; $2=""; sub(/^ +/, ""); printf "%d %s", m, substr($0,1,160)}')
 "
   done
@@ -280,7 +288,10 @@ case "$verb" in
     d="$B/jobs/$1"; rm -f "$B/queue/$1"; touch "$d/cancelled" 2>/dev/null
     [ -f "$d/pid" ] && kill -TERM "$(cat "$d/pid")" 2>/dev/null
     [ -f "$d/rc" ] || [ -f "$d/started" ] || echo 130 > "$d/rc"
-    if free_locks "$1" "${2:-}"; then echo cancelled; else echo "cancelled (still stopping)"; fi ;;
+    if free_locks "$1" "${2:-}"; then
+      [ -f "$d/rc" ] || { echo 130 > "$d/rc"; date +%s > "$d/finished"; }   # its runner writes the same when it is still there
+      echo cancelled
+    else echo "cancelled (still stopping)"; fi ;;
   rm) rm -rf "$B/jobs/$1" "$B/queue/$1" "$B/work/$1"; echo removed ;;
 
   tokens)  # tokens on <window> | off | status — `scaleout tokens`: Claude's auto-compact window on this machine and the job rules
@@ -327,7 +338,7 @@ PY
     done
     for d in "$B"/jobs/*/; do   # left "running" by a runner that died: no rc, its process gone, nothing written for a day
       [ -f "$d/started" ] && [ ! -f "$d/rc" ] || continue
-      p="$(cat "$d/pid" 2>/dev/null)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null && continue
+      p="$(cat "$d/pid" 2>/dev/null)"; [ -n "$p" ] && alive "$p" && continue
       [ -n "$(find "$d" -maxdepth 1 -mmin -1440 2>/dev/null)" ] && continue
       rm -rf "$d"; n=$((n + 1))
     done
