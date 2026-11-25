@@ -34,7 +34,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "0.9.19"
+VERSION = "0.9.20"
 HOME = Path.home()
 CONF_DIR = Path(os.environ.get("SCALEOUT_CONF", HOME / ".config" / "scaleout"))
 STATE_DIR = Path(os.environ.get("SCALEOUT_STATE", HOME / ".local" / "state" / "scaleout"))
@@ -241,6 +241,34 @@ def local_install(force: bool = False) -> None:
         deny += [r for r in LOCAL_DENY if r not in deny]   # the work tree shares refs with the user's repository
         s.write_text(json.dumps(d, indent=2, ensure_ascii=False) + "\n")
     (b / "bin" / ".stamp").write_text(stamp)
+
+
+def local_conf() -> Dict[str, str]:
+    """The orchestrator's own executor settings (its node.conf)."""
+    out: Dict[str, str] = {}
+    try:
+        for line in (local_home() / "node.conf").read_text().splitlines():
+            k, _, v = line.partition("=")
+            if k.strip() and not k.lstrip().startswith("#"):
+                out[k.strip()] = v.strip().strip('"\'')
+    except OSError:
+        pass
+    return out
+
+
+# tools the orchestrator's own agent cannot run while it asks before commands outside its allow list
+LOCAL_ASKS = re.compile(r"godot|dotnet|\.net\b|blender|블렌더|\bunity\b|유니티|emulator|에뮬|\badb\b|xvfb|opengl|vulkan|\bcuda\b", re.I)
+
+
+def local_asks(n: Dict[str, Any], j: Dict[str, Any]) -> str:
+    """Why the orchestrator's own executor passes this job over, or "". Its agent runs in acceptEdits mode with the allow list
+    unless its node.conf says PERMISSION_MODE=bypass, so a tool outside it (Godot, .NET, Blender, an emulator and the scripts
+    around them) waits for a yes nobody gives and the job ends without its work. A job sent to it with -w still goes."""
+    if not n.get("local") or j.get("want_node") or local_conf().get("PERMISSION_MODE") == "bypass":
+        return ""
+    if set(j.get("tags") or []) & ANDROID_TAGS or LOCAL_ASKS.search(PIN_NOT.sub(" ", task_of(j))):
+        return "its agent asks before tools outside its allow list (Godot, .NET, Blender, emulators)"
+    return ""
 
 
 def local_runner_alive() -> bool:
@@ -1576,6 +1604,9 @@ def pick_node(cfg: Dict[str, Any], j: Dict[str, Any], metrics: Dict[str, Dict[st
         have |= set(st.get("caps") or [])   # emulator / simulator / maestro, as the node found them
         if not set(j.get("tags") or []) <= have:
             why[name] = "lacks " + ",".join(sorted(set(j.get("tags") or []) - have))
+            continue
+        if local_asks(n, j):
+            why[name] = local_asks(n, j)
             continue
         # one job per attached phone: a job tagged android-device / ios-device needs a free device of that kind
         if any(int(devs.get(t[:-7], 0) or 0) <= dev_load.get((name, t), 0) for t in (j.get("tags") or []) if t in DEVICE_TAGS):
