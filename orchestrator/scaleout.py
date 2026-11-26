@@ -34,7 +34,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "0.9.20"
+VERSION = "0.9.21"
 HOME = Path.home()
 CONF_DIR = Path(os.environ.get("SCALEOUT_CONF", HOME / ".config" / "scaleout"))
 STATE_DIR = Path(os.environ.get("SCALEOUT_STATE", HOME / ".local" / "state" / "scaleout"))
@@ -5221,11 +5221,15 @@ def top_lines(cfg: Dict[str, Any], lu: "LocalUsage", interval: int, width: int =
     waiting, running = sum(1 for j in active if j["status"] == "queued"), sum(1 for j in active if j["status"] != "queued")
     ok, bad = sum(1 for j in done_today if j["status"] == "done"), sum(1 for j in done_today if j["status"] == "failed")
     in_s = sum(1 for j in active if j.get("direct"))
-    rows = [c("◌", C_WARN) + f" waiting {c(waiting, C_WARN if waiting else C_DIM, bold=True)}   " + c("●", C_ACCENT) + f" running {c(running, C_ACCENT if running else C_DIM, bold=True)}"
-            + (c(f" ({in_s} in sessions)", C_DIM) if in_s else "") + "   "
+    rows = [c("●", C_ACCENT) + f" running {c(running, C_ACCENT if running else C_DIM, bold=True)}"
+            + (c(f" ({in_s} in sessions)", C_DIM) if in_s else "") + "   " + c("◌", C_WARN) + f" waiting {c(waiting, C_WARN if waiting else C_DIM, bold=True)}   "
             + c("✔", C_OK) + f" finished today {c(ok, C_OK if ok else C_DIM, bold=True)}   " + c("✖", C_BAD) + f" failed today {c(bad, C_BAD if bad else C_DIM, bold=True)}"
             + c(f"   ▸ = run in a session, not through scaleout", C_DIM)]
-    for j in reversed(every[-8:]):
+    # running first, then waiting (newest first in each), then the latest finished ones up to 8 rows
+    act = sorted(active, key=lambda j: (j["status"] == "queued", -j.get("created", 0)))
+    seen = {id(j) for j in act}
+    shown = act + [j for j in reversed(every) if id(j) not in seen][:max(0, 8 - len(act))]
+    for j in shown:
         age = int(now() - (j.get("finished_at") or j.get("dispatched_at") or j.get("created", now())))
         ago = f"{age // 86400}d" if age >= 172800 else f"{age // 3600}h" if age >= 7200 else f"{age // 60}m"
         mark, col = JOB_MARKS.get(j.get("status", ""), ("·", C_DIM))

@@ -1615,6 +1615,22 @@ class DispatchFailure(unittest.TestCase):
             ctl("repo-unlock", str(b / "repos/r-wt1"))
             self.assertIsNotNone(left.wait(10), "stopped")
             self.assertIsNone(other.poll())
+            # the runner looking after a job in that folder is never stopped
+            fake = b / "bin/runner.sh"
+            keep_runner = fake.read_text()
+            fake.write_text("sleep 303\n")
+            runner = subprocess.Popen(["/bin/bash", str(fake)], cwd=b / "repos/r-wt10", start_new_session=True)
+            time.sleep(0.5)
+            self.assertNotIn(str(runner.pid), ctl("stray", str(b / "repos/r-wt10")).stdout.decode())
+            runner.kill(); runner.wait(); fake.write_text(keep_runner)
+            # a job whose process is gone is not running, even without rc; cancelling it marks it over
+            (b / "jobs/jDead").mkdir()
+            (b / "jobs/jDead/started").write_text("")
+            gone = subprocess.Popen(["true"]); gone.wait()
+            (b / "jobs/jDead/pid").write_text(str(gone.pid))
+            self.assertEqual(json.loads(ctl("metrics").stdout)["running"], 0)
+            ctl("cancel", "jDead")
+            self.assertEqual((b / "jobs/jDead/rc").read_text().strip(), "130")
             # cancelling a job whose lock names it does the same
             (b / "repos/r-wt2.lock").mkdir()
             (b / "repos/r-wt2.lock/job").write_text("jS\n")

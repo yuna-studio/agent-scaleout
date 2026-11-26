@@ -116,6 +116,7 @@ run_job() {
   local u0 peak u; u0="$(used_mb)"; peak="$u0"
   bash -c "$cmd" < "$d/prompt.md" > "$d/out" 2> "$d/err.log" &
   local cpid=$!; echo "$cpid" > "$d/pid"
+  cd / 2>/dev/null   # the agent keeps working in $wd; the runner itself does not sit there (what is left there is stopped later)
   # heartbeat + timeout watchdog: the orchestrator treats a stale heartbeat as a dead runner
   local waited=0
   while kill -0 "$cpid" 2>/dev/null; do
